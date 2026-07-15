@@ -34,20 +34,57 @@ describe("POST /api/agents/remit-cashout-payout/invoke", () => {
   beforeEach(() => {
     vi.stubEnv("TRANSFI_API_KEY", "");        // TransFi OFF → FallbackPayoutProvider (CD-4)
     vi.stubEnv("ALLOW_FALLBACK_PAYOUT", "true"); // en NODE_ENV=test corre el mock por la rama dev
+    // WKH-203: el gate KYC server-side corre en cada invoke. En NODE_ENV="test" (≠ production)
+    // el KYC fallback pasa por la rama B5 (opt-in explícito) → los tests del happy-path HTTP siguen
+    // ejerciendo el path real. En producción esta env NO abre nada (rama B3).
+    vi.stubEnv("ALLOW_FALLBACK_KYC", "true");
   });
   afterEach(() => {
     vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
   });
 
-  // (1) AC-3: hard-gate KYC → 200 blocked, NO ejecuta provider.
-  it("kycPayoutAllowed:false → 200 blocked, no ejecuta provider", async () => {
-    const res = await invoke({ ...validInput, kycPayoutAllowed: false });
+  // (1) WKH-203/AC-1-HTTP: el gate KYC server-side no confirma → 200 blocked, NO ejecuta provider.
+  // (Reemplaza al viejo test del booleano `kycPayoutAllowed:false`: con DT-4 Zod lo strippea y ya
+  // no bloquea nada — el equivalente REAL del gate es que el KYC no se pueda confirmar.)
+  it("KYC no confirmable (sin opt-in fallback) → 200 blocked, no ejecuta provider", async () => {
+    vi.stubEnv("ALLOW_FALLBACK_KYC", ""); // B4: sin opt-in el fallback no abre
+    const res = await invoke(validInput);
     expect(res.status).toBe(200);
     const output = (await res.json()).result;
     expect(output.executed).toBe(false);
     expect(output.status).toBe("blocked");
     expect(output.reason).toBe("kyc_gate_not_passed");
     expect(output.payoutId).toBeNull();
+  });
+
+  // (1b) AC-5a: el response `blocked` no filtra PII del beneficiario ni el Travel Rule.
+  it("el 200 blocked NO filtra beneficiary.name/destination ni travelRuleData (AC-5a)", async () => {
+    vi.stubEnv("ALLOW_FALLBACK_KYC", "");
+    const res = await invoke(validInput);
+    const body = JSON.stringify(await res.json());
+    expect(body).not.toContain("999888777");
+    expect(body).not.toContain("Bob");
+    expect(body).not.toContain("travelRuleData");
+  });
+
+  // (1c) AC-5b / B6: kyc_gate_unavailable → 502 opaco, sin filtrar el motivo interno ni PII.
+  it("gate KYC caído → 502 { error: payout_unavailable } sin filtrar kyc_gate_unavailable ni PII", async () => {
+    vi.stubEnv("DIDIT_API_KEY", "k");
+    vi.stubEnv("DIDIT_ADAPTER_READY", "true");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new Error("network_down 999888777");
+      }),
+    );
+    const res = await invoke(validInput);
+    expect(res.status).toBe(502);
+    const data = await res.json();
+    expect(data).toEqual({ error: "payout_unavailable" });
+    expect(JSON.stringify(data)).not.toContain("kyc_gate_unavailable");
+    expect(JSON.stringify(data)).not.toContain("999888777");
+    expect(JSON.stringify(data)).not.toContain("Bob");
   });
 
   // (2) AC-4 / AC-6 / CD-9: body válido → 200 { result } con EXACTAMENTE los 8 campos, provenance mock.
@@ -104,6 +141,17 @@ describe("POST /api/agents/remit-cashout-payout/invoke", () => {
     vi.stubEnv("NODE_ENV", "production");
     vi.stubEnv("PAYOUT_ALLOW_MOCK", "true");
     vi.stubEnv("TRANSFI_API_KEY", "");
+    // WKH-203 (C1): en PROD el gate KYC exige verificación REAL aprobada (B1) — el fallback jamás
+    // abre en prod (B3), ni con ALLOW_FALLBACK_KYC. Solo crece el ARRANGE: asserts originales.
+    vi.stubEnv("DIDIT_API_KEY", "k");
+    vi.stubEnv("DIDIT_ADAPTER_READY", "true");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify({ status: "Approved", session_id: "v1" }), { status: 200 }),
+      ),
+    );
     const res = await invoke(validInput);
     expect(res.status).toBe(200);
     const output = (await res.json()).result;

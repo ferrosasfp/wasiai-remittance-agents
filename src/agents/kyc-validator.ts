@@ -7,7 +7,7 @@
 // se mantiene la lógica framework-agnostic para testear como cobraya.
 
 import { z } from "zod";
-import { getKycProvider } from "../providers/kyc";
+import { getKycProvider, REAL_KYC_PROVENANCES } from "../providers/kyc";
 import type { KycResult } from "../providers/types";
 
 export const SLUG = "remit-kyc-validator";
@@ -49,10 +49,8 @@ export interface KycAgentOutput {
  * - En no-producción: se permite KYC fallback SOLO con opt-in explícito y ruidoso
  *   (`ALLOW_FALLBACK_KYC==='true'`), para dev/CI.
  */
-// MNR-3 (re-AR): allowlist explícita de proveniencias REALES (fail-safe en el eje provenance).
-// Un typo futuro en un provider NO debe leerse como "real" y abrir el money-path.
-const REAL_KYC_PROVENANCES = new Set<string>(["didit"]);
-
+// WKH-203/CD-9: la allowlist se movió a ../providers/kyc (única fuente, compartida con
+// cashout-payout.ts). Cambia el ORIGEN del símbolo, NO el comportamiento.
 function isPayoutAllowed(kyc: KycResult): boolean {
   if (!kyc.approved) return false;
   const isReal = REAL_KYC_PROVENANCES.has(kyc.provenance);

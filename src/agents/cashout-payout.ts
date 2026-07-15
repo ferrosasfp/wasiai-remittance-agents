@@ -9,7 +9,8 @@
 
 import { z } from "zod";
 import { getPayoutProvider } from "../providers/payout";
-import type { PayoutResult } from "../providers/types";
+import { getKycProvider, REAL_KYC_PROVENANCES } from "../providers/kyc";
+import type { KycStatusResult, PayoutResult } from "../providers/types";
 
 export const SLUG = "remit-cashout-payout";
 export const PRICE_USDC = 0.03;
@@ -18,7 +19,10 @@ export const CashoutPayoutInputSchema = z.object({
   quoteId: z.string().min(1), // del agente FX (tasa fijada)
   amountUsd: z.number().positive(),
   kycVerificationId: z.string().min(1), // handle del KYC (el Travel Rule se recupera por acá, no PII inline)
-  kycPayoutAllowed: z.boolean(), // hard-gate del agente KYC
+  // WKH-203/DT-4: `kycPayoutAllowed` FUE ELIMINADO a propósito. El input NO decide compliance:
+  // la decisión se re-deriva server-side en isKycGatePassed(). z.object sin .strict() strippea
+  // la key en silencio → los callers que la sigan mandando NO se rompen (compat), pero
+  // `input.kycPayoutAllowed` ya NO compila: la confianza en el caller es estructuralmente imposible.
   beneficiary: z.object({
     name: z.string().min(1),
     country: z.string().min(2),
@@ -72,14 +76,62 @@ function assertPayoutProviderSafe(): void {
 }
 
 /**
+ * WKH-203: el input NO decide compliance. Se consulta la fuente autoritativa por verificationId.
+ * Misma allowlist (REAL_KYC_PROVENANCES) y mismo default `false` que isPayoutAllowed()
+ * (kyc-validator.ts). NO es un espejo byte-a-byte: la comparación de `approved` es MÁS ESTRICTA
+ * A PROPÓSITO (`!== true` acá vs. la truthiness `!kyc.approved` de kyc-validator.ts) — CD-8 /
+ * anti-WKH-198: un `approved` no-booleano NUNCA debe leerse como señal de compliance.
+ * ⚠️ NO "alinear" este gate con la truthiness de kyc-validator.ts: la divergencia es el fix.
+ * Default = BLOQUEAR: no existe ninguna rama "else → allow".
+ *
+ * NOTA(WKH-204): este gate confirma que la verificación está APROBADA, no que sea DEL que pide el
+ * payout (binding verificationId ↔ sender). Ese riesgo residual es WKH-204, fuera de scope acá.
+ */
+async function isKycGatePassed(verificationId: string): Promise<boolean> {
+  // B7: FUERA del try — su throw (didit_adapter_not_ready) DEBE propagar fail-loud (CD-12).
+  // Si esto se mete adentro del try se convierte en kyc_gate_unavailable y se rompe la rama B7:
+  // key sin readiness sería un downgrade silencioso al fallback.
+  const kycProvider = getKycProvider();
+  let s: KycStatusResult;
+  try {
+    s = await kycProvider.status(verificationId);
+  } catch (err) {
+    // B6: partner caído/timeout ≠ aprobado. Nunca "asumir true".
+    console.warn("[remit-payout] kyc gate unavailable:", {
+      errorName: err instanceof Error ? err.name : "unknown", // nunca err.message/input (CD-4)
+    });
+    throw new Error("kyc_gate_unavailable");
+  }
+  if (s.approved !== true) return false; // B2 + B9: estricto, NUNCA truthy (CD-8, anti-WKH-198)
+  if (REAL_KYC_PROVENANCES.has(s.provenance)) return true; // B1: única rama que abre en prod
+  // B3: en prod el fallback JAMÁS abre — ninguna env puede abrirlo. El orden (isProd primero)
+  // es deliberado: no lo inviertas.
+  const isProd = process.env.NODE_ENV === "production";
+  if (!isProd && process.env.ALLOW_FALLBACK_KYC === "true") {
+    // B5
+    console.warn(
+      "[remit-payout] gate KYC pasado con provenance FALLBACK (no verificación real) — solo dev/CI",
+    );
+    return true;
+  }
+  return false; // B3/B4/B8: default = BLOQUEAR
+}
+
+/**
  * Core del agente. Devuelve el objeto que va dentro de `{ result }`.
- * Lanza ZodError si el input es inválido; lanza `payout_refused` si el fail-safe bloquea.
+ * Lanza ZodError si el input es inválido; lanza `payout_refused` si el fail-safe bloquea;
+ * lanza `kyc_gate_unavailable` si el gate KYC no se puede resolver (B6 → 502, fail-closed).
  */
 export async function runCashoutPayout(raw: unknown): Promise<CashoutPayoutOutput> {
-  const input = CashoutPayoutInputSchema.parse(raw);
+  const input = CashoutPayoutInputSchema.parse(raw); // 1. (ya sin kycPayoutAllowed — DT-4)
 
-  // Hard-gate KYC (viene del agente remit-kyc-validator).
-  if (!input.kycPayoutAllowed) {
+  assertPayoutProviderSafe(); // 2. INTACTO (CD-1) — throws primero, como hoy
+  const provider = getPayoutProvider(); // 3. INTACTO — throws adapter_not_ready, como hoy
+
+  // 4. GATE NUEVO (WKH-203): la decisión de compliance se re-deriva server-side contra la fuente
+  // autoritativa. Va DESPUÉS de 2 y 3 a propósito (CD-1: preservar el error de payout cuando hay
+  // dos problemas a la vez). getPayoutProvider() es cero-I/O y cero side-effects → inerte y seguro.
+  if (!(await isKycGatePassed(input.kycVerificationId))) {
     return {
       slug: SLUG,
       executed: false,
@@ -91,9 +143,6 @@ export async function runCashoutPayout(raw: unknown): Promise<CashoutPayoutOutpu
       provenance: "n/a",
     };
   }
-
-  assertPayoutProviderSafe();
-  const provider = getPayoutProvider();
 
   // El Travel Rule data se recupera por kycVerificationId vía canal seguro (NO viaja como PII en el input a2a).
   const travelRuleData = await resolveTravelRuleData(input.kycVerificationId);

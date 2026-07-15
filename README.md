@@ -119,15 +119,17 @@ El agente `remit-cashout-payout` ya es invocable vía Next.js App Router (mismo 
 
 ```
 POST /api/agents/remit-cashout-payout/invoke
-body: { "quoteId": "q1", "amountUsd": 100, "kycVerificationId": "v1", "kycPayoutAllowed": true,
+body: { "quoteId": "q1", "amountUsd": 100, "kycVerificationId": "v1",
         "beneficiary": { "name": "<PII>", "country": "PE", "method": "yape", "destination": "<Yape/CCI>" },
         "idempotencyKey": "idem-1" }
 → 200 { "result": { "slug", "executed", "status", "payoutId",
                     "deliveredLocal", "txRef", "reason", "provenance" } }  # SIN beneficiary ni travelRuleData
-→ 200 { "result": { "executed": false, "status": "blocked", "reason": "kyc_gate_not_passed" } }  # hard-gate KYC
+→ 200 { "result": { "executed": false, "status": "blocked", "reason": "kyc_gate_not_passed" } }  # hard-gate KYC (WKH-203: server-side, no del caller)
 → 400 { "error": "invalid_input", "details": {...} }  # body inválido (mensajes Zod, sin PII)
 → 502 { "error": "payout_unavailable" }               # fail-safe / misconfig del provider
 ```
+
+> **Nota**: el campo `kycPayoutAllowed` fue **removido del schema** (WKH-203). El hard-gate KYC ahora se **re-deriva server-side** contra Didit: `KycProvider.status(kycVerificationId)` → allowlist `REAL_KYC_PROVENANCES`. Si código legacy (`chaski-v2/gateways.ts`) aún envía `kycPayoutAllowed: true`, **Zod lo strippea silenciosamente** (schema sin `.strict()`); el campo no tiene ningún efecto.
 
 Etapa 1 corre 100% en **payout MOCK** (`FallbackPayoutProvider`, `provenance:"local-fallback"`,
 `deliveredLocal:null`, `txRef:null`): NUNCA mueve plata real. **TransFi queda OFF** (etapa 2 / WKH-168):

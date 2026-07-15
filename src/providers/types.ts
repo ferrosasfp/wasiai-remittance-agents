@@ -29,8 +29,23 @@ export interface KycResult {
   provenance: Provenance;
 }
 
+/**
+ * Resultado de una CONSULTA de estado de una verificación existente (no crea verificación).
+ * Deliberadamente MÁS ANGOSTO que KycResult: NO incluye travelRuleData ni ningún campo derivado
+ * del legalId/DNI (CD-7). El Travel Rule sigue viajando solo por el canal seguro del provider.
+ */
+export interface KycStatusResult {
+  approved: boolean;
+  verificationId: string; // eco del id consultado (canónico = el pedido)
+  provenance: Provenance; // "didit" | "local-fallback"
+  reasons: string[]; // auditable y VALUE-FREE (ej. "didit_status_declined"); nunca PII
+}
+
 export interface KycProvider {
   verify(input: KycInput): Promise<KycResult>;
+  // Consulta de estado de una verificación ya existente, por su verificationId.
+  // Espejo de PayoutProvider.status(payoutId) (L84-90 de este archivo).
+  status(verificationId: string): Promise<KycStatusResult>;
 }
 
 // ── FX / Corridor quote ──────────────────────────────────────────────────────
