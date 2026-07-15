@@ -20,6 +20,10 @@ const validInput = {
   amountUsd: 100,
   kycVerificationId: "v1",
   kycPayoutAllowed: true,
+  // WKH-204: identity claim del sender (un DNI REAL) — sin esto C3 bloquearía todos los tests HTTP
+  // antes de llegar a las ramas que ejercitan. Además es el probe de AC-3: NINGÚN response
+  // (200/400/502) puede ecoarlo. Solo crece el ARRANGE — los asserts quedan intactos.
+  senderIdentity: "12345678",
   beneficiary: { name: "Bob", country: "PE", method: "yape", destination: "999888777" },
   idempotencyKey: "idem-1",
 };
@@ -145,11 +149,15 @@ describe("POST /api/agents/remit-cashout-payout/invoke", () => {
     // abre en prod (B3), ni con ALLOW_FALLBACK_KYC. Solo crece el ARRANGE: asserts originales.
     vi.stubEnv("DIDIT_API_KEY", "k");
     vi.stubEnv("DIDIT_ADAPTER_READY", "true");
+    // WKH-204: el vendor_data debe matchear el senderIdentity del fixture (C7), si no C11 bloquea.
     vi.stubGlobal(
       "fetch",
       vi.fn(
         async () =>
-          new Response(JSON.stringify({ status: "Approved", session_id: "v1" }), { status: 200 }),
+          new Response(
+            JSON.stringify({ status: "Approved", session_id: "v1", vendor_data: "12345678" }),
+            { status: 200 },
+          ),
       ),
     );
     const res = await invoke(validInput);
@@ -168,6 +176,56 @@ describe("POST /api/agents/remit-cashout-payout/invoke", () => {
     expect(data.details).toBeTruthy();
     expect(JSON.stringify(data)).not.toContain("999888777");
     expect(JSON.stringify(data)).not.toContain("Bob");
+  });
+
+  // (7b) WKH-204/AC-3/CD-4: el senderIdentity (un DNI real) NUNCA se ecoa en un 200 blocked.
+  it("AC-3: el 200 blocked NO ecoa el senderIdentity ni el vendor_data (CD-4)", async () => {
+    vi.stubEnv("ALLOW_FALLBACK_KYC", ""); // B4 → blocked
+    const res = await invoke(validInput);
+    expect(res.status).toBe(200);
+    const body = JSON.stringify(await res.json());
+    expect(body).not.toContain("12345678"); // el DNI del claim
+    expect(body).not.toContain("senderIdentity");
+    expect(body).not.toContain("vendor_data");
+    expect(body).not.toContain("999888777");
+    expect(body).not.toContain("Bob");
+    expect(body).not.toContain("travelRuleData");
+  });
+
+  // (7c) WKH-204/AC-3 — 🔴 EL PROBE DE CD-11: el 400 devuelve parsed.error.flatten() tal cual.
+  // Con z.string() el mensaje es value-free; con un z.enum/discriminado ecoaría el DNI recibido.
+  it("AC-3/CD-11: el 400 NO ecoa el senderIdentity recibido (z.string() es value-free)", async () => {
+    // senderIdentity no-string + falta idempotencyKey → 400 invalid_input con details=flatten()
+    const res = await invoke({
+      ...validInput,
+      senderIdentity: "DNI-12345678",
+      idempotencyKey: undefined,
+    });
+    expect(res.status).toBe(400);
+    const data = await res.json();
+    expect(data.error).toBe("invalid_input");
+    const body = JSON.stringify(data);
+    expect(body).not.toContain("12345678"); // ← si alguien mete un z.enum, esto se rompe
+    expect(body).not.toContain("DNI-");
+    expect(body).not.toContain("999888777");
+    expect(body).not.toContain("Bob");
+  });
+
+  // (7d) WKH-204/AC-3: el 502 sigue siendo un body fijo opaco — tampoco filtra el claim.
+  it("AC-3: el 502 NO ecoa el senderIdentity (body fijo opaco)", async () => {
+    vi.stubEnv("DIDIT_API_KEY", "k");
+    vi.stubEnv("DIDIT_ADAPTER_READY", "true");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new Error("network_down 12345678");
+      }),
+    );
+    const res = await invoke(validInput);
+    expect(res.status).toBe(502);
+    const data = await res.json();
+    expect(data).toEqual({ error: "payout_unavailable" });
+    expect(JSON.stringify(data)).not.toContain("12345678");
   });
 
   // (8) AC-8: body no-JSON → 400 (no 500).

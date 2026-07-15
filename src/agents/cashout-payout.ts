@@ -9,7 +9,7 @@
 
 import { z } from "zod";
 import { getPayoutProvider } from "../providers/payout";
-import { getKycProvider, REAL_KYC_PROVENANCES } from "../providers/kyc";
+import { getKycProvider, normalizeIdentity, REAL_KYC_PROVENANCES } from "../providers/kyc";
 import type { KycStatusResult, PayoutResult } from "../providers/types";
 
 export const SLUG = "remit-cashout-payout";
@@ -23,6 +23,19 @@ export const CashoutPayoutInputSchema = z.object({
   // la decisión se re-deriva server-side en isKycGatePassed(). z.object sin .strict() strippea
   // la key en silencio → los callers que la sigan mandando NO se rompen (compat), pero
   // `input.kycPayoutAllowed` ya NO compila: la confianza en el caller es estructuralmente imposible.
+  // WKH-204: identity claim del sender. String OPACO a propósito (CD-11): PROHIBIDO z.enum/z.literal
+  // ni un discriminado {type,value} — z.enum ECOA el valor recibido en parsed.error.flatten(), que
+  // route.ts:15 devuelve en el 400 → fuga de PII. Semántica: "el valor que quedó ligado (vendor_data)
+  // a esa verificación en su creación" (el DNI si la creó remit-kyc-validator; el address si chaski-v2).
+  // ⚠️ optional() a propósito: un campo requerido ausente daría 400 invalid_input — indistinguible de
+  // un error de schema real y semánticamente falso (no falta input, falta AUTORIZACIÓN). Con optional()
+  // + rama de gate da 200 blocked/kyc_identity_claim_missing: igual de fail-closed, pero auditable.
+  senderIdentity: z.string().min(1).optional(),
+  // WKH-204/CD-16 — LEGADO/DEPRECADO: puente de compat con chaski-v2, que ya manda `address` no-vacío
+  // (submit/route.ts:59-62) y forwardea el body verbatim (:102) — hoy Zod lo strippea en silencio.
+  // NO es un fail-open: es un claim real que se compara con las MISMAS ramas fail-closed.
+  // PROHIBIDO construir features nuevas sobre él. Se elimina cuando chaski-v2 mande `senderIdentity`.
+  address: z.string().min(1).optional(),
   beneficiary: z.object({
     name: z.string().min(1),
     country: z.string().min(2),
@@ -76,6 +89,35 @@ function assertPayoutProviderSafe(): void {
 }
 
 /**
+ * WKH-204 / C1-C4: la identity claim resuelta + DE DÓNDE vino.
+ * `source` es un discriminador VALUE-FREE (conjunto cerrado de 2 literales) — sirve para diagnosticar
+ * el flujo legado en los logs sin tocar `value`. 🔴 PROHIBIDO loguear `value` (es el DNI — CD-4/CD-7).
+ */
+type IdentityClaim = { value: string; source: "senderIdentity" | "address" };
+
+/**
+ * WKH-204 / C1-C4: resuelve la identity claim del caller. Devuelve null = BLOQUEAR (fail-closed).
+ * CD-15 — precedencia determinística: `senderIdentity` (explícito) GANA sobre `address` (legado).
+ * PROHIBIDA cualquier rama "ambos presentes y discrepan → ambiguo": gana el explícito, siempre.
+ */
+function resolveIdentityClaim(input: CashoutPayoutInput): IdentityClaim | null {
+  const claim = input.senderIdentity ?? input.address; // C1 / C2
+  if (claim === undefined) return null; // C3
+  // 🔴 C4 — NO la borres "porque min(1) ya lo cubre": NO lo cubre. z.string().min(1) NO trimea
+  // (verificado ejecutando con zod 3.25.76: "   " → success:true). Un claim "   " ATRAVIESA Zod.
+  // Sin C4, si vendor_data también viniera vacío, "" === "" matchearía = fail-open clase WKH-198.
+  // C5 también lo ataja, pero son defensa en profundidad y cada una debe existir por separado:
+  // C4 evita además gastar una llamada a Didit y dar señal al caller.
+  if (normalizeIdentity(claim) === "") return null; // C4
+  // `source` espeja el `??` de arriba: si senderIdentity resolvió, ganó él (CD-15). Un senderIdentity
+  // whitespace NO cae al address: ya ganó en el `??` y C4 lo bloquea — comportamiento preservado.
+  return {
+    value: claim,
+    source: input.senderIdentity !== undefined ? "senderIdentity" : "address",
+  };
+}
+
+/**
  * WKH-203: el input NO decide compliance. Se consulta la fuente autoritativa por verificationId.
  * Misma allowlist (REAL_KYC_PROVENANCES) y mismo default `false` que isPayoutAllowed()
  * (kyc-validator.ts). NO es un espejo byte-a-byte: la comparación de `approved` es MÁS ESTRICTA
@@ -84,17 +126,18 @@ function assertPayoutProviderSafe(): void {
  * ⚠️ NO "alinear" este gate con la truthiness de kyc-validator.ts: la divergencia es el fix.
  * Default = BLOQUEAR: no existe ninguna rama "else → allow".
  *
- * NOTA(WKH-204): este gate confirma que la verificación está APROBADA, no que sea DEL que pide el
- * payout (binding verificationId ↔ sender). Ese riesgo residual es WKH-204, fuera de scope acá.
+ * WKH-204: además de que la verificación esté APROBADA, ahora se exige que sea DEL que pide el
+ * payout (binding verificationId ↔ sender) vía `identityMatches` (C11). La comparación real vive
+ * DENTRO del provider (CD-7): acá solo llega un booleano derivado, nunca el vendor_data/DNI.
  */
-async function isKycGatePassed(verificationId: string): Promise<boolean> {
+async function isKycGatePassed(verificationId: string, claim: IdentityClaim): Promise<boolean> {
   // B7: FUERA del try — su throw (didit_adapter_not_ready) DEBE propagar fail-loud (CD-12).
   // Si esto se mete adentro del try se convierte en kyc_gate_unavailable y se rompe la rama B7:
   // key sin readiness sería un downgrade silencioso al fallback.
   const kycProvider = getKycProvider();
   let s: KycStatusResult;
   try {
-    s = await kycProvider.status(verificationId);
+    s = await kycProvider.status(verificationId, claim.value);
   } catch (err) {
     // B6: partner caído/timeout ≠ aprobado. Nunca "asumir true".
     console.warn("[remit-payout] kyc gate unavailable:", {
@@ -103,6 +146,32 @@ async function isKycGatePassed(verificationId: string): Promise<boolean> {
     throw new Error("kyc_gate_unavailable");
   }
   if (s.approved !== true) return false; // B2 + B9: estricto, NUNCA truthy (CD-8, anti-WKH-198)
+  // 🔴 C11 (WKH-204): la verificación está aprobada, ¿pero es DEL que pide el payout? Va DESPUÉS de
+  // `approved` y ANTES de la allowlist: es un AND que SOLO PUEDE RESTAR allows — ningún camino que
+  // hoy devuelve false pasa a devolver true. PROHIBIDO un ||, un early-return que saltee B1-B10, o
+  // mover esta línea. PROHIBIDO `!s.identityMatches` (truthiness): es `!== true` estricto (CD-8).
+  if (s.identityMatches !== true) {
+    // CD-13: discriminación fina para ops, VALUE-FREE — nunca el claim, nunca el vendor_data/DNI.
+    //
+    // fix-pack: el viejo `identityClaimPresent: true` era una TAUTOLOGÍA — C11 es inalcanzable si el
+    // claim no resolvió (resolveIdentityClaim → null → early-return en runCashoutPayout), así que
+    // nunca podía ser false: cero información, y se leía como si fuera dinámico. Lo reemplazan dos
+    // señales que SÍ discriminan:
+    //  · `reasons` (del provider): separa identity_no_binding (Didit no ecoó vendor_data → R-5, falla
+    //    de INTEGRACIÓN, se ve masiva y pareja) de identity_mismatch (claim ajeno → ATAQUE, puntual).
+    //    Sin esto, ops no puede distinguir "la integración está rota" de "nos están atacando".
+    //    Es value-free POR CONTRATO (KycStatusResult.reasons). En C11 solo trae los identity_*:
+    //    `approved` ya es true acá (B2 filtró antes), así que el eje compliance no aporta reasons.
+    //  · `claimSource`: senderIdentity (moderno) vs address (legado chaski-v2/CD-16) — conjunto
+    //    cerrado de literales, nunca el valor.
+    // 🔴 PROHIBIDO agregar acá `claim.value`, el vendor_data o cualquier derivado del DNI (CD-4/CD-7).
+    console.warn("[remit-payout] kyc identity binding mismatch:", {
+      branch: "C11",
+      claimSource: claim.source,
+      reasons: s.reasons,
+    });
+    return false;
+  }
   if (REAL_KYC_PROVENANCES.has(s.provenance)) return true; // B1: única rama que abre en prod
   // B3: en prod el fallback JAMÁS abre — ninguna env puede abrirlo. El orden (isProd primero)
   // es deliberado: no lo inviertas.
@@ -128,10 +197,28 @@ export async function runCashoutPayout(raw: unknown): Promise<CashoutPayoutOutpu
   assertPayoutProviderSafe(); // 2. INTACTO (CD-1) — throws primero, como hoy
   const provider = getPayoutProvider(); // 3. INTACTO — throws adapter_not_ready, como hoy
 
-  // 4. GATE NUEVO (WKH-203): la decisión de compliance se re-deriva server-side contra la fuente
-  // autoritativa. Va DESPUÉS de 2 y 3 a propósito (CD-1: preservar el error de payout cuando hay
-  // dos problemas a la vez). getPayoutProvider() es cero-I/O y cero side-effects → inerte y seguro.
-  if (!(await isKycGatePassed(input.kycVerificationId))) {
+  // 4. WKH-204 / C1-C4: resolver la identity claim. DESPUÉS de 2 y 3 (CD-1: cuando hay dos
+  // problemas, gana el error de payout). C3/C4 bloquean SIN llamar al provider: no se gasta una
+  // llamada a Didit ni se le da señal al caller.
+  const identityClaim = resolveIdentityClaim(input);
+  if (identityClaim === null) {
+    return {
+      slug: SLUG,
+      executed: false,
+      status: "blocked",
+      payoutId: null,
+      deliveredLocal: null,
+      txRef: null,
+      reason: "kyc_identity_claim_missing",
+      provenance: "n/a",
+    };
+  }
+
+  // 5. GATE (WKH-203): la decisión de compliance se re-deriva server-side contra la fuente
+  // autoritativa, + binding de identidad (WKH-204, C11 adentro). Va DESPUÉS de 2 y 3 a propósito
+  // (CD-1: preservar el error de payout cuando hay dos problemas a la vez). getPayoutProvider() es
+  // cero-I/O y cero side-effects → inerte y seguro.
+  if (!(await isKycGatePassed(input.kycVerificationId, identityClaim))) {
     return {
       slug: SLUG,
       executed: false,

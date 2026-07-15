@@ -12,6 +12,16 @@ const DIDIT_BASE = process.env.DIDIT_BASE_URL ?? "https://verification.didit.me"
 // la consumen kyc-validator.ts (isPayoutAllowed) y cashout-payout.ts (isKycGatePassed).
 export const REAL_KYC_PROVENANCES = new Set<string>(["didit"]);
 
+/**
+ * WKH-204: normalización ÚNICA de identity claims. Sirve a las DOS convenciones de vendor_data:
+ * deja el DNI (dígitos) intacto y vuelve el wallet address EVM case-insensitive.
+ * ÚNICA fuente (CD-9): la consumen kyc.ts (DiditKycProvider.status) y cashout-payout.ts (C4).
+ * PROHIBIDO duplicarla — mismo criterio que REAL_KYC_PROVENANCES: el drift es lo que previene.
+ */
+export function normalizeIdentity(s: string): string {
+  return s.trim().toLowerCase();
+}
+
 /** Adapter Didit — activo cuando DIDIT_API_KEY está seteada. */
 export class DiditKycProvider implements KycProvider {
   constructor(private readonly apiKey: string) {}
@@ -55,9 +65,9 @@ export class DiditKycProvider implements KycProvider {
     };
   }
 
-  async status(verificationId: string): Promise<KycStatusResult> {
+  async status(verificationId: string, identityClaim: string): Promise<KycStatusResult> {
     // TODO(sandbox / DIDIT_ADAPTER_READY — R-1): checklist OBLIGATORIO antes de activar
-    // DIDIT_ADAPTER_READY=true. Ambos items son bloqueantes:
+    // DIDIT_ADAPTER_READY=true. Los TRES items son bloqueantes:
     //
     // 1. COMPAT v2↔v3: confirmar que un session_id creado con POST /v2/session/ (ver verify())
     //    es consultable por GET /v3/session/{id}/decision/. Si v3 no acepta ids de v2 → cae en
@@ -71,8 +81,15 @@ export class DiditKycProvider implements KycProvider {
     //    `approved: true` con `riskLevel:"low"`. A diferencia del item 1, este NO es fail-safe:
     //    es un fail-OPEN de compliance en el money-path. Hoy es inocuo SOLO porque el adapter
     //    entero está tras DIDIT_ADAPTER_READY — activarlo sin confirmar esto lo vuelve real.
-    // CD-7: de este JSON se leen SOLO status, aml.hits y session_id. PROHIBIDO leer/loguear
-    // id_verifications[], first_name, last_name, document_number, date_of_birth.
+    //
+    // 3. 🆕 (WKH-204 / R-5): confirmar que GET /v3/session/{id}/decision/ realmente ECOA
+    //    `vendor_data`, y con qué nombre/forma exacta. chaski-v2 lo asume (decision.ts:19) y
+    //    WKH-180 lo dio por bueno, pero ESTE repo nunca lo verificó contra el sandbox. Es
+    //    fail-SAFE: si no lo ecoa → identityMatches:false → rama C5 → blocked, NUNCA fail-open.
+    //    Sin esto confirmado, el binding de identidad bloquea TODO en prod.
+    // CD-7: de este JSON se leen SOLO status, aml.hits, session_id y vendor_data. PROHIBIDO leer/
+    // loguear id_verifications[], first_name, last_name, document_number, date_of_birth.
+    // `vendor_data` se usa para COMPARAR y se DESCARTA: nunca va a reasons, al return ni a un log.
     const res = await fetch(`${DIDIT_BASE}/v3/session/${encodeURIComponent(verificationId)}/decision/`, {
       method: "GET",
       signal: AbortSignal.timeout(8000), // igual que payout.ts:47 — no colgar el money-path
@@ -88,11 +105,52 @@ export class DiditKycProvider implements KycProvider {
     if (echoed !== "" && echoed !== verificationId) {
       throw new Error("didit_status_id_mismatch"); // rama B10, fail-closed
     }
+
+    // WKH-204 / C5-C8 — el binding de identidad. La comparación vive ACÁ a propósito (CD-7):
+    // `vendor_data` en este repo es el DNI; exponerlo crudo filtraría PII. Solo sale un booleano.
+    //
+    // 🔴 C8 — narrowing por `typeof`, NUNCA `String(...)`: `String(123)` es "123" (NO ""), así que
+    // un vendor_data no-string ALCANZARÍA la comparación y un claim "123" MATCHEARÍA = fail-open
+    // (misma clase que WKH-198/WKH-203). Un tipo inesperado DEBE colapsar a "" y bloquear por C5.
+    const vendorRaw: unknown = d.vendor_data;
+    const vendorData = typeof vendorRaw === "string" ? vendorRaw : ""; // C8 → "" → cae en C5
+    const normalizedVendor = normalizeIdentity(vendorData);
+
+    // C5: sin vendor_data no hay CONTRA QUÉ comparar → BLOQUEAR. C6: distinto → false. C7: igual → true.
+    // ⚠️ El `normalizedVendor !== ""` va PRIMERO y es un AND: PROHIBIDO la forma de chaski-v2
+    // (`vendorData !== "" && vendorData !== claim`), que OMITE el check si viene vacío → fail-OPEN
+    // (CD-12, probado ejecutando por el AR de WKH-202). La divergencia con chaski-v2 ES el fix.
+    const identityMatches =
+      normalizedVendor !== "" && normalizedVendor === normalizeIdentity(identityClaim);
+
+    // WKH-204 fix-pack / R-5 — discriminador VALUE-FREE para ops. El agente recibe SOLO un booleano
+    // (CD-7, y está bien así), así que NO puede distinguir "Didit no ecoó vendor_data" (C5) de "el
+    // claim no matchea" (C6): para él son la misma señal. La diferencia es crítica: R-5 = este repo
+    // NUNCA verificó contra el sandbox que GET /v3/.../decision/ realmente ecoe `vendor_data`. Si no
+    // lo ecoa, el binding bloquea TODO en prod y ops ve una avalancha de warns idénticos,
+    // indistinguibles de un ataque real. Esta es la única señal que separa "falla de integración"
+    // (identity_no_binding masivo) de "alguien está atacando" (identity_mismatch puntual).
+    //
+    // 🔴 Son ETIQUETAS DE RAMA, NUNCA valores: PROHIBIDO interpolar acá el vendor_data, el claim o
+    // cualquier derivado (CD-4/CD-7). El contrato de `reasons` ya exige value-free.
+    // 🔴 El nombre NO contiene el literal "vendor_data" A PROPÓSITO: el canario CD-7 de kyc.test.ts
+    // assertea que ese literal jamás cruza el borde. No se debilita un canario de PII para acomodar
+    // el nombre de una etiqueta — se elige otro nombre. (De ahí `no_binding` y no `no_vendor_data`.)
+    const identityReasons = identityMatches
+      ? []
+      : [normalizedVendor === "" ? "identity_no_binding" : "identity_mismatch"];
+
     return assertValidKycStatus({
       approved,
       verificationId, // canónico = el PEDIDO (igual que payout.ts:53)
       provenance: "didit",
-      reasons: approved ? [] : [`didit_status_${decision}`, `aml_hits_${amlHits}`],
+      identityMatches,
+      // Los dos ejes son INDEPENDIENTES (una verificación puede estar aprobada Y no ser tuya):
+      // por eso los reasons de identidad se CONCATENAN, no reemplazan a los de compliance.
+      reasons: [
+        ...(approved ? [] : [`didit_status_${decision}`, `aml_hits_${amlHits}`]),
+        ...identityReasons,
+      ],
     });
   }
 }
@@ -122,7 +180,7 @@ export class FallbackKycProvider implements KycProvider {
     };
   }
 
-  async status(verificationId: string): Promise<KycStatusResult> {
+  async status(verificationId: string, _identityClaim: string): Promise<KycStatusResult> {
     // NO es verificación real y NO hay store: determinístico y SIEMPRE tageado local-fallback.
     // Es INOCUO por construcción: REAL_KYC_PROVENANCES lo bloquea en prod SIEMPRE (rama B3).
     // El `approved: true` NO abre nada — la seguridad vive en la allowlist del gate (B3/B4),
@@ -131,6 +189,10 @@ export class FallbackKycProvider implements KycProvider {
       approved: true,
       verificationId,
       provenance: "local-fallback",
+      // WKH-204 / C9: NO tiene store y NO debe fingir que lo tiene (mismo razonamiento que su
+      // `approved: true`). INOCUO por construcción: B3 lo bloquea en prod SIEMPRE, y en dev/CI
+      // exige ALLOW_FALLBACK_KYC=true (B5). La seguridad vive en la allowlist, no acá.
+      identityMatches: true,
       reasons: ["fallback_no_real_verification"], // mismo reason que FallbackKycProvider.verify()
     };
   }
@@ -153,6 +215,9 @@ export function assertValidKycStatus(s: KycStatusResult): KycStatusResult {
   if (typeof s.approved !== "boolean") throw new Error("invalid_kyc_status_approved");
   if (!s.verificationId) throw new Error("invalid_kyc_status_id");
   if (!s.provenance) throw new Error("invalid_kyc_status_provenance");
+  // WKH-204/C10: espejo exacto del guard de `approved` — una señal de binding no-booleana
+  // NUNCA debe llegar al gate (anti-WKH-198).
+  if (typeof s.identityMatches !== "boolean") throw new Error("invalid_kyc_status_identity");
   return s;
 }
 

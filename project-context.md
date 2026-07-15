@@ -174,15 +174,42 @@ N/A — la auth/pago del caller la resuelve el gateway `wasiai-a2a` (repo extern
   defecto: un env olvidado NUNCA abre el money-path.
 - **WKH-203 (gate KYC server-side del payout):** `remit-cashout-payout` NO confía en ningún booleano
   del caller para decidir compliance. `isKycGatePassed()` (`src/agents/cashout-payout.ts`) re-deriva
-  la decisión server-side consultando `KycProvider.status(verificationId)` contra la fuente
+  la decisión server-side consultando `KycProvider.status(verificationId, identityClaim)` contra la fuente
   autoritativa, y aplica `REAL_KYC_PROVENANCES` (allowlist ÚNICA, `src/providers/kyc.ts` — CD-9,
   PROHIBIDO duplicarla). Default = **BLOQUEAR**: no existe rama "else → allow". "No sé" (partner
   caído/timeout) ≠ "aprobado" → `kyc_gate_unavailable` → 502, nunca fail-open. La comparación es
   `approved !== true` **estricta** (PROHIBIDA la truthiness — precedente WKH-198, un fail-open que se
   coló por un `NaN`). En dev/CI el KYC fallback exige `ALLOW_FALLBACK_KYC=true`; en producción el
   fallback **jamás** abre el gate y **ninguna env puede abrirlo**.
-  Riesgo residual conocido: el gate confirma que la verificación está aprobada, **no** que sea de
-  quien pide el payout (binding `verificationId` ↔ sender) → **WKH-204**.
+- **WKH-204 (identity binding del payout — `senderIdentity`):** el gate de WKH-203 confirma que la
+  verificación está **aprobada**, no que sea **del que pide el payout**. `remit-cashout-payout` exige
+  además una identity claim y la compara contra el `vendor_data` **real** que la fuente autoritativa
+  tiene atado a esa verificación; si no coincide → **blocked**.
+  - **`senderIdentity`**: `z.string().min(1).optional()` — **string OPACO** (ver la regla anti-`z.enum`
+    en PROHIBIDO). Semántica: el valor ligado como `vendor_data` al crear la verificación (el **DNI**
+    si la creó `remit-kyc-validator`; la **wallet address** si la creó `chaski-v2`). El agente NO
+    adivina la convención: compara contra la fuente autoritativa. "No sé qué convención es" nunca
+    produce un allow. Normalización **ÚNICA**: `normalizeIdentity()` (`src/providers/kyc.ts`,
+    `trim()`+`toLowerCase()`) — PROHIBIDO duplicarla (mismo criterio que `REAL_KYC_PROVENANCES`).
+  - **`address`**: **DEPRECADO** — puente de compat con `chaski-v2` (que manda `address`, no
+    `senderIdentity`). Precedencia determinística: `senderIdentity ?? address` (gana el explícito;
+    PROHIBIDA una rama "ambos discrepan → ambiguo"). PROHIBIDO construir features nuevas sobre él.
+  - **La comparación vive DENTRO del provider** (`DiditKycProvider.status()`), NO en el agente: en este
+    repo `vendor_data` **es el DNI** (`verify()`: `vendor_data: input.legalId`) → exponerlo crudo en
+    `KycStatusResult` sería una fuga de PII nueva. Solo cruza el borde `identityMatches: boolean`.
+    PROHIBIDO agregar `vendorData`/`legalId`/`identity` a `KycStatusResult`.
+  - **Fail-closed en todas las ramas**: sin claim / claim whitespace → `kyc_identity_claim_missing`
+    **sin llamar al provider**; `vendor_data` ausente/vacío/**no-string** → `identityMatches:false` →
+    blocked (⚠️ **divergencia deliberada de `chaski-v2/authority.ts`, que omite el check si viene
+    vacío = fail-OPEN — la divergencia ES el fix**). `identityMatches !== true` **estricto** en el gate.
+  - **No-oracle**: "no aprobado" y "aprobado pero no es tuyo" colapsan al mismo
+    `reason:"kyc_gate_not_passed"` (no confirmar DNIs de a uno). La discriminación fina va a
+    `console.warn` server-side y **value-free** (nunca el claim, nunca el `vendor_data`).
+  - ⚠️ **Alcance real**: NO es prueba criptográfica de posesión (no hay firma/SIWE) y `senderIdentity`
+    es caller-controlado. Sube la barra (deja de ser un ataque de un solo dato); un atacante con
+    **ambos** datos pasa. Para sesiones creadas con `vendor_data` **público** (wallet address, caso
+    `chaski-v2`) la protección de **ese** flujo es **≈nula**. Prueba de posesión = HU de seguimiento.
+    Riesgo residual: cerrar WKH-204 **NO** habilita la Fase A (falta G3/WKH-168).
 - **CD-6 (no-PII, todos los agentes remesa):** ningún response (200/400/502) puede exponer
   `beneficiary.name`/`beneficiary.destination` (Yape/CCI), `legalId` (DNI) ni `travelRuleData` en
   claro. El Travel Rule data viaja solo por `verificationId` (handle), nunca inline en el envelope
@@ -191,6 +218,16 @@ N/A — la auth/pago del caller la resuelve el gateway `wasiai-a2a` (repo extern
 ### PROHIBIDO
 - NUNCA `any` explícito en TypeScript.
 - NUNCA hardcodear URLs, keys o secrets — todo vía env vars.
+- **NUNCA `z.enum`/`z.literal` en un campo de input que pueda contener PII mientras el 400 devuelva
+  `parsed.error.flatten()` (WKH-204/CD-11).** Zod **ecoa el valor recibido** en el mensaje del enum:
+  `"Invalid enum value. Expected 'wallet_address' | 'legal_id', received 'DNI-12345678'"` — y
+  `route.ts` devuelve ese `flatten()` tal cual en el body del 400 (y el gateway lo persiste) →
+  **publica el DNI**. `z.string()` es **value-free** (`"Expected string, received number"`).
+  Verificado ejecutando contra zod 3.25.76. ⇒ esos campos son `z.string()` **opaco**.
+- **NUNCA leer un valor externo con `String(x ?? "")` para "sanitizarlo" a "" y bloquear**
+  (WKH-204/C8): `String(123)` es `"123"`, **no** `""`, y `String({})` es `"[object Object]"` → el
+  valor **alcanza** la comparación y un claim `"123"` **matchea = fail-open**. Usar
+  **`typeof`-narrowing**: `typeof raw === "string" ? raw : ""`. Misma clase de bug que WKH-198.
 - NUNCA debilitar, saltear o volver condicional un fail-safe money-path existente
   (`assertPayoutProviderSafe`, `isPayoutAllowed`, los gates `*_ADAPTER_READY`).
 - NUNCA tocar el demo live (`agentshop-*`, `wasiai-agentshop.vercel.app`, la PWA `chaski-ai`) ni el
@@ -242,6 +279,9 @@ No existe `.env.example` en el repo — inferido de README + código (`process.e
 | Fecha | Error | Fix | Aplicar en |
 |-------|-------|-----|-----------|
 | 2026-07-15 | (WKH-203 F0) `resolveTravelRuleData()` en `cashout-payout.ts` es un STUB (`TODO(WKH-168/sandbox)`) que devuelve datos sintéticos vacíos — NO recupera nada real por `kycVerificationId`. No asumir que "ya recupera datos por verificationId vía canal seguro" significa que existe un store real. | N/A (hallazgo de grounding, no bug de código) | Cualquier HU futura que toque `kycVerificationId` / Travel Rule en este repo |
+| 2026-07-15 | (WKH-204 F3) El SDD especificaba el guard de C8 con `String(v ?? "")` para colapsar un `vendor_data` no-string a `""` y bloquear. **Nace fail-OPEN**: `String(123)` es `"123"` (no `""`), así que un `vendor_data: 123` alcanza la comparación y un claim `"123"` **matchea → ALLOW** (ídem `{}` → `"[object Object]"`). Verificado ejecutando. | `typeof`-narrowing: `typeof vendorRaw === "string" ? vendorRaw : ""`. Test que lo mata: `vendor_data:123` + claim `"123"` → `identityMatches:false`. Regla asentada en PROHIBIDO. | Cualquier guard que "sanitice" un valor externo a `""` para bloquear. Misma clase que WKH-198 (`NaN`) y WKH-203 (`approved` no-booleano): *un valor ausente o de tipo inesperado se lee como señal positiva* |
+| 2026-07-15 | (WKH-204 F3) `z.string().min(1)` **NO trimea**: un claim `"   "` **atraviesa Zod** (verificado con zod 3.25.76). Sin una rama explícita, si el `vendor_data` también viniera vacío, `"" === ""` **matchearía = fail-open**. La rama parece redundante ("`min(1)` ya lo cubre") y es exactamente el tipo de código que se "limpia" sin entender. | Rama C4 explícita: `if (normalizeIdentity(claim) === "") return null` → blocked, y además evita gastar una llamada al partner. Defensa en profundidad junto a C5. | Cualquier validación que asuma que `min(1)` implica contenido no-vacío tras normalizar |
+| 2026-07-15 | (WKH-204 F3) Mutation testing del gate: el mutante `identityMatches !== true` → `!identityMatches` (truthiness) **sobrevivía** a la suite. Es alcanzable de verdad: `FallbackKycProvider.status()` devuelve un object literal que **no** pasa por `assertValidKycStatus()`, así que el guard C10 no lo cubre y el `!== true` del gate es la última línea de defensa. | Tests con `vi.spyOn(FallbackKycProvider.prototype,"status")` devolviendo `identityMatches: 1` (truthy no-booleano) y `approved: 1` → deben dar blocked. Resultado: **12/12 mutantes muertos** (WKH-203 estaba en 8/9). | Todo gate `!== true`: si ningún test inyecta un truthy-no-booleano, la estrictez **no está testeada** y el mutante sobrevive |
 
 ---
 

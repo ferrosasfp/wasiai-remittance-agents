@@ -120,16 +120,44 @@ El agente `remit-cashout-payout` ya es invocable vía Next.js App Router (mismo 
 ```
 POST /api/agents/remit-cashout-payout/invoke
 body: { "quoteId": "q1", "amountUsd": 100, "kycVerificationId": "v1",
+        "senderIdentity": "<el vendor_data ligado a esa verificación: DNI o wallet address>",
         "beneficiary": { "name": "<PII>", "country": "PE", "method": "yape", "destination": "<Yape/CCI>" },
         "idempotencyKey": "idem-1" }
 → 200 { "result": { "slug", "executed", "status", "payoutId",
                     "deliveredLocal", "txRef", "reason", "provenance" } }  # SIN beneficiary ni travelRuleData
-→ 200 { "result": { "executed": false, "status": "blocked", "reason": "kyc_gate_not_passed" } }  # hard-gate KYC (WKH-203: server-side, no del caller)
+→ 200 { "result": { "executed": false, "status": "blocked", "reason": "kyc_gate_not_passed" } }  # hard-gate KYC (WKH-203: server-side, no del caller) o identidad no coincide (WKH-204)
+→ 200 { "result": { "executed": false, "status": "blocked", "reason": "kyc_identity_claim_missing" } }  # falta la identity claim (WKH-204)
 → 400 { "error": "invalid_input", "details": {...} }  # body inválido (mensajes Zod, sin PII)
 → 502 { "error": "payout_unavailable" }               # fail-safe / misconfig del provider
 ```
 
-> **Nota**: el campo `kycPayoutAllowed` fue **removido del schema** (WKH-203). El hard-gate KYC ahora se **re-deriva server-side** contra Didit: `KycProvider.status(kycVerificationId)` → allowlist `REAL_KYC_PROVENANCES`. Si código legacy (`chaski-v2/gateways.ts`) aún envía `kycPayoutAllowed: true`, **Zod lo strippea silenciosamente** (schema sin `.strict()`); el campo no tiene ningún efecto.
+> **Nota**: el campo `kycPayoutAllowed` fue **removido del schema** (WKH-203). El hard-gate KYC ahora se **re-deriva server-side** contra Didit: `KycProvider.status(verificationId, identityClaim)` → allowlist `REAL_KYC_PROVENANCES`. (El 2º parámetro es **requerido** desde WKH-204: un opcional se puede olvidar en un call site nuevo y degradaría el binding en silencio; uno requerido **no compila**.) Si código legacy (`chaski-v2/gateways.ts`) aún envía `kycPayoutAllowed: true`, **Zod lo strippea silenciosamente** (schema sin `.strict()`); el campo no tiene ningún efecto.
+
+### Identity binding — `senderIdentity` (WKH-204)
+
+El hard-gate de WKH-203 confirma que la verificación está **aprobada**, no que sea **del que pide el payout**.
+WKH-204 ata las dos cosas: el caller presenta `senderIdentity` y el agente lo compara contra el `vendor_data`
+**real** que la fuente autoritativa (Didit) tiene atado a esa verificación. Si no coincide → **blocked**.
+
+- **`senderIdentity`** (`string`, opcional en el schema): el valor que quedó ligado como `vendor_data` a esa
+  verificación **en su creación** — el **DNI** si la creó `remit-kyc-validator`, la **wallet address** si la creó
+  `chaski-v2`. La comparación normaliza con `trim()` + `toLowerCase()` (deja el DNI intacto y vuelve el address
+  EVM case-insensitive). El valor **nunca** se ecoa en un response ni se loguea.
+- **`address`** (`string`, opcional): **DEPRECADO** — puente de compatibilidad con `chaski-v2`, que hoy manda
+  `address` y no `senderIdentity`. Se usa **solo** si `senderIdentity` está ausente (precedencia: gana el
+  explícito). No construir features nuevas sobre él; se elimina cuando `chaski-v2` mande `senderIdentity`.
+- **Fail-closed**: sin claim (o claim vacío/whitespace) → `kyc_identity_claim_missing` **sin llamar a Didit**. Si
+  la verificación no tiene `vendor_data` contra qué comparar → **blocked** (no se asume que coincide).
+- **No-oracle**: "no aprobado" y "aprobado pero no es tuyo" colapsan al **mismo** `reason:
+  "kyc_gate_not_passed"`, para no convertir el endpoint en un confirmador de DNIs.
+
+> ⚠️ **Alcance real de esta protección (sin eufemismos).** El binding `kycVerificationId` ↔ `senderIdentity`
+> **sube la barra** (deja de ser un ataque de un solo dato) pero **NO constituye prueba criptográfica de
+> posesión**: no hay firma ni SIWE, y `senderIdentity` es caller-controlado igual que `kycVerificationId`. Un
+> atacante que consiga **ambos** datos pasa. Además, cuando la sesión KYC fue creada con un `vendor_data`
+> **público** (ej. una wallet address, como hace `chaski-v2`), la protección de **ese** flujo es **≈nula**: el
+> atacante que quiere suplantar a esa víctima ya conoce su address. La prueba de posesión real es una HU de
+> seguimiento.
 
 Etapa 1 corre 100% en **payout MOCK** (`FallbackPayoutProvider`, `provenance:"local-fallback"`,
 `deliveredLocal:null`, `txRef:null`): NUNCA mueve plata real. **TransFi queda OFF** (etapa 2 / WKH-168):

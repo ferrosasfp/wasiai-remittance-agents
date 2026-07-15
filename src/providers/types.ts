@@ -38,14 +38,36 @@ export interface KycStatusResult {
   approved: boolean;
   verificationId: string; // eco del id consultado (canónico = el pedido)
   provenance: Provenance; // "didit" | "local-fallback"
-  reasons: string[]; // auditable y VALUE-FREE (ej. "didit_status_declined"); nunca PII
+  /**
+   * Auditable y VALUE-FREE (ej. "didit_status_declined"); nunca PII.
+   * WKH-204 fix-pack — discriminadores del eje IDENTIDAD, para que ops pueda separar una falla de
+   * integración de un ataque (R-5); son ETIQUETAS DE RAMA, nunca valores:
+   *  · "identity_no_binding" — la fuente autoritativa NO tiene un valor de binding atado a esta
+   *    verificación (no lo ecoó / vino vacío / vino de un tipo inesperado) → no hay CONTRA QUÉ
+   *    comparar → bloquea (C5/C8). Masivo y parejo = la integración está rota (R-5).
+   *  · "identity_mismatch" — SÍ hay binding y NO coincide con el claim (C6). Puntual = ataque.
+   * Se CONCATENAN a los reasons de compliance: los dos ejes son independientes.
+   */
+  reasons: string[];
+  /**
+   * WKH-204: ¿la identity claim del caller coincide con el `vendor_data` que la fuente autoritativa
+   * tiene atado a esta verificación? Booleano DERIVADO: la comparación ocurre DENTRO del provider.
+   * CD-7: `vendor_data` en este repo es el DNI (lo setea `DiditKycProvider.verify()`) → PROHIBIDO
+   * exponerlo crudo acá. (Se cita el SÍMBOLO y no un nº de línea: las refs numéricas quedan stale al
+   * primer insert — lección de WKH-203, repetida acá cuando `normalizeIdentity` corrió el archivo.)
+   * ⚠️ Es un booleano, NUNCA `vendorData`: PROHIBIDO agregar a esta interface un `vendorData`,
+   * `legalId`, `identity`, `travelRuleData` ni nada derivado del DNI.
+   */
+  identityMatches: boolean;
 }
 
 export interface KycProvider {
   verify(input: KycInput): Promise<KycResult>;
   // Consulta de estado de una verificación ya existente, por su verificationId.
-  // Espejo de PayoutProvider.status(payoutId) (L84-90 de este archivo).
-  status(verificationId: string): Promise<KycStatusResult>;
+  // Espejo de `PayoutProvider.status(payoutId)` (más abajo en este archivo) — símbolo, no nº de línea.
+  // WKH-204: `identityClaim` es REQUERIDO a propósito (no opcional): un param opcional se puede
+  // OLVIDAR en un call site nuevo y degradaría en silencio; uno requerido NO COMPILA.
+  status(verificationId: string, identityClaim: string): Promise<KycStatusResult>;
 }
 
 // ── FX / Corridor quote ──────────────────────────────────────────────────────
