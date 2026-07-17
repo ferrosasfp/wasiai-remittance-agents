@@ -64,7 +64,10 @@ export interface CashoutPayoutOutput {
  */
 function assertPayoutProviderSafe(): void {
   const hasReal =
-    !!process.env.TRANSFI_API_KEY && process.env.TRANSFI_ADAPTER_READY === "true";
+    !!process.env.TRANSFI_USERNAME &&
+    !!process.env.TRANSFI_PASSWORD &&
+    !!process.env.TRANSFI_MID &&
+    process.env.TRANSFI_ADAPTER_READY === "true";
   if (hasReal) return;
   if (process.env.NODE_ENV === "production") {
     // ⚠️ SEGURIDAD MONEY-PATH (WKH-172, etapa 1): PAYOUT_ALLOW_MOCK habilita SOLO el

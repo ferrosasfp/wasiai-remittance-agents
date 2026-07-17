@@ -132,16 +132,38 @@ export async function POST(req: NextRequest) {
 
 ### Patron de fail-safe money-path (provider factory)
 ```ts
-// getXProvider(): real solo si hay KEY + ADAPTER_READY=true (opt-in explícito, fail-loud si falta)
+// getPayoutProvider(): real solo con las 3 creds TransFi + ADAPTER_READY=true (opt-in explícito,
+// fail-loud si falta readiness). WKH-208: el payout usa user+pass+mid (NO TRANSFI_API_KEY).
 export function getPayoutProvider(): PayoutProvider {
-  const key = process.env.TRANSFI_API_KEY;
-  if (!key) return new FallbackPayoutProvider();
+  const { TRANSFI_USERNAME, TRANSFI_PASSWORD, TRANSFI_MID } = process.env;
+  if (!TRANSFI_USERNAME || !TRANSFI_PASSWORD || !TRANSFI_MID) return new FallbackPayoutProvider();
   if (process.env.TRANSFI_ADAPTER_READY !== "true") {
     throw new Error("transfi_adapter_not_ready: ...");
   }
-  return new TransFiPayoutProvider(key);
+  return new TransFiPayoutProvider({ ... });
 }
 ```
+
+### Env vars TransFi (WKH-208 — payout off-ramp real, sandbox-only)
+El adapter de payout (`src/providers/payout.ts`) habla el contrato REAL de TransFi off-ramp. Creds
+SOLO por env (nunca hardcode). El mock (`FallbackPayoutProvider`) sigue siendo el default sin las 3
+creds + `TRANSFI_ADAPTER_READY=true`.
+
+| Env var | Rol |
+|---|---|
+| `TRANSFI_USERNAME` | Basic auth user (secreto). Señal de "real" en payout — reemplaza a `TRANSFI_API_KEY` en el payout. |
+| `TRANSFI_PASSWORD` | Basic auth pass (secreto). |
+| `TRANSFI_MID` | valor del header `mid` (ej. `WIIB1V_NA_NA`). |
+| `TRANSFI_BASE_URL` | host base; default `https://sandbox-api.transfi.com` (sandbox-only). |
+| `TRANSFI_USDC_NETWORK` | red del USDC del `source`; default `base` → `USDCBASE`. Fail-loud si fuera del allowlist. |
+| `TRANSFI_SOURCE_WALLET_ADDRESS` | `source.walletAddress` del body (config, no secreto — TODO(F3-sandbox)). |
+| `TRANSFI_SOURCE_URL` | `sourceUrl` del body (URL del merchant, server-only, no secreto — TODO(F3-sandbox): confirmar si es requerido y qué valor). Default `""` → fail-loud (4xx) si el sandbox lo exige. |
+| `TRANSFI_PURPOSE_CODE` | `purposeCode` del body (TODO(F3-sandbox): valor válido para PE). |
+| `TRANSFI_PAYMENT_CODE` | `destination.paymentCode` (TODO(F3-sandbox): de GET /v3/payment-methods PEN/withdraw). |
+| `TRANSFI_USER_ID` | `userId` del body (usuario TransFi KYC'd; TODO(F3-sandbox), probable HU de seguimiento). |
+| `TRANSFI_WEBHOOK_SECRET` | firma del webhook off-ramp — **RESERVADO, NO se lee en este repo** (el webhook receiver vive en chaski-v2). |
+| `TRANSFI_API_KEY` | **LEGADO — lo usa `fx.ts`, NO borrar.** El payout ya NO lo lee. |
+| `TRANSFI_ADAPTER_READY` | opt-in del adapter real; **compartido con `fx.ts`, NO renombrar.** |
 
 ### Patron de acceso a base de datos
 N/A — no existe capa de persistencia en este repo.

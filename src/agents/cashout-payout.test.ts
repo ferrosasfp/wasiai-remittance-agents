@@ -490,6 +490,10 @@ describe("runCashoutPayout — flag PAYOUT_ALLOW_MOCK (prod opt-in, etapa 1)", (
   it("PROD + PAYOUT_ALLOW_MOCK → ejecuta mock (no mueve plata)", async () => {
     vi.stubEnv("NODE_ENV", "production");
     vi.stubEnv("TRANSFI_API_KEY", "");
+    // CD-12 (WKH-208): el path fallback no debe confiar en la AUSENCIA de las creds nuevas.
+    vi.stubEnv("TRANSFI_USERNAME", "");
+    vi.stubEnv("TRANSFI_PASSWORD", "");
+    vi.stubEnv("TRANSFI_MID", "");
     vi.stubEnv("PAYOUT_ALLOW_MOCK", "true");
     // WKH-203: en PROD el gate KYC solo abre con una verificación REAL aprobada (rama B1) — el
     // fallback jamás abre en prod (B3). Solo crece el ARRANGE: los asserts son los originales.
@@ -504,18 +508,24 @@ describe("runCashoutPayout — flag PAYOUT_ALLOW_MOCK (prod opt-in, etapa 1)", (
     expect(out.txRef).toBeNull();
   });
 
-  it("PROD + PAYOUT_ALLOW_MOCK + TRANSFI_API_KEY sin READY → throws transfi_adapter_not_ready", async () => {
-    // El flag NO habilita un real a medias ni un mock silencioso: getPayoutProvider() lanza fail-loud.
+  it("PROD + PAYOUT_ALLOW_MOCK + creds TransFi sin READY → throws transfi_adapter_not_ready", async () => {
+    // WKH-208: el payout usa TRANSFI_USERNAME/PASSWORD/MID (no TRANSFI_API_KEY). El flag NO habilita
+    // un real a medias ni un mock silencioso: getPayoutProvider() lanza fail-loud.
     vi.stubEnv("NODE_ENV", "production");
     vi.stubEnv("PAYOUT_ALLOW_MOCK", "true");
-    vi.stubEnv("TRANSFI_API_KEY", "k");
+    vi.stubEnv("TRANSFI_USERNAME", "u");
+    vi.stubEnv("TRANSFI_PASSWORD", "p");
+    vi.stubEnv("TRANSFI_MID", "m");
     vi.stubEnv("TRANSFI_ADAPTER_READY", "");
     await expect(runCashoutPayout(validInput)).rejects.toThrow(/transfi_adapter_not_ready/);
   });
 
   it("PROD sin PAYOUT_ALLOW_MOCK → throws payout_refused (default intacto)", async () => {
     vi.stubEnv("NODE_ENV", "production");
-    vi.stubEnv("TRANSFI_API_KEY", "");
+    // CD-12: no confiar en la AUSENCIA de las creds nuevas — stub explícito a "".
+    vi.stubEnv("TRANSFI_USERNAME", "");
+    vi.stubEnv("TRANSFI_PASSWORD", "");
+    vi.stubEnv("TRANSFI_MID", "");
     vi.stubEnv("PAYOUT_ALLOW_MOCK", "");
     await expect(runCashoutPayout(validInput)).rejects.toThrow(/payout_refused/);
   });

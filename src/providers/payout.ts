@@ -1,61 +1,178 @@
-// Payout provider — TransFi adapter + fallback MOCK (no mueve plata).
+// Payout provider — TransFi off-ramp adapter + fallback MOCK (no mueve plata).
 // ⚠️ El movimiento REAL del principal + la máquina de estados (quote-lock → principal-in →
 // payout → reconcile → refund) vive en la capa de value-delivery (WKH-168, gated sandbox TransFi).
 // Este provider es solo el LEAF que llama al partner; el fallback NUNCA desembolsa de verdad.
+//
+// WKH-208: contrato HTTP REAL de TransFi off-ramp (sandbox-only, cero plata real):
+//  · POST /v3/orders con orderType:"offramp"  (NO /v1/payouts)
+//  · Auth Basic base64(user:pass) + header `mid`  (NUNCA Bearer / x-api-key)
+//  · Idempotencia por campo `partnerId` = input.idempotencyKey  (NO header idempotency-key)
+//  · Modelo create-order ASYNC: el POST devuelve una `depositAddress` dedicada; el `settled` llega
+//    DESPUÉS por webhook (fuera de scope, CD-4). El POST NUNCA se asume `settled`.
 
 import type { PayoutInput, PayoutProvider, PayoutResult } from "./types";
 
-const TRANSFI_BASE = process.env.TRANSFI_BASE_URL ?? "https://api.transfi.com";
+// CD-1: default sandbox. Ningún path apunta a api.transfi.com salvo que el env lo fuerce.
+const TRANSFI_BASE = process.env.TRANSFI_BASE_URL ?? "https://sandbox-api.transfi.com";
 
-/** Adapter TransFi — activo con key + readiness. Ejecuta el desembolso real a Yape/Plin/banco. */
+// DT-2 (humano, 2026-07-17): la red del USDC es Base. Configurable por env, fail-loud si no soportada.
+const TRANSFI_DEFAULT_NETWORK = "base";
+
+// Códigos `source.currency` publicados por TransFi (doc/transfi-offramp-api-spec.md L38).
+// ⚠️ Avalanche (`USDCAVAX`) NO está en la lista → cae en fail-loud (AC-6), a propósito.
+const TRANSFI_USDC_CURRENCY: Record<string, string> = {
+  ethereum: "USDC",
+  polygon: "USDCPOLYGON",
+  base: "USDCBASE",
+  arbitrum: "USDCARB",
+  bsc: "USDCBSC",
+  solana: "USDCSOL",
+  celo: "USDCCELO",
+  linea: "USDCLINEA",
+  algorand: "USDCALGO",
+  stellar: "USDCXLM",
+  fuse: "USDCFUSE",
+};
+
+/**
+ * Resuelve el `source.currency` para la red pedida. Fail-loud ANTES de armar/enviar el body (AC-6):
+ * una red no soportada NUNCA debe mandar una orden con una currency inventada.
+ */
+export function resolveSourceCurrency(network: string): string {
+  const code = TRANSFI_USDC_CURRENCY[network.trim().toLowerCase()];
+  if (!code) throw new Error(`transfi_unsupported_network_${network}`);
+  return code;
+}
+
+interface TransFiCreds {
+  username: string;
+  password: string;
+  mid: string;
+}
+
+// CD-8: Basic base64(user:pass) + header `mid`. NUNCA Bearer / x-api-key / idempotency-key.
+function transfiHeaders(c: TransFiCreds): HeadersInit {
+  const basic = Buffer.from(`${c.username}:${c.password}`).toString("base64");
+  return {
+    "content-type": "application/json",
+    authorization: `Basic ${basic}`,
+    mid: c.mid,
+  };
+}
+
+/**
+ * Lee un string NO vacío de la respuesta, probando los nombres candidatos por orden.
+ * Narrowing por `typeof` (NUNCA `String()` coercitivo — WKH-204/C8): un campo ausente o no-string
+ * colapsa a null y NO produce un valor fabricado.
+ */
+function readString(obj: Record<string, unknown>, keys: string[]): string | null {
+  for (const k of keys) {
+    const v = obj[k];
+    if (typeof v === "string" && v.length > 0) return v;
+  }
+  return null;
+}
+
+/** Adapter TransFi — activo con las 3 creds + readiness. Crea la orden off-ramp real. */
 export class TransFiPayoutProvider implements PayoutProvider {
-  constructor(private readonly apiKey: string) {}
+  constructor(private readonly creds: TransFiCreds) {}
 
   async execute(input: PayoutInput): Promise<PayoutResult> {
-    // TODO(sandbox): confirmar endpoint/shape + el flujo de depósito del principal.
-    const res = await fetch(`${TRANSFI_BASE}/v1/payouts`, {
+    // AC-6: resolver la red PRIMERO (fail-loud antes de tocar la red). Una red no soportada
+    // NO debe llegar al fetch.
+    const sourceCurrency = resolveSourceCurrency(
+      process.env.TRANSFI_USDC_NETWORK ?? TRANSFI_DEFAULT_NETWORK,
+    );
+
+    const res = await fetch(`${TRANSFI_BASE}/v3/orders`, {
       method: "POST",
-      signal: AbortSignal.timeout(15000), // payout puede tardar; igual acotado
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${this.apiKey}`,
-        "idempotency-key": input.idempotencyKey, // evita doble-desembolso
-      },
+      signal: AbortSignal.timeout(15000), // payout puede tardar; igual acotado (espejo kyc.ts)
+      headers: transfiHeaders(this.creds),
       body: JSON.stringify({
-        quoteId: input.quoteId,
-        amount: input.amountUsd,
-        beneficiary: input.beneficiary,
-        // travelRuleData se envía al partner por este canal seguro (NO por el result a2a).
-        travelRule: input.travelRuleData,
+        orderType: "offramp", // fijo (AC-2)
+        partnerId: input.idempotencyKey, // CD-6/AC-2: byte-idéntico, sin regenerar/derivar
+        // TODO(F3-sandbox): flujo del `userId` (usuario TransFi KYC'd, "UX-..."). Probable HU de
+        // seguimiento — hoy no viaja en PayoutInput. Se toma de config hasta confirmarlo en sandbox.
+        userId: process.env.TRANSFI_USER_ID ?? "",
+        // TODO(F3-sandbox): `purposeCode` válido para remesas a Perú.
+        purposeCode: process.env.TRANSFI_PURPOSE_CODE ?? "",
+        // TODO(F3-sandbox): confirmar si `sourceUrl` es requerido y qué valor espera TransFi
+        // (URL del merchant). Server-only, solo de env — nunca hardcode. Default "" → si el sandbox
+        // lo exige produce un 4xx thrown (fail-loud, consistente con los otros campos inciertos).
+        sourceUrl: process.env.TRANSFI_SOURCE_URL ?? "",
+        source: {
+          currency: sourceCurrency,
+          // TODO(F3-sandbox): confirmar la forma de `source.walletAddress` con el sandbox.
+          walletAddress: process.env.TRANSFI_SOURCE_WALLET_ADDRESS ?? "",
+          amount: input.amountUsd, // fijo
+        },
+        destination: {
+          currency: "PEN", // fijo
+          paymentType: "bank_transfer", // fijo (spec L48)
+          // TODO(F3-sandbox): `paymentCode` de GET /v3/payment-methods (PEN/withdraw).
+          paymentCode: process.env.TRANSFI_PAYMENT_CODE ?? "",
+          // TODO(F3-sandbox): `destination.amount` = monto PEN. HOY no viaja en PayoutInput; si el
+          // sandbox confirma que TransFi lo exige, extender PayoutInput es HU de seguimiento (Scope OUT).
+          // TODO(F3-sandbox): forma exacta de `additionalPaymentDetails` (beneficiario PE: CCI/banco/doc)
+          // via GET /v3/payment-methods. Los nombres de estos sub-campos NO están confirmados en docs.
+          additionalPaymentDetails: {
+            name: input.beneficiary.name,
+            method: input.beneficiary.method,
+            destination: input.beneficiary.destination,
+            country: input.beneficiary.country,
+          },
+        },
       }),
     });
+    // CD-5/AC-7: error HTTP → throw tipado por status. NUNCA éxito silencioso ni downgrade al mock.
     if (!res.ok) throw new Error(`transfi_payout_error_${res.status}`);
-    const d = (await res.json()) as any;
+    // Un 2xx con body vacío/no-JSON NO debe filtrar un SyntaxError crudo (ni asumir settled ni
+    // caer al mock): se tipa como error del adapter, consistente con el resto de errores.
+    let d: Record<string, unknown>;
+    try {
+      d = (await res.json()) as Record<string, unknown>;
+    } catch {
+      throw new Error("transfi_payout_bad_response");
+    }
+    // TODO(F3-sandbox): nombres JSON exactos de `orderId` / `depositAddress` en la respuesta del POST.
+    // Parseo defensivo (narrowing por tipo, NO String()); W3/sandbox confirma los nombres reales.
+    const orderId = readString(d, ["orderId", "id"]);
+    if (!orderId) throw new Error("transfi_payout_missing_order_id");
+    const depositAddress = readString(d, ["depositAddress", "walletAddress"]);
     return assertValidPayout({
-      payoutId: String(d.payoutId ?? d.id ?? ""),
-      status: normalizeStatus(d.status),
-      deliveredLocal: d.destAmount != null ? Number(d.destAmount) : null,
-      txRef: d.txRef ?? d.reference ?? null,
-      failureReason: d.failureReason ?? null,
+      payoutId: orderId,
+      status: "submitted", // CD-5: FORZADO — el POST crea la orden, NUNCA es `settled` sincrónico.
+      deliveredLocal: null, // el settle (PEN entregado) llega por webhook, no en el create-order.
+      txRef: null,
+      failureReason: null,
       provenance: "transfi",
+      depositAddress, // el sender manda el USDC on-chain a esta address dedicada por orden.
     });
   }
 
   async status(payoutId: string): Promise<PayoutResult> {
-    const res = await fetch(`${TRANSFI_BASE}/v1/payouts/${encodeURIComponent(payoutId)}`, {
+    const res = await fetch(`${TRANSFI_BASE}/v3/orders/${encodeURIComponent(payoutId)}`, {
       method: "GET",
       signal: AbortSignal.timeout(8000),
-      headers: { authorization: `Bearer ${this.apiKey}` },
+      headers: transfiHeaders(this.creds),
     });
     if (!res.ok) throw new Error(`transfi_payout_status_error_${res.status}`);
-    const d = (await res.json()) as any;
+    // Ídem execute(): un 2xx con body no-JSON → error tipado, no un SyntaxError crudo.
+    let d: Record<string, unknown>;
+    try {
+      d = (await res.json()) as Record<string, unknown>;
+    } catch {
+      throw new Error("transfi_payout_status_bad_response");
+    }
     return assertValidPayout({
-      payoutId,
+      payoutId, // canónico = el id PEDIDO
       status: normalizeStatus(d.status),
-      deliveredLocal: d.destAmount != null ? Number(d.destAmount) : null,
-      txRef: d.txRef ?? d.reference ?? null,
-      failureReason: d.failureReason ?? null,
+      // TODO(F3-sandbox): nombre del monto PEN entregado en el estado; hasta confirmarlo → null.
+      deliveredLocal: null,
+      txRef: null,
+      failureReason: null,
       provenance: "transfi",
+      depositAddress: null, // status() no devuelve la address dedicada.
     });
   }
 }
@@ -74,6 +191,7 @@ export class FallbackPayoutProvider implements PayoutProvider {
       txRef: null,
       failureReason: null,
       provenance: "local-fallback",
+      depositAddress: null, // el mock no crea orden real → no hay address dedicada.
     };
   }
   async status(payoutId: string): Promise<PayoutResult> {
@@ -84,15 +202,32 @@ export class FallbackPayoutProvider implements PayoutProvider {
       txRef: null,
       failureReason: null,
       provenance: "local-fallback",
+      depositAddress: null,
     };
   }
 }
 
-function normalizeStatus(s: unknown): PayoutResult["status"] {
+/**
+ * Mapea el `status` de una orden TransFi off-ramp → `PayoutResult.status`.
+ * CD-7: SOLO estados documentados (spec L43). Un estado desconocido → `"submitted"` + warn value-free,
+ * NUNCA un `"settled"` fabricado (eso abriría el money-path sin entrega confirmada).
+ */
+export function normalizeStatus(s: unknown): PayoutResult["status"] {
   const v = String(s ?? "").toLowerCase();
-  if (v === "settled" || v === "completed" || v === "success") return "settled";
-  if (v === "failed" || v === "error" || v === "rejected") return "failed";
-  return "submitted";
+  switch (v) {
+    case "initiated":
+    case "asset_deposited":
+      return "submitted";
+    case "fund_settled":
+      return "settled";
+    case "fund_failed":
+    case "expired":
+      return "failed";
+    default:
+      // value-free: solo la etiqueta de estado, nunca PII ni el body crudo (CD-11).
+      console.warn(`[remit-payout] transfi_unknown_status:${v || "empty"} → submitted`);
+      return "submitted";
+  }
 }
 
 // guard de salida — no dejar pasar un payout con payoutId vacío o deliveredLocal NaN.
@@ -104,15 +239,20 @@ export function assertValidPayout(p: PayoutResult): PayoutResult {
   return p;
 }
 
-/** Factory: adapter TransFi si hay key + readiness, si no el fallback (mock, no mueve plata). */
+/**
+ * Factory: adapter TransFi si están las 3 creds (user+pass+mid) + readiness, si no el fallback
+ * (mock, no mueve plata). CD-9: NO lee `TRANSFI_API_KEY` (esa la usa fx.ts, se preserva).
+ */
 export function getPayoutProvider(): PayoutProvider {
-  const key = process.env.TRANSFI_API_KEY;
-  if (!key) return new FallbackPayoutProvider();
+  const username = process.env.TRANSFI_USERNAME;
+  const password = process.env.TRANSFI_PASSWORD;
+  const mid = process.env.TRANSFI_MID;
+  if (!username || !password || !mid) return new FallbackPayoutProvider(); // falta cualquiera → mock
   if (process.env.TRANSFI_ADAPTER_READY !== "true") {
     throw new Error(
-      "transfi_adapter_not_ready: TRANSFI_API_KEY seteada pero TRANSFI_ADAPTER_READY!=true — " +
-        "confirmá el mapeo + el flujo de depósito con el sandbox antes de mover plata real.",
+      "transfi_adapter_not_ready: credenciales TransFi seteadas pero TRANSFI_ADAPTER_READY!=true — " +
+        "confirmá el mapeo + el flujo de depósito con el sandbox antes de mover plata.",
     );
   }
-  return new TransFiPayoutProvider(key);
+  return new TransFiPayoutProvider({ username, password, mid });
 }

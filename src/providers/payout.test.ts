@@ -4,6 +4,7 @@ import {
   TransFiPayoutProvider,
   assertValidPayout,
   getPayoutProvider,
+  normalizeStatus,
 } from "./payout";
 import type { PayoutInput, PayoutResult } from "./types";
 
@@ -18,13 +19,41 @@ const input: PayoutInput = {
   idempotencyKey: "idem-1",
 };
 
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), { status });
+}
+
+// §9: `mockImplementation` (no `mockResolvedValue`) para poder inspeccionar los args del request.
+// Tipado explícito (evitar `any` — golden path TS strict): captura [url, init] tipados.
+function stubFetch(body: unknown, status = 200) {
+  const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => jsonResponse(body, status));
+  vi.stubGlobal("fetch", fetchMock);
+  return fetchMock;
+}
+
+// Variante: body 2xx CRUDO no-JSON (para probar el fail-loud tipado, no SyntaxError). §Reglas:
+// `mockImplementation` (no `mockResolvedValue`) — cada llamada re-crea la Response (body de un solo uso).
+function stubFetchRaw(text: string, status = 200) {
+  const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => new Response(text, { status }));
+  vi.stubGlobal("fetch", fetchMock);
+  return fetchMock;
+}
+
+const CREDS = { username: "u", password: "p", mid: "m" };
+
 describe("FallbackPayoutProvider (mock — NO mueve plata)", () => {
-  it("no entrega real: deliveredLocal null + provenance local-fallback", async () => {
+  it("no entrega real: deliveredLocal null + provenance local-fallback + depositAddress null", async () => {
     const r = await new FallbackPayoutProvider().execute(input);
     expect(r.provenance).toBe("local-fallback");
     expect(r.deliveredLocal).toBeNull();
     expect(r.txRef).toBeNull();
+    expect(r.depositAddress).toBeNull();
     expect(r.payoutId).toContain("fallback-");
+  });
+  it("status() del mock también devuelve depositAddress null", async () => {
+    const r = await new FallbackPayoutProvider().status("x");
+    expect(r.depositAddress).toBeNull();
+    expect(r.provenance).toBe("local-fallback");
   });
 });
 
@@ -36,6 +65,7 @@ describe("assertValidPayout", () => {
     txRef: "0xabc",
     failureReason: null,
     provenance: "transfi",
+    depositAddress: null,
   };
   it("pasa uno válido", () => expect(assertValidPayout(ok)).toBe(ok));
   it("lanza si payoutId vacío", () =>
@@ -46,19 +76,192 @@ describe("assertValidPayout", () => {
     ));
 });
 
-describe("getPayoutProvider factory", () => {
+// ── Adapter TransFi — contrato HTTP real (WKH-208) ────────────────────────────
+describe("TransFiPayoutProvider.execute — contrato HTTP", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  it("AC-1: auth Basic base64(user:pass) + header mid; NUNCA Bearer ni x-api-key", async () => {
+    const fetchMock = stubFetch({ orderId: "ord-1", walletAddress: "0xdep" });
+    await new TransFiPayoutProvider(CREDS).execute(input);
+    const [, init] = fetchMock.mock.calls[0]!;
+    const headers = init?.headers as Record<string, string>;
+    expect(headers.authorization).toBe("Basic " + Buffer.from("u:p").toString("base64"));
+    expect(headers.mid).toBe("m");
+    expect(JSON.stringify(headers).toLowerCase()).not.toContain("bearer");
+    expect(headers["x-api-key"]).toBeUndefined();
+  });
+
+  it("AC-2: POST /v3/orders; orderType offramp; partnerId=idempotencyKey byte-idéntico; sin header idempotency-key", async () => {
+    const fetchMock = stubFetch({ orderId: "ord-1", walletAddress: "0xdep" });
+    await new TransFiPayoutProvider(CREDS).execute(input);
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toMatch(/\/v3\/orders$/);
+    expect(url).not.toContain("/v1/payouts");
+    const body = JSON.parse(init?.body as string) as Record<string, unknown>;
+    expect(body.orderType).toBe("offramp");
+    expect(body.partnerId).toBe(input.idempotencyKey);
+    const headers = init?.headers as Record<string, string>;
+    expect(headers["idempotency-key"]).toBeUndefined();
+  });
+
+  it("FIX-A (CR MNR-1): body incluye sourceUrl desde TRANSFI_SOURCE_URL cuando está seteada", async () => {
+    const fetchMock = stubFetch({ orderId: "ord-1", walletAddress: "0xdep" });
+    vi.stubEnv("TRANSFI_SOURCE_URL", "https://merchant.example/return");
+    await new TransFiPayoutProvider(CREDS).execute(input);
+    const body = JSON.parse(fetchMock.mock.calls[0]![1]?.body as string) as { sourceUrl: string };
+    expect(body.sourceUrl).toBe("https://merchant.example/return");
+  });
+
+  it("FIX-B (AR MNR-1): 2xx con body no-JSON → transfi_payout_bad_response tipado, NO SyntaxError crudo, NO mock", async () => {
+    stubFetchRaw("not json");
+    await expect(new TransFiPayoutProvider(CREDS).execute(input)).rejects.toThrow(
+      /^transfi_payout_bad_response$/,
+    );
+    // el error NO es un SyntaxError crudo del parser
+    await expect(new TransFiPayoutProvider(CREDS).execute(input)).rejects.not.toThrow(SyntaxError);
+  });
+
+  it("AC-3: 2xx → status submitted, payoutId=orderId, depositAddress=walletAddress, deliveredLocal null, provenance transfi", async () => {
+    stubFetch({ orderId: "ord-1", walletAddress: "0xdeposit" });
+    const r = await new TransFiPayoutProvider(CREDS).execute(input);
+    expect(r.status).toBe("submitted");
+    expect(r.payoutId).toBe("ord-1");
+    expect(r.depositAddress).toBe("0xdeposit");
+    expect(r.deliveredLocal).toBeNull();
+    expect(r.provenance).toBe("transfi");
+  });
+
+  it("AC-3 adversarial: status:fund_settled EN el POST NO produce settled (se fuerza submitted)", async () => {
+    stubFetch({ orderId: "ord-1", walletAddress: "0xdeposit", status: "fund_settled" });
+    const r = await new TransFiPayoutProvider(CREDS).execute(input);
+    expect(r.status).toBe("submitted"); // CD-5: nunca leer status del create-order
+  });
+
+  it("AC-6: red no soportada (avalanche) → throw transfi_unsupported_network, SIN llamar fetch", async () => {
+    const fetchMock = stubFetch({ orderId: "ord-1" });
+    vi.stubEnv("TRANSFI_USDC_NETWORK", "avalanche");
+    await expect(new TransFiPayoutProvider(CREDS).execute(input)).rejects.toThrow(
+      /transfi_unsupported_network_avalanche/,
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("AC-6 feliz: polygon → source.currency USDCPOLYGON", async () => {
+    const fetchMock = stubFetch({ orderId: "ord-1", walletAddress: "0xdep" });
+    vi.stubEnv("TRANSFI_USDC_NETWORK", "polygon");
+    await new TransFiPayoutProvider(CREDS).execute(input);
+    const body = JSON.parse(fetchMock.mock.calls[0]![1]?.body as string) as {
+      source: { currency: string };
+    };
+    expect(body.source.currency).toBe("USDCPOLYGON");
+  });
+
+  it("AC-6 feliz: base (default) → source.currency USDCBASE", async () => {
+    const fetchMock = stubFetch({ orderId: "ord-1", walletAddress: "0xdep" });
+    vi.stubEnv("TRANSFI_USDC_NETWORK", "base");
+    await new TransFiPayoutProvider(CREDS).execute(input);
+    const body = JSON.parse(fetchMock.mock.calls[0]![1]?.body as string) as {
+      source: { currency: string };
+    };
+    expect(body.source.currency).toBe("USDCBASE");
+  });
+
+  it("AC-7: 4xx (PARTNER_ID_ALREADY_USED) → throws transfi_payout_error_409, nunca resuelve", async () => {
+    stubFetch({ code: "PARTNER_ID_ALREADY_USED" }, 409);
+    await expect(new TransFiPayoutProvider(CREDS).execute(input)).rejects.toThrow(
+      /transfi_payout_error_409/,
+    );
+  });
+
+  it("AC-7: 5xx → throws transfi_payout_error_500", async () => {
+    stubFetch({}, 500);
+    await expect(new TransFiPayoutProvider(CREDS).execute(input)).rejects.toThrow(
+      /transfi_payout_error_500/,
+    );
+  });
+});
+
+describe("TransFiPayoutProvider.status", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  it("GET /v3/orders/{id} con Basic+mid; mapea normalizeStatus; depositAddress null", async () => {
+    const fetchMock = stubFetch({ status: "fund_settled" });
+    const r = await new TransFiPayoutProvider(CREDS).status("ord-1");
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toMatch(/\/v3\/orders\/ord-1$/);
+    const headers = init?.headers as Record<string, string>;
+    expect(headers.authorization).toBe("Basic " + Buffer.from("u:p").toString("base64"));
+    expect(headers.mid).toBe("m");
+    expect(r.status).toBe("settled");
+    expect(r.payoutId).toBe("ord-1");
+    expect(r.depositAddress).toBeNull();
+  });
+
+  it("FIX-B (AR MNR-1): status() 2xx con body no-JSON → transfi_payout_status_bad_response tipado, NO SyntaxError", async () => {
+    stubFetchRaw("not json");
+    await expect(new TransFiPayoutProvider(CREDS).status("ord-1")).rejects.toThrow(
+      /^transfi_payout_status_bad_response$/,
+    );
+    await expect(new TransFiPayoutProvider(CREDS).status("ord-1")).rejects.not.toThrow(SyntaxError);
+  });
+
+  it("AC-7: !2xx en status → throws transfi_payout_status_error_500", async () => {
+    stubFetch({}, 500);
+    await expect(new TransFiPayoutProvider(CREDS).status("ord-1")).rejects.toThrow(
+      /transfi_payout_status_error_500/,
+    );
+  });
+});
+
+// AC-8: tabla directa sobre normalizeStatus (exportado). Un caso por estado documentado + desconocido.
+describe("normalizeStatus (AC-8/CD-7)", () => {
+  it.each([
+    ["initiated", "submitted"],
+    ["asset_deposited", "submitted"],
+    ["fund_settled", "settled"],
+    ["fund_failed", "failed"],
+    ["expired", "failed"],
+  ])("%s → %s", (transfi, expected) => {
+    expect(normalizeStatus(transfi)).toBe(expected);
+  });
+  it("desconocido → submitted (NUNCA settled fabricado)", () => {
+    expect(normalizeStatus("wat_status")).toBe("submitted");
+    expect(normalizeStatus(undefined)).toBe("submitted");
+  });
+});
+
+describe("getPayoutProvider factory (AC-5)", () => {
   afterEach(() => vi.unstubAllEnvs());
-  it("sin key → fallback", () => {
-    vi.stubEnv("TRANSFI_API_KEY", "");
+  it("sin las 3 creds → fallback", () => {
+    vi.stubEnv("TRANSFI_USERNAME", "");
+    vi.stubEnv("TRANSFI_PASSWORD", "");
+    vi.stubEnv("TRANSFI_MID", "");
     expect(getPayoutProvider()).toBeInstanceOf(FallbackPayoutProvider);
   });
-  it("key sin readiness → throws", () => {
-    vi.stubEnv("TRANSFI_API_KEY", "k");
+  it("falta una de las creds → fallback (no adapter real a medias)", () => {
+    vi.stubEnv("TRANSFI_USERNAME", "u");
+    vi.stubEnv("TRANSFI_PASSWORD", "p");
+    vi.stubEnv("TRANSFI_MID", "");
+    vi.stubEnv("TRANSFI_ADAPTER_READY", "true");
+    expect(getPayoutProvider()).toBeInstanceOf(FallbackPayoutProvider);
+  });
+  it("creds sin readiness → throws transfi_adapter_not_ready", () => {
+    vi.stubEnv("TRANSFI_USERNAME", "u");
+    vi.stubEnv("TRANSFI_PASSWORD", "p");
+    vi.stubEnv("TRANSFI_MID", "m");
     vi.stubEnv("TRANSFI_ADAPTER_READY", "");
     expect(() => getPayoutProvider()).toThrow(/transfi_adapter_not_ready/);
   });
-  it("key + readiness → adapter TransFi", () => {
-    vi.stubEnv("TRANSFI_API_KEY", "k");
+  it("creds + readiness → adapter TransFi", () => {
+    vi.stubEnv("TRANSFI_USERNAME", "u");
+    vi.stubEnv("TRANSFI_PASSWORD", "p");
+    vi.stubEnv("TRANSFI_MID", "m");
     vi.stubEnv("TRANSFI_ADAPTER_READY", "true");
     expect(getPayoutProvider()).toBeInstanceOf(TransFiPayoutProvider);
   });

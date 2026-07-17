@@ -116,6 +116,10 @@ export interface PayoutResult {
   txRef: string | null; // referencia del partner / on-chain
   failureReason: string | null;
   provenance: Provenance;
+  // WKH-208 (DT-4): address dedicada por orden que TransFi devuelve en el create-order; el sender
+  // manda el USDC on-chain ahí y el settle llega DESPUÉS por webhook (fuera de scope). null en el
+  // fallback (mock) y en status() (no devuelve address).
+  depositAddress: string | null;
 }
 
 export interface PayoutProvider {
