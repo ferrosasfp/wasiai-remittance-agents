@@ -415,6 +415,70 @@ describe("runCashoutPayout — identity binding (WKH-204/C1-C4, C11, C12)", () =
   });
 });
 
+// WKH-212 — el campo depositAddress viaja de PayoutResult a CashoutPayoutOutput (aditivo, no rompe).
+describe("runCashoutPayout — depositAddress (WKH-212)", () => {
+  /** arrange: payout fail-safe en rama dev + KYC Didit real activo (NODE_ENV="test" en vitest). */
+  function stubDevPayoutAndDidit() {
+    vi.stubEnv("TRANSFI_API_KEY", "");
+    vi.stubEnv("ALLOW_FALLBACK_PAYOUT", "true");
+    vi.stubEnv("DIDIT_API_KEY", "k");
+    vi.stubEnv("DIDIT_ADAPTER_READY", "true");
+  }
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+  });
+
+  // AC-1: executed real → la address del provider llega al output verbatim.
+  it("AC-1: executed real → depositAddress del provider llega al output", async () => {
+    stubDevPayoutAndDidit();
+    stubDiditDecision({ status: "Approved", session_id: "v1", vendor_data: "12345678" });
+    vi.spyOn(FallbackPayoutProvider.prototype, "execute").mockResolvedValue({
+      payoutId: "p1",
+      status: "submitted",
+      deliveredLocal: null,
+      txRef: null,
+      failureReason: null,
+      provenance: "transfi",
+      depositAddress: "0xDEPOSIT",
+    });
+    const out = await runCashoutPayout(validInput);
+    expect(out.executed).toBe(true);
+    expect(out.depositAddress).toBe("0xDEPOSIT");
+  });
+
+  // AC-3: rama blocked kyc_identity_claim_missing → null (no hubo payout).
+  it("AC-3: blocked kyc_identity_claim_missing → depositAddress null", async () => {
+    stubDevPayoutAndDidit();
+    const { senderIdentity: _omit, ...noClaim } = validInput;
+    const out = await runCashoutPayout(noClaim);
+    expect(out.reason).toBe("kyc_identity_claim_missing");
+    expect(out.depositAddress).toBeNull();
+  });
+
+  // AC-3: rama blocked kyc_gate_not_passed → null (no hubo payout).
+  it("AC-3: blocked kyc_gate_not_passed → depositAddress null", async () => {
+    stubDevPayoutAndDidit();
+    stubDiditDecision({ status: "Declined", session_id: "v1" });
+    const out = await runCashoutPayout(validInput);
+    expect(out.reason).toBe("kyc_gate_not_passed");
+    expect(out.depositAddress).toBeNull();
+  });
+
+  // AC-2 / CD-1: el mock por default refleja null sin alterar los campos existentes.
+  it("AC-2: mock (FallbackPayoutProvider) → depositAddress null, resto de campos intacto", async () => {
+    stubDevPayoutAndDidit();
+    stubDiditDecision({ status: "Approved", session_id: "v1", vendor_data: "12345678" });
+    const out = await runCashoutPayout(validInput); // sin stubear execute → mock real
+    expect(out.executed).toBe(true);
+    expect(out.provenance).toBe("local-fallback");
+    expect(out.depositAddress).toBeNull();
+    expect(out.deliveredLocal).toBeNull(); // campos existentes sin cambio (CD-1)
+    expect(out.txRef).toBeNull();
+  });
+});
+
 // AC-5: el schema acepta el campo legado sin romperse (compat chaski-v2).
 describe("CashoutPayoutInputSchema — senderIdentity / address (WKH-204)", () => {
   it("AC-5: `address` en el raw → parsea OK (compat chaski-v2, no rompe el schema)", () => {

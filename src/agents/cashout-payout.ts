@@ -56,6 +56,7 @@ export interface CashoutPayoutOutput {
   txRef: string | null;
   reason: string | null;
   provenance: string;
+  depositAddress: string | null; // WKH-212: address dedicada del create-order (null en mock/blocked)
 }
 
 /**
@@ -214,6 +215,7 @@ export async function runCashoutPayout(raw: unknown): Promise<CashoutPayoutOutpu
       txRef: null,
       reason: "kyc_identity_claim_missing",
       provenance: "n/a",
+      depositAddress: null, // WKH-212: no hubo payout, no hay address
     };
   }
 
@@ -231,6 +233,7 @@ export async function runCashoutPayout(raw: unknown): Promise<CashoutPayoutOutpu
       txRef: null,
       reason: "kyc_gate_not_passed",
       provenance: "n/a",
+      depositAddress: null, // WKH-212: no hubo payout, no hay address
     };
   }
 
@@ -254,6 +257,7 @@ export async function runCashoutPayout(raw: unknown): Promise<CashoutPayoutOutpu
     txRef: result.txRef,
     reason: result.failureReason,
     provenance: result.provenance,
+    depositAddress: result.depositAddress, // WKH-212: propaga la address del provider (real o null)
   };
 }
 

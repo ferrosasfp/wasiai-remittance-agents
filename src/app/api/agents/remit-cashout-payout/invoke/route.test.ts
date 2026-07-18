@@ -91,8 +91,9 @@ describe("POST /api/agents/remit-cashout-payout/invoke", () => {
     expect(JSON.stringify(data)).not.toContain("Bob");
   });
 
-  // (2) AC-4 / AC-6 / CD-9: body válido → 200 { result } con EXACTAMENTE los 8 campos, provenance mock.
-  it("body válido → 200 { result } con exactamente los 8 campos, provenance local-fallback", async () => {
+  // (2) AC-4 / AC-6 / CD-9: body válido → 200 { result } con EXACTAMENTE los 9 campos, provenance mock.
+  // WKH-212: el contrato del wire ahora incluye `depositAddress` (null en el mock/fallback).
+  it("body válido → 200 { result } con exactamente los 9 campos, provenance local-fallback", async () => {
     const res = await invoke(validInput);
     expect(res.status).toBe(200);
     const data = await res.json();
@@ -100,6 +101,7 @@ describe("POST /api/agents/remit-cashout-payout/invoke", () => {
     expect(output.slug).toBe("remit-cashout-payout");
     expect(Object.keys(output).sort()).toEqual([
       "deliveredLocal",
+      "depositAddress",
       "executed",
       "payoutId",
       "provenance",
@@ -111,6 +113,7 @@ describe("POST /api/agents/remit-cashout-payout/invoke", () => {
     expect(output.provenance).toBe("local-fallback");
     expect(output.deliveredLocal).toBeNull();
     expect(output.txRef).toBeNull();
+    expect(output.depositAddress).toBeNull(); // WKH-212: mock/fallback no devuelve address
   });
 
   // (3) AC-4 / CD-6: el 200 NO filtra beneficiary.name/destination ni travelRuleData (NO-PII HTTP).
