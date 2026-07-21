@@ -155,7 +155,7 @@ creds + `TRANSFI_ADAPTER_READY=true`.
 | `TRANSFI_PASSWORD` | Basic auth pass (secreto). |
 | `TRANSFI_MID` | valor del header `mid` (ej. `WIIB1V_NA_NA`). |
 | `TRANSFI_BASE_URL` | host base; default `https://sandbox-api.transfi.com` (sandbox-only). |
-| `TRANSFI_USDC_NETWORK` | red del USDC del `source`; default `base` → `USDCBASE`. Fail-loud si fuera del allowlist. |
+| `TRANSFI_USDC_NETWORK` | red del USDC del `source`; default `base` → `USDCBASE`; `solana` → `USDCSOL`. Fail-loud si fuera del allowlist. |
 | `TRANSFI_SOURCE_WALLET_ADDRESS` | `source.walletAddress` del body (config, no secreto — TODO(F3-sandbox)). |
 | `TRANSFI_SOURCE_URL` | `sourceUrl` del body (URL del merchant, server-only, no secreto — TODO(F3-sandbox): confirmar si es requerido y qué valor). Default `""` → fail-loud (4xx) si el sandbox lo exige. |
 | `TRANSFI_PURPOSE_CODE` | `purposeCode` del body (TODO(F3-sandbox): valor válido para PE). |
