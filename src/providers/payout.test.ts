@@ -169,6 +169,26 @@ describe("TransFiPayoutProvider.execute — contrato HTTP", () => {
     expect(body.source.currency).toBe("USDCBASE");
   });
 
+  it("AC-6 feliz: solana → source.currency USDCSOL", async () => {
+    const fetchMock = stubFetch({ orderId: "ord-1", walletAddress: "0xdep" });
+    vi.stubEnv("TRANSFI_USDC_NETWORK", "solana");
+    await new TransFiPayoutProvider(CREDS).execute(input);
+    const body = JSON.parse(fetchMock.mock.calls[0]![1]?.body as string) as {
+      source: { currency: string };
+    };
+    expect(body.source.currency).toBe("USDCSOL");
+  });
+
+  it("AC-2: solana → depositAddress base58 pass-through intacto", async () => {
+    stubFetch({
+      orderId: "ord-1",
+      depositAddress: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU",
+    });
+    vi.stubEnv("TRANSFI_USDC_NETWORK", "solana");
+    const r = await new TransFiPayoutProvider(CREDS).execute(input);
+    expect(r.depositAddress).toBe("7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU");
+  });
+
   it("AC-7: 4xx (PARTNER_ID_ALREADY_USED) → throws transfi_payout_error_409, nunca resuelve", async () => {
     stubFetch({ code: "PARTNER_ID_ALREADY_USED" }, 409);
     await expect(new TransFiPayoutProvider(CREDS).execute(input)).rejects.toThrow(
