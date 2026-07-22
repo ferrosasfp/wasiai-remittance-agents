@@ -48,6 +48,7 @@ en fallback, y el día que llega el sandbox del partner solo se setea la env key
 DIDIT_API_KEY=            # KYC/AML (Didit)
 TRANSFI_API_KEY=          # quote + payout (TransFi)
 TRANSFI_USDC_NETWORK=     # red del USDC del off-ramp; default base → USDCBASE; solana → USDCSOL (fail-loud fuera del allowlist)
+TRANSFI_DEVNET_SOLANA_DEPOSIT_ADDRESS=  # ⚠️ devnet-only — NUNCA setear en un deploy de producción (escape-hatch smoke M5, provenance:devnet-stub, no mueve plata)
 AGENT_SIGNER_PRIVATE_KEY= # firma EIP-712 de los receipts (hot key por-servicio)
 ```
 

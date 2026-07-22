@@ -44,6 +44,33 @@ export function resolveSourceCurrency(network: string): string {
   return code;
 }
 
+// DT-4: base58 (alfabeto Bitcoin/Solana, sin 0 O I l) + longitud de pubkey Solana (32-44 chars).
+// Anclada ^…$ (CD-10): rechaza EVM 0x…, vacíos/whitespace, chars ambiguos y sufijos basura.
+// NO usa @solana/web3.js (ausente del repo; verificación de curva Ed25519 es Scope OUT).
+const BASE58_ADDR_RE = /^[123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz]{32,44}$/;
+
+/**
+ * Escape-hatch DEVNET-ONLY (WKH-232 / HU-SOL-15). Devuelve la deposit address SOLO si el doble-gate
+ * (env seteada + red solana) pasa Y el valor es base58 válido; si no, null (fail-closed → mock estándar).
+ * NO mueve plata: el mock nunca desembolsa. Se exporta para testear la validación en aislamiento (CD-10).
+ */
+export function resolveDevnetStubAddress(): string | null {
+  const raw = process.env.TRANSFI_DEVNET_SOLANA_DEPOSIT_ADDRESS;
+  if (!raw) return null; // CD-4: unset/"" → byte-idéntico
+  if (process.env.TRANSFI_USDC_NETWORK !== "solana") return null; // CD-2 (b) / DT-3 guard de red
+  const addr = raw.trim();
+  if (!BASE58_ADDR_RE.test(addr)) {
+    // CD-5 fail-closed
+    console.warn(
+      "[remit-payout] TRANSFI_DEVNET_SOLANA_DEPOSIT_ADDRESS ignorada: no es base58 válida " +
+        "(DEVNET STUB, NO real off-ramp)", // CD-8 value-free (sin la address)
+    );
+    return null;
+  }
+  console.warn("[remit-payout] DEVNET STUB deposit address ACTIVO — devnet-only, NO real off-ramp"); // CD-8
+  return addr;
+}
+
 interface TransFiCreds {
   username: string;
   password: string;
@@ -184,25 +211,27 @@ export class TransFiPayoutProvider implements PayoutProvider {
  */
 export class FallbackPayoutProvider implements PayoutProvider {
   async execute(input: PayoutInput): Promise<PayoutResult> {
+    const stub = resolveDevnetStubAddress(); // WKH-232: null salvo doble-gate + base58 válido
     return {
       payoutId: `fallback-${input.idempotencyKey}`,
       status: "settled",
       deliveredLocal: null, // NO hubo entrega real
       txRef: null,
       failureReason: null,
-      provenance: "local-fallback",
-      depositAddress: null, // el mock no crea orden real → no hay address dedicada.
+      provenance: stub ? "devnet-stub" : "local-fallback", // CD-3/AC-6
+      depositAddress: stub, // CD-4: stub===null → null (byte-idéntico); el mock no crea orden real.
     };
   }
   async status(payoutId: string): Promise<PayoutResult> {
+    const stub = resolveDevnetStubAddress(); // WKH-232: null salvo doble-gate + base58 válido
     return {
       payoutId,
       status: "settled",
       deliveredLocal: null,
       txRef: null,
       failureReason: null,
-      provenance: "local-fallback",
-      depositAddress: null,
+      provenance: stub ? "devnet-stub" : "local-fallback", // CD-3/AC-6
+      depositAddress: stub, // CD-4: stub===null → null (byte-idéntico)
     };
   }
 }
