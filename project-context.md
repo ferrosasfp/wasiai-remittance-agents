@@ -164,6 +164,7 @@ creds + `TRANSFI_ADAPTER_READY=true`.
 | `TRANSFI_WEBHOOK_SECRET` | firma del webhook off-ramp — **RESERVADO, NO se lee en este repo** (el webhook receiver vive en chaski-v2). |
 | `TRANSFI_API_KEY` | **LEGADO — lo usa `fx.ts`, NO borrar.** El payout ya NO lo lee. |
 | `TRANSFI_ADAPTER_READY` | opt-in del adapter real; **compartido con `fx.ts`, NO renombrar.** |
+| `TRANSFI_DEVNET_SOLANA_DEPOSIT_ADDRESS` | ATA USDC **devnet** del equipo. Escape-hatch **devnet-only, opt-in** (WKH-232): con esta env seteada **Y** `TRANSFI_USDC_NETWORK=solana` **Y** el provider real inactivo, el mock devuelve esta address con `provenance:devnet-stub`. Fail-closed si no es base58 o red≠solana. **NUNCA en prod real** (hereda el gate `PAYOUT_ALLOW_MOCK`). Enabler del smoke M5, no mueve plata. |
 
 ### Patron de acceso a base de datos
 N/A — no existe capa de persistencia en este repo.

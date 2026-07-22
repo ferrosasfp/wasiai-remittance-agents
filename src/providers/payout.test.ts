@@ -5,7 +5,9 @@ import {
   assertValidPayout,
   getPayoutProvider,
   normalizeStatus,
+  resolveDevnetStubAddress,
 } from "./payout";
+import { runCashoutPayout } from "../agents/cashout-payout";
 import type { PayoutInput, PayoutResult } from "./types";
 
 const input: PayoutInput = {
@@ -253,6 +255,103 @@ describe("normalizeStatus (AC-8/CD-7)", () => {
   it("desconocido → submitted (NUNCA settled fabricado)", () => {
     expect(normalizeStatus("wat_status")).toBe("submitted");
     expect(normalizeStatus(undefined)).toBe("submitted");
+  });
+});
+
+// ── Escape-hatch devnet-only (WKH-232 / HU-SOL-15) ────────────────────────────
+describe("FallbackPayoutProvider — escape-hatch devnet (WKH-232 / HU-SOL-15)", () => {
+  afterEach(() => vi.unstubAllEnvs());
+
+  const VALID = "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU"; // base58 real, 44 chars
+
+  it("T-1 (AC-1): doble-gate → depositAddress = env address + provenance devnet-stub, sin fetch a TransFi", async () => {
+    vi.stubEnv("TRANSFI_DEVNET_SOLANA_DEPOSIT_ADDRESS", VALID);
+    vi.stubEnv("TRANSFI_USDC_NETWORK", "solana");
+    const r = await new FallbackPayoutProvider().execute(input);
+    expect(r.depositAddress).toBe(VALID);
+    expect(r.provenance).toBe("devnet-stub");
+  });
+
+  it("T-2 (AC-6/CD-3): provenance distinguible — nunca transfi ni local-fallback", async () => {
+    vi.stubEnv("TRANSFI_DEVNET_SOLANA_DEPOSIT_ADDRESS", VALID);
+    vi.stubEnv("TRANSFI_USDC_NETWORK", "solana");
+    const r = await new FallbackPayoutProvider().execute(input);
+    expect(r.provenance).not.toBe("transfi");
+    expect(r.provenance).not.toBe("local-fallback");
+    expect(r.provenance).toBe("devnet-stub");
+  });
+
+  it("T-3 (AC-2/CD-1): el real SIEMPRE precede — con creds+readiness el mock ni se instancia", () => {
+    vi.stubEnv("TRANSFI_USERNAME", "u");
+    vi.stubEnv("TRANSFI_PASSWORD", "p");
+    vi.stubEnv("TRANSFI_MID", "m");
+    vi.stubEnv("TRANSFI_ADAPTER_READY", "true");
+    vi.stubEnv("TRANSFI_DEVNET_SOLANA_DEPOSIT_ADDRESS", VALID);
+    vi.stubEnv("TRANSFI_USDC_NETWORK", "solana");
+    expect(getPayoutProvider()).toBeInstanceOf(TransFiPayoutProvider);
+  });
+
+  it("T-4 (AC-3/CD-4): sin la env → byte-idéntico (depositAddress null + local-fallback)", async () => {
+    vi.stubEnv("TRANSFI_USDC_NETWORK", "solana"); // solo una pata del gate
+    const r = await new FallbackPayoutProvider().execute(input);
+    expect(r.depositAddress).toBeNull();
+    expect(r.provenance).toBe("local-fallback");
+  });
+
+  it("T-5 (AC-4a/CD-5): address malformada (no base58) → fail-closed", async () => {
+    vi.stubEnv("TRANSFI_DEVNET_SOLANA_DEPOSIT_ADDRESS", "0xNOTbase58INVALID");
+    vi.stubEnv("TRANSFI_USDC_NETWORK", "solana");
+    const r = await new FallbackPayoutProvider().execute(input);
+    expect(r.depositAddress).toBeNull();
+    expect(r.provenance).toBe("local-fallback");
+  });
+
+  it("T-6 (AC-4b/CD-2): red≠solana → fail-closed aunque la address sea base58 válida", async () => {
+    vi.stubEnv("TRANSFI_DEVNET_SOLANA_DEPOSIT_ADDRESS", VALID);
+    vi.stubEnv("TRANSFI_USDC_NETWORK", "base");
+    const r = await new FallbackPayoutProvider().execute(input);
+    expect(r.depositAddress).toBeNull();
+    expect(r.provenance).toBe("local-fallback");
+  });
+
+  it("T-7 (AC-5/CD-6): hereda el gate de prod — el stub no bypassea assertPayoutProviderSafe", async () => {
+    vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv("TRANSFI_USERNAME", "");
+    vi.stubEnv("TRANSFI_PASSWORD", "");
+    vi.stubEnv("TRANSFI_MID", "");
+    vi.stubEnv("PAYOUT_ALLOW_MOCK", "");
+    vi.stubEnv("TRANSFI_DEVNET_SOLANA_DEPOSIT_ADDRESS", VALID);
+    vi.stubEnv("TRANSFI_USDC_NETWORK", "solana");
+    await expect(
+      runCashoutPayout({
+        quoteId: "q1",
+        amountUsd: 100,
+        kycVerificationId: "kyc-1",
+        beneficiary: { name: "Bob", country: "PE", method: "yape", destination: "999999999" },
+        idempotencyKey: "idem-1",
+      }),
+    ).rejects.toThrow(/payout_refused/);
+  });
+
+  it("T-8 (CD-10): boundary de longitud — 31/45 null, 32/44 válido", () => {
+    vi.stubEnv("TRANSFI_USDC_NETWORK", "solana");
+    vi.stubEnv("TRANSFI_DEVNET_SOLANA_DEPOSIT_ADDRESS", "1".repeat(31));
+    expect(resolveDevnetStubAddress()).toBeNull();
+    vi.stubEnv("TRANSFI_DEVNET_SOLANA_DEPOSIT_ADDRESS", "1".repeat(32));
+    expect(resolveDevnetStubAddress()).toBe("1".repeat(32));
+    vi.stubEnv("TRANSFI_DEVNET_SOLANA_DEPOSIT_ADDRESS", "1".repeat(44));
+    expect(resolveDevnetStubAddress()).toBe("1".repeat(44));
+    vi.stubEnv("TRANSFI_DEVNET_SOLANA_DEPOSIT_ADDRESS", "1".repeat(45));
+    expect(resolveDevnetStubAddress()).toBeNull();
+  });
+
+  it("T-9 (CD-10): charset — chars ambiguos 0/O/I/l → null", () => {
+    vi.stubEnv("TRANSFI_USDC_NETWORK", "solana");
+    // 43 chars base58 + 1 char ambiguo (total 44) → fuera del charset → null.
+    for (const bad of ["0", "O", "I", "l"]) {
+      vi.stubEnv("TRANSFI_DEVNET_SOLANA_DEPOSIT_ADDRESS", "1".repeat(43) + bad);
+      expect(resolveDevnetStubAddress()).toBeNull();
+    }
   });
 });
 
