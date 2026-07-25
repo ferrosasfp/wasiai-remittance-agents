@@ -3,12 +3,52 @@
 // open.er-api.com (como hacía la demo) y le aplica un spread documentado → cotización
 // genuina. TransFi da la tasa efectiva real del corredor cuando su key está seteada.
 
+import { z } from "zod";
 import type { FxQuote, FxQuoteInput, FxQuoteProvider } from "./types";
 
 const TRANSFI_BASE = process.env.TRANSFI_BASE_URL ?? "https://api.transfi.com";
 // spread del fallback (bps) — conservador, declarado. TransFi reemplaza esto con su tasa real.
 const FALLBACK_SPREAD_BPS = Number(process.env.FALLBACK_FX_SPREAD_BPS ?? 250); // 2.5%
 const FALLBACK_FLAT_FEE_USD = Number(process.env.FALLBACK_FX_FLAT_FEE_USD ?? 0.5);
+
+// ── Shape de las respuestas EXTERNAS ─────────────────────────────────────────
+// Reemplazan al cast crudo sin validar que había sobre `res.json()`. Dos reglas:
+//  1. Declaran SOLO los campos que ESTE archivo consume, y son `.passthrough()`: un partner que
+//     agrega campos NUNCA debe romper una cotización (los schemas no son un contrato de exclusión).
+//  2. Son PERMISIVOS a propósito y NO deciden si el quote es usable: esa decisión sigue siendo
+//     exclusivamente de `assertValidQuote()` (BLQ-MED-2). El schema solo hace explícito el shape
+//     que el código ya asumía; no mueve el guard de dinero de lugar.
+// Los nombres de campo siguen siendo sandbox-unverified — los fija el TODO(sandbox) de quote().
+
+/** Monto que el partner puede mandar como number o como string numérico (`Number()` los coerce). */
+const NumericLike = z.union([z.number(), z.string()]);
+/** Id/fecha que el partner puede mandar como string o number (`String()` lo coerce, como antes). */
+const StringLike = z.union([z.string(), z.number()]);
+
+/**
+ * Respuesta del quote API de TransFi.
+ * TODOS los campos son `.nullish()` A PROPÓSITO: así un campo ausente/null degrada byte-idéntico
+ * al comportamiento anterior (`Number(undefined)` → NaN → `invalid_quote_rate` en assertValidQuote)
+ * en vez de introducir un throw nuevo en un flujo que ya fallaba de otra forma.
+ */
+const TransFiQuoteResponseSchema = z
+  .object({
+    rate: NumericLike.nullish(),
+    fee: NumericLike.nullish(),
+    destAmount: NumericLike.nullish(),
+    etaMinutes: NumericLike.nullish(),
+    quoteId: StringLike.nullish(),
+    id: StringLike.nullish(),
+    expiresAt: StringLike.nullish(),
+  })
+  .passthrough();
+
+/** Respuesta de open.er-api.com — de este JSON se lee SOLO `rates.PEN`. */
+const FxMidResponseSchema = z
+  .object({
+    rates: z.object({ PEN: NumericLike.nullish() }).passthrough().nullish(),
+  })
+  .passthrough();
 
 /** Adapter TransFi — activo con TRANSFI_API_KEY. Devuelve la tasa efectiva real del corredor. */
 export class TransFiFxProvider implements FxQuoteProvider {
@@ -29,7 +69,13 @@ export class TransFiFxProvider implements FxQuoteProvider {
       }),
     });
     if (!res.ok) throw new Error(`transfi_quote_error_${res.status}`);
-    const d = (await res.json()) as any;
+    const parsed = TransFiQuoteResponseSchema.safeParse(await res.json());
+    // Shape NO reconocible (body que no es objeto, o un campo escalar que vino como objeto/array):
+    // se corta ACÁ con un error tipado. Antes moría igual (`Number({})` → NaN → invalid_quote_rate),
+    // pero sin distinguir "el partner cambió el contrato" de "el partner cotizó cualquier cosa".
+    // Sigue siendo un throw, como antes: NUNCA emitir un quote a partir de un shape desconocido.
+    if (!parsed.success) throw new Error("transfi_quote_bad_shape");
+    const d = parsed.data;
     const quote: FxQuote = {
       rate: Number(d.rate),
       feeUsd: Number(d.fee ?? 0),
@@ -81,11 +127,19 @@ async function getUsdToPenMid(): Promise<number> {
       signal: AbortSignal.timeout(4000),
     });
     if (res.ok) {
-      const d = (await res.json()) as any;
-      const pen = Number(d?.rates?.PEN);
-      if (pen > 0) {
-        cache = { rate: pen, at: Date.now() };
-        return pen;
+      const parsed = FxMidResponseSchema.safeParse(await res.json());
+      if (!parsed.success) {
+        // Degradación IGUAL que antes (cae al estático), pero EXPLÍCITA: antes un cambio de shape
+        // del feed FX era 100% silencioso. Value-free: solo la etiqueta, nunca el body del tercero.
+        console.warn("[remit-fx] fx_mid_bad_shape → fallback estático USD/PEN");
+      } else {
+        const pen = Number(parsed.data.rates?.PEN);
+        if (pen > 0) {
+          cache = { rate: pen, at: Date.now() };
+          return pen;
+        }
+        // 2xx con shape OK pero sin una tasa PEN usable (ausente/0/negativa/no numérica).
+        console.warn("[remit-fx] fx_mid_no_usable_pen_rate → fallback estático USD/PEN");
       }
     }
   } catch {

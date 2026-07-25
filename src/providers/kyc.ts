@@ -2,6 +2,7 @@
 // Didit: verificación DNI + liveness + screening OFAC/PEP/sanciones + monitoreo continuo,
 // SBS-compliant Perú. Docs: https://docs.didit.me  (endpoints exactos a confirmar en sandbox).
 
+import { z } from "zod";
 import type { KycInput, KycProvider, KycResult, KycStatusResult } from "./types";
 
 const DIDIT_BASE = process.env.DIDIT_BASE_URL ?? "https://verification.didit.me";
@@ -21,6 +22,31 @@ export const REAL_KYC_PROVENANCES = new Set<string>(["didit"]);
 export function normalizeIdentity(s: string): string {
   return s.trim().toLowerCase();
 }
+
+/**
+ * Shape de la respuesta EXTERNA de Didit que consume `verify()` — reemplaza a los casts crudos sin
+ * validar que había sobre `res.json()`. Tres decisiones, las tres deliberadas:
+ *
+ *  1. Declara SOLO los 4 campos que el código lee (`status`, `aml.hits`, `session_id`, `id`).
+ *  2. 🔴 NO es `.passthrough()` (a diferencia de los schemas de fx.ts): con el strip por default de
+ *     zod, el objeto parseado NO PUEDE cargar `id_verifications[]`, `first_name`, `document_number`
+ *     ni `date_of_birth` — CD-7 pasa de ser una regla escrita en un comentario a ser una propiedad
+ *     del tipo. Los campos extra del partner NO invalidan la respuesta (zod los descarta en
+ *     silencio, no falla), así que la tolerancia a campos nuevos se mantiene intacta.
+ *  3. Todo `.nullish()` + `hits: z.unknown()`: el schema TIPA, no DECIDE. La decisión de compliance
+ *     sigue viviendo abajo (`decision === "approved" && amlHits === 0`) y en assertValidKycStatus.
+ *
+ * Los nombres exactos siguen sandbox-unverified: los fija el TODO(sandbox) de `verify()`.
+ */
+const DiditVerifyResponseSchema = z.object({
+  // Didit manda "Approved"; se aceptan escalares (se coercen con String(), como antes), pero un
+  // objeto/array NO se lee como estado: cae en la degradación fail-closed.
+  status: z.union([z.string(), z.number(), z.boolean()]).nullish(),
+  aml: z.object({ hits: z.unknown() }).nullish(),
+  session_id: z.union([z.string(), z.number()]).nullish(),
+  id: z.union([z.string(), z.number()]).nullish(),
+});
+type DiditVerifyResponse = z.infer<typeof DiditVerifyResponseSchema>;
 
 /** Adapter Didit — activo cuando DIDIT_API_KEY está seteada. */
 export class DiditKycProvider implements KycProvider {
@@ -48,19 +74,41 @@ export class DiditKycProvider implements KycProvider {
     if (!res.ok) {
       throw new Error(`didit_error_${res.status}`);
     }
-    const data = (await res.json()) as Record<string, unknown>;
+    const parsed = DiditVerifyResponseSchema.safeParse(await res.json());
+    // Shape NO reconocible → NO se lanza (antes tampoco: un `status` de tipo raro se coercía con
+    // String() y caía en approved:false). Se degrada por el MISMO camino, con todos los campos
+    // AUSENTES: `decision` queda "" → nunca "approved" → fail-closed, y `payoutAllowed` del agente
+    // queda false. Lo único que cambia es que el fallo deja rastro (warn + reason) en vez de ser
+    // silencioso — y que un body `null`, que antes tiraba un TypeError crudo, ahora degrada limpio.
+    if (!parsed.success) {
+      // CD-7: etiqueta value-free. PROHIBIDO loguear el body ni los issues de zod (traen los
+      // nombres de los campos del partner y, según la versión, valores recibidos).
+      console.warn("[remit-kyc] didit_verify_bad_shape → approved:false (fail-closed)");
+    }
+    const data: DiditVerifyResponse = parsed.success ? parsed.data : {};
     // TODO(sandbox): mapear la decisión real de Didit (status/aml.hits/risk).
-    const decision = String((data as any).status ?? "").toLowerCase();
-    const amlHits = Array.isArray((data as any).aml?.hits)
-      ? (data as any).aml.hits.length
-      : 0;
+    const decision = String(data.status ?? "").toLowerCase();
+    // ⚠️ El `Array.isArray(...) ? .length : 0` se PRESERVA tal cual, fail-open latente incluido
+    // (si Didit no manda un array, `amlHits` cae a 0): confirmar la forma real es el item 2 del
+    // TODO(sandbox) de status(), founder-gated. De ahí el `hits: z.unknown()` del schema — tipa el
+    // campo sin fingir que su forma está confirmada, y sin cambiar la decisión de compliance.
+    const amlHitsRaw = data.aml?.hits;
+    const amlHits = Array.isArray(amlHitsRaw) ? amlHitsRaw.length : 0;
     const approved = decision === "approved" && amlHits === 0;
     return {
       approved,
       riskLevel: amlHits > 0 ? "high" : approved ? "low" : "medium",
-      reasons: approved ? [] : [`didit_status_${decision}`, `aml_hits_${amlHits}`],
+      reasons: approved
+        ? []
+        : [
+            // El discriminador de shape se AGREGA (no reemplaza): los reasons históricos se siguen
+            // emitiendo igual para no romper consumidores. Value-free, como el resto (CD-4/CD-7).
+            ...(parsed.success ? [] : ["didit_response_bad_shape"]),
+            `didit_status_${decision}`,
+            `aml_hits_${amlHits}`,
+          ],
       travelRuleData: buildTravelRule(input),
-      verificationId: String((data as any).session_id ?? (data as any).id ?? "unknown"),
+      verificationId: String(data.session_id ?? data.id ?? "unknown"),
       provenance: "didit",
     };
   }
