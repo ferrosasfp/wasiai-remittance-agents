@@ -431,6 +431,153 @@ describe("assertValidKycStatus (WKH-203/CD-8, anti-WKH-198)", () => {
   });
 });
 
+// ── Shape de la respuesta EXTERNA de Didit en verify() (schema zod, ex-cast crudo) ─────────────
+// (a) shape válido → mismo mapeo que antes; (b) campos extra del partner → sigue funcionando y la
+// PII extra NO cruza el borde (el canario cubre el BORDE; el strip del schema agrega la garantía
+// estructural de que el objeto parseado ni siquiera carga esos campos — CD-7); (c) shape inválido
+// → degradación fail-closed EXPLÍCITA (warn + reason) en vez de silenciosa, y SIN throws nuevos.
+describe("DiditKycProvider.verify — validación de shape de la respuesta del partner", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  const stub = (body: unknown, status = 200) =>
+    vi.stubGlobal("fetch", vi.fn(async () => jsonResponse(body, status)));
+
+  it("(a) Approved sin AML hits → approved true, riskLevel low, provenance didit, id del partner", async () => {
+    stub({ status: "Approved", session_id: "s-1" });
+    const r = await new DiditKycProvider("k").verify(base);
+    expect(r.approved).toBe(true);
+    expect(r.riskLevel).toBe("low");
+    expect(r.provenance).toBe("didit");
+    expect(r.verificationId).toBe("s-1");
+    expect(r.reasons).toEqual([]);
+  });
+
+  it("(a) Declined → approved false + reasons históricos INTACTOS", async () => {
+    stub({ status: "Declined", session_id: "s-2" });
+    const r = await new DiditKycProvider("k").verify(base);
+    expect(r.approved).toBe(false);
+    expect(r.riskLevel).toBe("medium");
+    expect(r.reasons).toEqual(["didit_status_declined", "aml_hits_0"]);
+  });
+
+  it("(a) AML hits (array) → approved false + riskLevel high + conteo en reasons", async () => {
+    stub({ status: "Approved", session_id: "s-3", aml: { hits: [{ x: 1 }, { x: 2 }] } });
+    const r = await new DiditKycProvider("k").verify(base);
+    expect(r.approved).toBe(false);
+    expect(r.riskLevel).toBe("high");
+    expect(r.reasons).toEqual(["didit_status_approved", "aml_hits_2"]);
+  });
+
+  it("(b) campos EXTRA del partner → sigue aprobando Y la PII del partner NO cruza el borde (CD-7)", async () => {
+    stub({
+      status: "Approved",
+      session_id: "s-4",
+      // PII que el endpoint de decisión de Didit devuelve y este repo tiene PROHIBIDO leer.
+      // Los valores son distintos de los del input a propósito: lo único que puede aparecer en el
+      // resultado es el Travel Rule armado con el INPUT, nunca el payload del partner.
+      first_name: "PartnerGivenName",
+      last_name: "PartnerFamilyName",
+      document_number: "87654321",
+      date_of_birth: "1990-01-01",
+      id_verifications: [{ document_number: "87654321", portrait_image: "https://x/y.jpg" }],
+      warnings: [{ risk: "OCR_MISMATCH" }],
+    });
+    const r = await new DiditKycProvider("k").verify(base);
+    expect(r.approved).toBe(true);
+    expect(r.verificationId).toBe("s-4");
+    const dump = JSON.stringify(r);
+    expect(dump).not.toContain("87654321");
+    expect(dump).not.toContain("PartnerGivenName");
+    expect(dump).not.toContain("PartnerFamilyName");
+    expect(dump).not.toContain("1990-01-01");
+    expect(dump).not.toContain("portrait_image");
+  });
+
+  it("(b) session_id numérico → String() preservado", async () => {
+    stub({ status: "Approved", session_id: 12345 });
+    expect((await new DiditKycProvider("k").verify(base)).verificationId).toBe("12345");
+  });
+
+  it("(b) sin session_id pero con id → usa id (cadena de nombres preservada)", async () => {
+    stub({ status: "Approved", id: "alt-id" });
+    expect((await new DiditKycProvider("k").verify(base)).verificationId).toBe("alt-id");
+  });
+
+  it("(b) sin ningún id → 'unknown' (default histórico)", async () => {
+    stub({ status: "Approved" });
+    expect((await new DiditKycProvider("k").verify(base)).verificationId).toBe("unknown");
+  });
+
+  it("(c) body null → NO lanza: approved false + didit_response_bad_shape (antes: TypeError crudo)", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    stub(null);
+    const r = await new DiditKycProvider("k").verify(base);
+    expect(r.approved).toBe(false);
+    expect(r.provenance).toBe("didit");
+    expect(r.reasons).toContain("didit_response_bad_shape");
+    expect(r.verificationId).toBe("unknown");
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("didit_verify_bad_shape"));
+  });
+
+  it("(c) status de tipo inesperado (objeto) → fail-closed + reason de shape, sin throw", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    stub({ status: { code: "approved" }, session_id: "s-5" });
+    const r = await new DiditKycProvider("k").verify(base);
+    expect(r.approved).toBe(false); // NUNCA se lee un objeto como "approved"
+    expect(r.reasons).toContain("didit_response_bad_shape");
+    // los reasons históricos se AGREGAN, no se reemplazan (no se rompen consumidores)
+    expect(r.reasons).toContain("aml_hits_0");
+  });
+
+  it("(c) body array → fail-closed + reason de shape", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    stub([{ status: "Approved" }]);
+    const r = await new DiditKycProvider("k").verify(base);
+    expect(r.approved).toBe(false);
+    expect(r.reasons).toContain("didit_response_bad_shape");
+  });
+
+  it("(c) el reason de shape es una ETIQUETA value-free (CD-7: nunca el body del partner)", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    stub({ status: { nested: "Approved" }, document_number: "87654321", vendor_data: "12345678" });
+    const r = await new DiditKycProvider("k").verify(base);
+    const dump = JSON.stringify(r.reasons);
+    expect(dump).not.toContain("87654321");
+    expect(dump).not.toContain("vendor_data");
+    expect(dump).not.toContain("nested");
+  });
+
+  it("(c) shape válido → NO se emite el reason de shape (el discriminador no es ruido)", async () => {
+    stub({ status: "Declined", session_id: "s-6" });
+    const r = await new DiditKycProvider("k").verify(base);
+    expect(r.reasons).not.toContain("didit_response_bad_shape");
+  });
+
+  it("!res.ok → sigue lanzando didit_error_<n> (fail-closed intacto, nada cambió antes del parseo)", async () => {
+    stub({}, 500);
+    await expect(new DiditKycProvider("k").verify(base)).rejects.toThrow(/didit_error_500/);
+  });
+
+  // 🔴 Guard de REGRESIÓN, no de deseo: `aml.hits` NO-array sigue contando 0 hits. Es el fail-open
+  // latente que documenta el item 2 del TODO(sandbox) de status() — confirmar la forma real contra
+  // el sandbox es founder-gated, así que este cambio (solo tipado) lo PRESERVA a propósito. Si
+  // alguien lo endurece, este test se pone rojo y hay que ir a leer ese TODO.
+  it("aml.hits no-array (number) → amlHits 0: comportamiento PRESERVADO (TODO(sandbox) item 2)", async () => {
+    stub({ status: "Approved", session_id: "s-7", aml: { hits: 3 } });
+    const r = await new DiditKycProvider("k").verify(base);
+    expect(r.approved).toBe(true); // fail-open latente, hoy inocuo tras DIDIT_ADAPTER_READY
+    expect(r.reasons).toEqual([]);
+  });
+
+  it("aml null → amlHits 0 sin romper (nullish preservado)", async () => {
+    stub({ status: "Approved", session_id: "s-8", aml: null });
+    expect((await new DiditKycProvider("k").verify(base)).approved).toBe(true);
+  });
+});
+
 describe("getKycProvider factory (MNR-2: readiness fail-loud)", () => {
   afterEach(() => vi.unstubAllEnvs());
 
