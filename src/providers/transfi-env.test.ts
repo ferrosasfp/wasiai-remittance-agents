@@ -31,6 +31,10 @@ const MANAGED_ENVS = [
   "ALLOW_FALLBACK_KYC",
   "DIDIT_API_KEY",
   "DIDIT_ADAPTER_READY",
+  // Deben estar acá para que el snapshot/restore las limpie: si no, el `setEnv("DIDIT_ENV", …)` de
+  // G-18 se FILTRARÍA a los demás tests del archivo (y el orden de ejecución decidiría el resultado).
+  "DIDIT_ENV",
+  "DIDIT_BASE_URL",
 ] as const;
 
 let envSnapshot: Record<string, string | undefined> = {};
@@ -332,6 +336,12 @@ describe("modo devnet actual (sin creds TransFi) sigue andando sin TRANSFI_ENV (
     setEnv("ALLOW_FALLBACK_PAYOUT", "true"); // NODE_ENV=test → rama dev del fail-safe de payout
     setEnv("DIDIT_API_KEY", "k");
     setEnv("DIDIT_ADAPTER_READY", "true");
+    // El adapter de Didit tiene su propio fail-closed de ambiente (didit-env.ts, módulo hermano de
+    // este): sin DIDIT_ENV la factory lanza. Este test declara "mock" + localhost porque su punto es
+    // el fail-closed de TRANSFI_ENV, no el de Didit — y porque un test jamás debe resolver el host
+    // real de Didit. El eje Didit se cubre en didit-env.test.ts.
+    setEnv("DIDIT_ENV", "mock");
+    setEnv("DIDIT_BASE_URL", "http://localhost:9999/didit-mock");
     setEnv("TRANSFI_USDC_NETWORK", "solana");
     setEnv("TRANSFI_DEVNET_SOLANA_DEPOSIT_ADDRESS", "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU");
     const { calls } = stubFetchCapturing({
