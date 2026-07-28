@@ -152,6 +152,12 @@ describe("POST /api/agents/remit-cashout-payout/invoke", () => {
     // abre en prod (B3), ni con ALLOW_FALLBACK_KYC. Solo crece el ARRANGE: asserts originales.
     vi.stubEnv("DIDIT_API_KEY", "k");
     vi.stubEnv("DIDIT_ADAPTER_READY", "true");
+    // El adapter de Didit exige que el ambiente se DECLARE (didit-env.ts, fail-closed): sin esto la
+    // factory lanza y la ruta devuelve 502. Se declara "mock" + localhost — con NODE_ENV=production
+    // stubeado, "live" resolvería el host REAL de Didit desde un test, que es justo lo que no puede
+    // pasar. El eje Didit se cubre en didit-env.test.ts.
+    vi.stubEnv("DIDIT_ENV", "mock");
+    vi.stubEnv("DIDIT_BASE_URL", "http://localhost:9999/didit-mock");
     // WKH-204: el vendor_data debe matchear el senderIdentity del fixture (C7), si no C11 bloquea.
     vi.stubGlobal(
       "fetch",

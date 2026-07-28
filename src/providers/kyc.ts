@@ -3,9 +3,8 @@
 // SBS-compliant Perú. Docs: https://docs.didit.me  (endpoints exactos a confirmar en sandbox).
 
 import { z } from "zod";
+import { resolveDiditBaseUrl, type DiditBaseUrl } from "./didit-env";
 import type { KycInput, KycProvider, KycResult, KycStatusResult } from "./types";
-
-const DIDIT_BASE = process.env.DIDIT_BASE_URL ?? "https://verification.didit.me";
 
 // MNR-3 (re-AR): allowlist explícita de proveniencias REALES (fail-safe en el eje provenance).
 // Un typo futuro en un provider NO debe leerse como "real" y abrir el money-path.
@@ -50,13 +49,23 @@ type DiditVerifyResponse = z.infer<typeof DiditVerifyResponseSchema>;
 
 /** Adapter Didit — activo cuando DIDIT_API_KEY está seteada. */
 export class DiditKycProvider implements KycProvider {
-  constructor(private readonly apiKey: string) {}
+  /**
+   * `baseUrl` es un `DiditBaseUrl` (BRANDED) y se RECIBE, no se lee de una env acá: mismo contrato
+   * que `TransFiPayoutProvider` (payout.ts:109). Es lo que garantiza por COMPILADOR que el único
+   * origen de host es `resolveDiditBaseUrl()` — un `string` cualquiera (un default nuevo, un literal
+   * hardcodeado) no compila como argumento. Antes esto era un `const` de módulo con
+   * `?? "<host productivo>"`: sin env seteada, el adapter hablaba con la producción de Didit.
+   */
+  constructor(
+    private readonly apiKey: string,
+    private readonly baseUrl: DiditBaseUrl,
+  ) {}
 
   async verify(input: KycInput): Promise<KycResult> {
     // Didit expone verificación por "session"; acá se crea/consulta la verificación
     // del legalId (DNI) + screening AML. La forma exacta de request/response se fija
     // con el sandbox (Fase A) — TODO: mapear campos reales.
-    const res = await fetch(`${DIDIT_BASE}/v2/session/`, {
+    const res = await fetch(`${this.baseUrl}/v2/session/`, {
       method: "POST",
       signal: AbortSignal.timeout(8000), // MNR-3: no colgar el money-path si el partner stallea
       headers: {
@@ -138,7 +147,7 @@ export class DiditKycProvider implements KycProvider {
     // CD-7: de este JSON se leen SOLO status, aml.hits, session_id y vendor_data. PROHIBIDO leer/
     // loguear id_verifications[], first_name, last_name, document_number, date_of_birth.
     // `vendor_data` se usa para COMPARAR y se DESCARTA: nunca va a reasons, al return ni a un log.
-    const res = await fetch(`${DIDIT_BASE}/v3/session/${encodeURIComponent(verificationId)}/decision/`, {
+    const res = await fetch(`${this.baseUrl}/v3/session/${encodeURIComponent(verificationId)}/decision/`, {
       method: "GET",
       signal: AbortSignal.timeout(8000), // igual que payout.ts:47 — no colgar el money-path
       headers: { "x-api-key": this.apiKey },
@@ -291,5 +300,10 @@ export function getKycProvider(): KycProvider {
         "confirmá el mapeo de campos con el sandbox antes de activar el adapter en el money-path.",
     );
   }
-  return new DiditKycProvider(key);
+  // `resolveDiditBaseUrl()` se llama ACÁ y no antes: es el punto donde se construye el adapter REAL
+  // (mismo lugar que `getPayoutProvider()` llama a `resolveTransFiBaseUrl()`). Consecuencia
+  // deliberada: la rama de arriba (sin key → FallbackKycProvider) NUNCA necesita `DIDIT_ENV`, así
+  // que el deploy devnet actual sigue andando inerte sin tocar ninguna env nueva. El fail-closed
+  // solo muerde a quien de verdad va a hablarle a Didit.
+  return new DiditKycProvider(key, resolveDiditBaseUrl());
 }

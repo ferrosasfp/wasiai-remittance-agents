@@ -25,6 +25,16 @@ function stubDiditDecision(body: unknown) {
   );
 }
 
+// Ambiente de Didit declarado, para TODO el archivo (fail-closed): los tests que stubean
+// DIDIT_API_KEY="k" + DIDIT_ADAPTER_READY=true construyen el adapter REAL vía getKycProvider(), que
+// sin DIDIT_ENV lanza didit_env_unset. Se fija en "mock" + localhost, así que además BLINDA: ningún
+// test puede resolver el host REAL de Didit (crearía verificaciones con PII), ni siquiera si alguien
+// exporta DIDIT_ENV=live en la shell/CI. Los tests con DIDIT_API_KEY="" no lo usan (van al fallback).
+beforeEach(() => {
+  vi.stubEnv("DIDIT_ENV", "mock");
+  vi.stubEnv("DIDIT_BASE_URL", "http://localhost:9999/didit-mock");
+});
+
 // WKH-203 — el input NO decide compliance: la decisión se re-deriva server-side.
 // Reemplaza al viejo describe "hard-gate KYC" (que testeaba el booleano del caller, hoy strippeado).
 describe("runCashoutPayout — gate KYC server-side (WKH-203)", () => {
