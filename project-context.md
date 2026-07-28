@@ -154,7 +154,8 @@ creds + `TRANSFI_ADAPTER_READY=true`.
 | `TRANSFI_USERNAME` | Basic auth user (secreto). Señal de "real" en payout — reemplaza a `TRANSFI_API_KEY` en el payout. |
 | `TRANSFI_PASSWORD` | Basic auth pass (secreto). |
 | `TRANSFI_MID` | valor del header `mid` (ej. `WIIB1V_NA_NA`). |
-| `TRANSFI_BASE_URL` | host base; default `https://sandbox-api.transfi.com` (sandbox-only). |
+| `TRANSFI_ENV` | **OBLIGATORIA para usar el adapter real** (`sandbox` \| `production`). Única fuente de verdad del ambiente de TransFi para los DOS providers (payout + fx), en `src/providers/transfi-env.ts`. **Sin ella el adapter real NO se construye** (`transfi_env_unset`, fail-closed): no se asume ningún host. `production` exige además `NODE_ENV=production`. El modo mock/devnet (sin creds) no la necesita. |
+| `TRANSFI_BASE_URL` | **override opcional** del host (mock de CI, host dedicado del partner). NO define el ambiente y NO puede contradecir a `TRANSFI_ENV`: apuntar al host productivo declarando `sandbox` (o al revés) es un throw (`transfi_base_url_env_conflict`). `http://` solo para `localhost`. |
 | `TRANSFI_USDC_NETWORK` | red del USDC del `source`; default `base` → `USDCBASE`; `solana` → `USDCSOL`. Fail-loud si fuera del allowlist. |
 | `TRANSFI_SOURCE_WALLET_ADDRESS` | `source.walletAddress` del body (config, no secreto — TODO(F3-sandbox)). |
 | `TRANSFI_SOURCE_URL` | `sourceUrl` del body (URL del merchant, server-only, no secreto — TODO(F3-sandbox): confirmar si es requerido y qué valor). Default `""` → fail-loud (4xx) si el sandbox lo exige. |
@@ -269,7 +270,8 @@ DIDIT_BASE_URL            — override del base URL de Didit (default https://ve
 ALLOW_FALLBACK_KYC        — "true" habilita que el fallback KYC (no real) marque payoutAllowed en no-prod (dev/CI). WKH-203: AHORA TAMBIÉN habilita el gate KYC del agente de PAYOUT (remit-cashout-payout) en no-prod → sin esta env, en dev/CI el payout queda blocked. En producción NO abre nada (el fallback jamás pasa el gate)
 TRANSFI_API_KEY           — key del partner de payout TransFi (activa el adapter real)
 TRANSFI_ADAPTER_READY     — "true" para confirmar el mapeo/flujo del adapter TransFi (opt-in explícito)
-TRANSFI_BASE_URL          — override del base URL de TransFi (default https://api.transfi.com)
+TRANSFI_ENV               — ambiente de TransFi: "sandbox" | "production". OBLIGATORIA para el adapter real (fx Y payout leen el MISMO resolvedor). Sin ella: transfi_env_unset, el adapter no se construye y no sale ninguna request (antes: fx caía en https://api.transfi.com, PRODUCCIÓN del partner). "production" exige NODE_ENV=production
+TRANSFI_BASE_URL          — override opcional del host (mock CI / host dedicado). NO define el ambiente y no puede contradecir a TRANSFI_ENV (throw transfi_base_url_env_conflict). Ya NO tiene default
 PAYOUT_ALLOW_MOCK         — "true" permite el payout FALLBACK (mock) en NODE_ENV=production (etapa 1 del deploy; NUNCA abre payout real)
 ALLOW_FALLBACK_PAYOUT     — "true" habilita el payout fallback (mock) en dev/CI (fuera de producción)
 FALLBACK_FX_SPREAD_BPS    — spread declarado del fallback FX (bps, default 250)

@@ -4,9 +4,15 @@
 // genuina. TransFi da la tasa efectiva real del corredor cuando su key está seteada.
 
 import { z } from "zod";
+import { resolveTransFiBaseUrl, type TransFiBaseUrl } from "./transfi-env";
 import type { FxQuote, FxQuoteInput, FxQuoteProvider } from "./types";
 
-const TRANSFI_BASE = process.env.TRANSFI_BASE_URL ?? "https://api.transfi.com";
+// 🔴 NO existe acá ninguna constante de host de TransFi, y este archivo NO lee `TRANSFI_BASE_URL`.
+// Antes había un `process.env.TRANSFI_BASE_URL ?? "https://api.transfi.com"` (¡PRODUCCIÓN del
+// partner!) que contradecía el default sandbox de `payout.ts`: la misma env, dos ambientes.
+// El host llega ahora inyectado como `TransFiBaseUrl` (branded) desde `transfi-env.ts`, que es la
+// única fuente de verdad. Volver a poner un default local acá no compila como argumento del
+// adapter y además pone en rojo `transfi-env.test.ts` (test estructural).
 // spread del fallback (bps) — conservador, declarado. TransFi reemplaza esto con su tasa real.
 const FALLBACK_SPREAD_BPS = Number(process.env.FALLBACK_FX_SPREAD_BPS ?? 250); // 2.5%
 const FALLBACK_FLAT_FEE_USD = Number(process.env.FALLBACK_FX_FLAT_FEE_USD ?? 0.5);
@@ -52,11 +58,15 @@ const FxMidResponseSchema = z
 
 /** Adapter TransFi — activo con TRANSFI_API_KEY. Devuelve la tasa efectiva real del corredor. */
 export class TransFiFxProvider implements FxQuoteProvider {
-  constructor(private readonly apiKey: string) {}
+  /** `baseUrl` es OBLIGATORIO y branded: solo `resolveTransFiBaseUrl()` puede producir uno. */
+  constructor(
+    private readonly apiKey: string,
+    private readonly baseUrl: TransFiBaseUrl,
+  ) {}
 
   async quote(input: FxQuoteInput): Promise<FxQuote> {
     // TODO(sandbox): confirmar el endpoint/shape exactos del quote API de TransFi.
-    const res = await fetch(`${TRANSFI_BASE}/v1/quotes`, {
+    const res = await fetch(`${this.baseUrl}/v1/quotes`, {
       method: "POST",
       signal: AbortSignal.timeout(8000), // MNR-3: no colgar el money-path
       headers: { "content-type": "application/json", authorization: `Bearer ${this.apiKey}` },
@@ -174,5 +184,7 @@ export function getFxQuoteProvider(): FxQuoteProvider {
         "confirmá el mapeo de campos con el sandbox antes de activar el adapter en el money-path.",
     );
   }
-  return new TransFiFxProvider(key);
+  // El ambiente se resuelve ACÁ (lazy, mismo llamado que usa `getPayoutProvider()`): sin
+  // `TRANSFI_ENV` esto lanza `transfi_env_unset` en vez de apuntar a la API productiva del partner.
+  return new TransFiFxProvider(key, resolveTransFiBaseUrl());
 }
