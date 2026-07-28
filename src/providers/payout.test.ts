@@ -7,8 +7,26 @@ import {
   normalizeStatus,
   resolveDevnetStubAddress,
 } from "./payout";
+import { resolveTransFiBaseUrl, type TransFiBaseUrl } from "./transfi-env";
 import { runCashoutPayout } from "../agents/cashout-payout";
 import type { PayoutInput, PayoutResult } from "./types";
+
+/**
+ * Mint del host de sandbox para los tests. Usa el resolvedor REAL (no un cast) a propósito: el tipo
+ * `TransFiBaseUrl` es branded, así que este helper es la prueba de que el ÚNICO camino a un host de
+ * TransFi pasa por `resolveTransFiBaseUrl()`, incluso desde los tests.
+ */
+function mintSandboxBaseUrl(): TransFiBaseUrl {
+  const previous = process.env.TRANSFI_ENV;
+  process.env.TRANSFI_ENV = "sandbox";
+  try {
+    return resolveTransFiBaseUrl();
+  } finally {
+    if (previous === undefined) delete process.env.TRANSFI_ENV;
+    else process.env.TRANSFI_ENV = previous;
+  }
+}
+const SANDBOX_BASE = mintSandboxBaseUrl();
 
 const input: PayoutInput = {
   quoteId: "q1",
@@ -87,7 +105,7 @@ describe("TransFiPayoutProvider.execute — contrato HTTP", () => {
 
   it("AC-1: auth Basic base64(user:pass) + header mid; NUNCA Bearer ni x-api-key", async () => {
     const fetchMock = stubFetch({ orderId: "ord-1", walletAddress: "0xdep" });
-    await new TransFiPayoutProvider(CREDS).execute(input);
+    await new TransFiPayoutProvider(CREDS, SANDBOX_BASE).execute(input);
     const [, init] = fetchMock.mock.calls[0]!;
     const headers = init?.headers as Record<string, string>;
     expect(headers.authorization).toBe("Basic " + Buffer.from("u:p").toString("base64"));
@@ -98,7 +116,7 @@ describe("TransFiPayoutProvider.execute — contrato HTTP", () => {
 
   it("AC-2: POST /v3/orders; orderType offramp; partnerId=idempotencyKey byte-idéntico; sin header idempotency-key", async () => {
     const fetchMock = stubFetch({ orderId: "ord-1", walletAddress: "0xdep" });
-    await new TransFiPayoutProvider(CREDS).execute(input);
+    await new TransFiPayoutProvider(CREDS, SANDBOX_BASE).execute(input);
     const [url, init] = fetchMock.mock.calls[0]!;
     expect(url).toMatch(/\/v3\/orders$/);
     expect(url).not.toContain("/v1/payouts");
@@ -112,23 +130,23 @@ describe("TransFiPayoutProvider.execute — contrato HTTP", () => {
   it("FIX-A (CR MNR-1): body incluye sourceUrl desde TRANSFI_SOURCE_URL cuando está seteada", async () => {
     const fetchMock = stubFetch({ orderId: "ord-1", walletAddress: "0xdep" });
     vi.stubEnv("TRANSFI_SOURCE_URL", "https://merchant.example/return");
-    await new TransFiPayoutProvider(CREDS).execute(input);
+    await new TransFiPayoutProvider(CREDS, SANDBOX_BASE).execute(input);
     const body = JSON.parse(fetchMock.mock.calls[0]![1]?.body as string) as { sourceUrl: string };
     expect(body.sourceUrl).toBe("https://merchant.example/return");
   });
 
   it("FIX-B (AR MNR-1): 2xx con body no-JSON → transfi_payout_bad_response tipado, NO SyntaxError crudo, NO mock", async () => {
     stubFetchRaw("not json");
-    await expect(new TransFiPayoutProvider(CREDS).execute(input)).rejects.toThrow(
+    await expect(new TransFiPayoutProvider(CREDS, SANDBOX_BASE).execute(input)).rejects.toThrow(
       /^transfi_payout_bad_response$/,
     );
     // el error NO es un SyntaxError crudo del parser
-    await expect(new TransFiPayoutProvider(CREDS).execute(input)).rejects.not.toThrow(SyntaxError);
+    await expect(new TransFiPayoutProvider(CREDS, SANDBOX_BASE).execute(input)).rejects.not.toThrow(SyntaxError);
   });
 
   it("AC-3: 2xx → status submitted, payoutId=orderId, depositAddress=walletAddress, deliveredLocal null, provenance transfi", async () => {
     stubFetch({ orderId: "ord-1", walletAddress: "0xdeposit" });
-    const r = await new TransFiPayoutProvider(CREDS).execute(input);
+    const r = await new TransFiPayoutProvider(CREDS, SANDBOX_BASE).execute(input);
     expect(r.status).toBe("submitted");
     expect(r.payoutId).toBe("ord-1");
     expect(r.depositAddress).toBe("0xdeposit");
@@ -138,14 +156,14 @@ describe("TransFiPayoutProvider.execute — contrato HTTP", () => {
 
   it("AC-3 adversarial: status:fund_settled EN el POST NO produce settled (se fuerza submitted)", async () => {
     stubFetch({ orderId: "ord-1", walletAddress: "0xdeposit", status: "fund_settled" });
-    const r = await new TransFiPayoutProvider(CREDS).execute(input);
+    const r = await new TransFiPayoutProvider(CREDS, SANDBOX_BASE).execute(input);
     expect(r.status).toBe("submitted"); // CD-5: nunca leer status del create-order
   });
 
   it("AC-6: red no soportada (avalanche) → throw transfi_unsupported_network, SIN llamar fetch", async () => {
     const fetchMock = stubFetch({ orderId: "ord-1" });
     vi.stubEnv("TRANSFI_USDC_NETWORK", "avalanche");
-    await expect(new TransFiPayoutProvider(CREDS).execute(input)).rejects.toThrow(
+    await expect(new TransFiPayoutProvider(CREDS, SANDBOX_BASE).execute(input)).rejects.toThrow(
       /transfi_unsupported_network_avalanche/,
     );
     expect(fetchMock).not.toHaveBeenCalled();
@@ -154,7 +172,7 @@ describe("TransFiPayoutProvider.execute — contrato HTTP", () => {
   it("AC-6 feliz: polygon → source.currency USDCPOLYGON", async () => {
     const fetchMock = stubFetch({ orderId: "ord-1", walletAddress: "0xdep" });
     vi.stubEnv("TRANSFI_USDC_NETWORK", "polygon");
-    await new TransFiPayoutProvider(CREDS).execute(input);
+    await new TransFiPayoutProvider(CREDS, SANDBOX_BASE).execute(input);
     const body = JSON.parse(fetchMock.mock.calls[0]![1]?.body as string) as {
       source: { currency: string };
     };
@@ -164,7 +182,7 @@ describe("TransFiPayoutProvider.execute — contrato HTTP", () => {
   it("AC-6 feliz: base (default) → source.currency USDCBASE", async () => {
     const fetchMock = stubFetch({ orderId: "ord-1", walletAddress: "0xdep" });
     vi.stubEnv("TRANSFI_USDC_NETWORK", "base");
-    await new TransFiPayoutProvider(CREDS).execute(input);
+    await new TransFiPayoutProvider(CREDS, SANDBOX_BASE).execute(input);
     const body = JSON.parse(fetchMock.mock.calls[0]![1]?.body as string) as {
       source: { currency: string };
     };
@@ -174,7 +192,7 @@ describe("TransFiPayoutProvider.execute — contrato HTTP", () => {
   it("AC-6 feliz: solana → source.currency USDCSOL", async () => {
     const fetchMock = stubFetch({ orderId: "ord-1", walletAddress: "0xdep" });
     vi.stubEnv("TRANSFI_USDC_NETWORK", "solana");
-    await new TransFiPayoutProvider(CREDS).execute(input);
+    await new TransFiPayoutProvider(CREDS, SANDBOX_BASE).execute(input);
     const body = JSON.parse(fetchMock.mock.calls[0]![1]?.body as string) as {
       source: { currency: string };
     };
@@ -187,20 +205,20 @@ describe("TransFiPayoutProvider.execute — contrato HTTP", () => {
       depositAddress: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU",
     });
     vi.stubEnv("TRANSFI_USDC_NETWORK", "solana");
-    const r = await new TransFiPayoutProvider(CREDS).execute(input);
+    const r = await new TransFiPayoutProvider(CREDS, SANDBOX_BASE).execute(input);
     expect(r.depositAddress).toBe("7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU");
   });
 
   it("AC-7: 4xx (PARTNER_ID_ALREADY_USED) → throws transfi_payout_error_409, nunca resuelve", async () => {
     stubFetch({ code: "PARTNER_ID_ALREADY_USED" }, 409);
-    await expect(new TransFiPayoutProvider(CREDS).execute(input)).rejects.toThrow(
+    await expect(new TransFiPayoutProvider(CREDS, SANDBOX_BASE).execute(input)).rejects.toThrow(
       /transfi_payout_error_409/,
     );
   });
 
   it("AC-7: 5xx → throws transfi_payout_error_500", async () => {
     stubFetch({}, 500);
-    await expect(new TransFiPayoutProvider(CREDS).execute(input)).rejects.toThrow(
+    await expect(new TransFiPayoutProvider(CREDS, SANDBOX_BASE).execute(input)).rejects.toThrow(
       /transfi_payout_error_500/,
     );
   });
@@ -214,7 +232,7 @@ describe("TransFiPayoutProvider.status", () => {
 
   it("GET /v3/orders/{id} con Basic+mid; mapea normalizeStatus; depositAddress null", async () => {
     const fetchMock = stubFetch({ status: "fund_settled" });
-    const r = await new TransFiPayoutProvider(CREDS).status("ord-1");
+    const r = await new TransFiPayoutProvider(CREDS, SANDBOX_BASE).status("ord-1");
     const [url, init] = fetchMock.mock.calls[0]!;
     expect(url).toMatch(/\/v3\/orders\/ord-1$/);
     const headers = init?.headers as Record<string, string>;
@@ -227,15 +245,15 @@ describe("TransFiPayoutProvider.status", () => {
 
   it("FIX-B (AR MNR-1): status() 2xx con body no-JSON → transfi_payout_status_bad_response tipado, NO SyntaxError", async () => {
     stubFetchRaw("not json");
-    await expect(new TransFiPayoutProvider(CREDS).status("ord-1")).rejects.toThrow(
+    await expect(new TransFiPayoutProvider(CREDS, SANDBOX_BASE).status("ord-1")).rejects.toThrow(
       /^transfi_payout_status_bad_response$/,
     );
-    await expect(new TransFiPayoutProvider(CREDS).status("ord-1")).rejects.not.toThrow(SyntaxError);
+    await expect(new TransFiPayoutProvider(CREDS, SANDBOX_BASE).status("ord-1")).rejects.not.toThrow(SyntaxError);
   });
 
   it("AC-7: !2xx en status → throws transfi_payout_status_error_500", async () => {
     stubFetch({}, 500);
-    await expect(new TransFiPayoutProvider(CREDS).status("ord-1")).rejects.toThrow(
+    await expect(new TransFiPayoutProvider(CREDS, SANDBOX_BASE).status("ord-1")).rejects.toThrow(
       /transfi_payout_status_error_500/,
     );
   });
@@ -286,6 +304,7 @@ describe("FallbackPayoutProvider — escape-hatch devnet (WKH-232 / HU-SOL-15)",
     vi.stubEnv("TRANSFI_PASSWORD", "p");
     vi.stubEnv("TRANSFI_MID", "m");
     vi.stubEnv("TRANSFI_ADAPTER_READY", "true");
+    vi.stubEnv("TRANSFI_ENV", "sandbox"); // ambiente declarado (fail-closed sin esto)
     vi.stubEnv("TRANSFI_DEVNET_SOLANA_DEPOSIT_ADDRESS", VALID);
     vi.stubEnv("TRANSFI_USDC_NETWORK", "solana");
     expect(getPayoutProvider()).toBeInstanceOf(TransFiPayoutProvider);
@@ -377,11 +396,12 @@ describe("getPayoutProvider factory (AC-5)", () => {
     vi.stubEnv("TRANSFI_ADAPTER_READY", "");
     expect(() => getPayoutProvider()).toThrow(/transfi_adapter_not_ready/);
   });
-  it("creds + readiness → adapter TransFi", () => {
+  it("creds + readiness + TRANSFI_ENV → adapter TransFi", () => {
     vi.stubEnv("TRANSFI_USERNAME", "u");
     vi.stubEnv("TRANSFI_PASSWORD", "p");
     vi.stubEnv("TRANSFI_MID", "m");
     vi.stubEnv("TRANSFI_ADAPTER_READY", "true");
+    vi.stubEnv("TRANSFI_ENV", "sandbox"); // ahora el ambiente se DECLARA (antes se adivinaba)
     expect(getPayoutProvider()).toBeInstanceOf(TransFiPayoutProvider);
   });
 });

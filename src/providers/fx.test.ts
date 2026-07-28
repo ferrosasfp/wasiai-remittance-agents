@@ -5,7 +5,25 @@ import {
   assertValidQuote,
   getFxQuoteProvider,
 } from "./fx";
+import { resolveTransFiBaseUrl, type TransFiBaseUrl } from "./transfi-env";
 import type { FxQuote, FxQuoteInput } from "./types";
+
+/**
+ * Mint del host de sandbox para los tests. Usa el resolvedor REAL (no un cast) a propósito: el tipo
+ * `TransFiBaseUrl` es branded, así que este helper es la prueba de que el ÚNICO camino a un host de
+ * TransFi pasa por `resolveTransFiBaseUrl()`, incluso desde los tests.
+ */
+function mintSandboxBaseUrl(): TransFiBaseUrl {
+  const previous = process.env.TRANSFI_ENV;
+  process.env.TRANSFI_ENV = "sandbox";
+  try {
+    return resolveTransFiBaseUrl();
+  } finally {
+    if (previous === undefined) delete process.env.TRANSFI_ENV;
+    else process.env.TRANSFI_ENV = previous;
+  }
+}
+const SANDBOX_BASE = mintSandboxBaseUrl();
 
 const goodQuote: FxQuote = {
   rate: 3.7,
@@ -71,9 +89,10 @@ describe("getFxQuoteProvider factory (MNR-2: readiness fail-loud)", () => {
     vi.stubEnv("TRANSFI_ADAPTER_READY", "");
     expect(() => getFxQuoteProvider()).toThrow(/transfi_adapter_not_ready/);
   });
-  it("key + readiness → adapter TransFi", () => {
+  it("key + readiness + TRANSFI_ENV → adapter TransFi", () => {
     vi.stubEnv("TRANSFI_API_KEY", "k");
     vi.stubEnv("TRANSFI_ADAPTER_READY", "true");
+    vi.stubEnv("TRANSFI_ENV", "sandbox"); // ahora el ambiente se DECLARA (antes se adivinaba)
     expect(getFxQuoteProvider()).toBeInstanceOf(TransFiFxProvider);
   });
 });
@@ -105,7 +124,7 @@ describe("TransFiFxProvider.quote — validación de shape de la respuesta del p
       quoteId: "tq-1",
       expiresAt: "2026-07-25T00:00:00.000Z",
     });
-    const q = await new TransFiFxProvider("k").quote(fxInput);
+    const q = await new TransFiFxProvider("k", SANDBOX_BASE).quote(fxInput);
     expect(q).toEqual({
       rate: 3.6,
       feeUsd: 0.4,
@@ -129,7 +148,7 @@ describe("TransFiFxProvider.quote — validación de shape de la respuesta del p
       breakdown: { spreadBps: 120, partnerFee: { amount: 0.4, currency: "USD" } },
       _links: [{ rel: "self", href: "/v1/quotes/tq-2" }],
     });
-    const q = await new TransFiFxProvider("k").quote(fxInput);
+    const q = await new TransFiFxProvider("k", SANDBOX_BASE).quote(fxInput);
     expect(q.quoteId).toBe("tq-2");
     expect(q.rate).toBe(3.6);
     expect(q.provenance).toBe("transfi");
@@ -144,7 +163,7 @@ describe("TransFiFxProvider.quote — validación de shape de la respuesta del p
       quoteId: "tq-3",
       expiresAt: "2026-07-25T00:00:00.000Z",
     });
-    const q = await new TransFiFxProvider("k").quote(fxInput);
+    const q = await new TransFiFxProvider("k", SANDBOX_BASE).quote(fxInput);
     expect(q.rate).toBe(3.65);
     expect(q.feeUsd).toBe(0.5);
     expect(q.netDeliveredLocal).toBe(365);
@@ -153,7 +172,7 @@ describe("TransFiFxProvider.quote — validación de shape de la respuesta del p
 
   it("(b) id numérico + fee null + fallback quoteId→id → coerciones históricas preservadas", async () => {
     stubQuoteResponse({ rate: 3.6, fee: null, destAmount: 358.4, id: 99, expiresAt: null });
-    const q = await new TransFiFxProvider("k").quote(fxInput);
+    const q = await new TransFiFxProvider("k", SANDBOX_BASE).quote(fxInput);
     expect(q.quoteId).toBe("99"); // String(d.quoteId ?? d.id)
     expect(q.feeUsd).toBe(0); // fee null → ?? 0
     expect(q.expiresAt).toBe(""); // expiresAt null → ?? ""
@@ -162,14 +181,14 @@ describe("TransFiFxProvider.quote — validación de shape de la respuesta del p
 
   it("(c) shape inválido (rate como objeto) → throws transfi_quote_bad_shape", async () => {
     stubQuoteResponse({ rate: { value: 3.6 }, destAmount: 358.4, quoteId: "tq-4" });
-    await expect(new TransFiFxProvider("k").quote(fxInput)).rejects.toThrow(
+    await expect(new TransFiFxProvider("k", SANDBOX_BASE).quote(fxInput)).rejects.toThrow(
       /transfi_quote_bad_shape/,
     );
   });
 
   it("(c) body que no es objeto (array) → throws transfi_quote_bad_shape", async () => {
     stubQuoteResponse([{ rate: 3.6 }]);
-    await expect(new TransFiFxProvider("k").quote(fxInput)).rejects.toThrow(
+    await expect(new TransFiFxProvider("k", SANDBOX_BASE).quote(fxInput)).rejects.toThrow(
       /transfi_quote_bad_shape/,
     );
   });
@@ -178,17 +197,17 @@ describe("TransFiFxProvider.quote — validación de shape de la respuesta del p
     // el schema es .nullish() a propósito: un campo faltante NO inventa un error nuevo, sigue
     // cayendo en el guard de dinero de siempre (BLQ-MED-2).
     stubQuoteResponse({ destAmount: 358.4, quoteId: "tq-5" });
-    await expect(new TransFiFxProvider("k").quote(fxInput)).rejects.toThrow(/invalid_quote_rate/);
+    await expect(new TransFiFxProvider("k", SANDBOX_BASE).quote(fxInput)).rejects.toThrow(/invalid_quote_rate/);
   });
 
   it("(c) quoteId/id ausentes → degradación byte-idéntica: invalid_quote_id", async () => {
     stubQuoteResponse({ rate: 3.6, destAmount: 358.4 });
-    await expect(new TransFiFxProvider("k").quote(fxInput)).rejects.toThrow(/invalid_quote_id/);
+    await expect(new TransFiFxProvider("k", SANDBOX_BASE).quote(fxInput)).rejects.toThrow(/invalid_quote_id/);
   });
 
   it("!res.ok → sigue lanzando transfi_quote_error_<n> (nada cambió antes del parseo)", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => ({ ok: false, status: 503, json: async () => ({}) })));
-    await expect(new TransFiFxProvider("k").quote(fxInput)).rejects.toThrow(
+    await expect(new TransFiFxProvider("k", SANDBOX_BASE).quote(fxInput)).rejects.toThrow(
       /transfi_quote_error_503/,
     );
   });

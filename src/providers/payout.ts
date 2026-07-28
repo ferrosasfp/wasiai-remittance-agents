@@ -10,10 +10,13 @@
 //  · Modelo create-order ASYNC: el POST devuelve una `depositAddress` dedicada; el `settled` llega
 //    DESPUÉS por webhook (fuera de scope, CD-4). El POST NUNCA se asume `settled`.
 
+import { resolveTransFiBaseUrl, type TransFiBaseUrl } from "./transfi-env";
 import type { PayoutInput, PayoutProvider, PayoutResult } from "./types";
 
-// CD-1: default sandbox. Ningún path apunta a api.transfi.com salvo que el env lo fuerce.
-const TRANSFI_BASE = process.env.TRANSFI_BASE_URL ?? "https://sandbox-api.transfi.com";
+// CD-1 (evolucionado): este archivo YA NO define un default de host ni lee `TRANSFI_BASE_URL`.
+// El default sandbox local cumplía CD-1 acá pero NO alcanzaba: `fx.ts` leía la MISMA env con default
+// productivo, así que el repo entero podía quedar "sandbox a medias". El ambiente ahora es explícito
+// y único (`transfi-env.ts`, fail-closed sin `TRANSFI_ENV`) y llega inyectado al adapter.
 
 // DT-2 (humano, 2026-07-17): la red del USDC es Base. Configurable por env, fail-loud si no soportada.
 const TRANSFI_DEFAULT_NETWORK = "base";
@@ -102,7 +105,11 @@ function readString(obj: Record<string, unknown>, keys: string[]): string | null
 
 /** Adapter TransFi — activo con las 3 creds + readiness. Crea la orden off-ramp real. */
 export class TransFiPayoutProvider implements PayoutProvider {
-  constructor(private readonly creds: TransFiCreds) {}
+  /** `baseUrl` es OBLIGATORIO y branded: solo `resolveTransFiBaseUrl()` puede producir uno. */
+  constructor(
+    private readonly creds: TransFiCreds,
+    private readonly baseUrl: TransFiBaseUrl,
+  ) {}
 
   async execute(input: PayoutInput): Promise<PayoutResult> {
     // AC-6: resolver la red PRIMERO (fail-loud antes de tocar la red). Una red no soportada
@@ -111,7 +118,7 @@ export class TransFiPayoutProvider implements PayoutProvider {
       process.env.TRANSFI_USDC_NETWORK ?? TRANSFI_DEFAULT_NETWORK,
     );
 
-    const res = await fetch(`${TRANSFI_BASE}/v3/orders`, {
+    const res = await fetch(`${this.baseUrl}/v3/orders`, {
       method: "POST",
       signal: AbortSignal.timeout(15000), // payout puede tardar; igual acotado (espejo kyc.ts)
       headers: transfiHeaders(this.creds),
@@ -178,7 +185,7 @@ export class TransFiPayoutProvider implements PayoutProvider {
   }
 
   async status(payoutId: string): Promise<PayoutResult> {
-    const res = await fetch(`${TRANSFI_BASE}/v3/orders/${encodeURIComponent(payoutId)}`, {
+    const res = await fetch(`${this.baseUrl}/v3/orders/${encodeURIComponent(payoutId)}`, {
       method: "GET",
       signal: AbortSignal.timeout(8000),
       headers: transfiHeaders(this.creds),
@@ -283,5 +290,8 @@ export function getPayoutProvider(): PayoutProvider {
         "confirmá el mapeo + el flujo de depósito con el sandbox antes de mover plata.",
     );
   }
-  return new TransFiPayoutProvider({ username, password, mid });
+  // Mismo llamado que `getFxQuoteProvider()`: un solo resolvedor para los dos providers, así no
+  // pueden hablarle a ambientes distintos. Sin `TRANSFI_ENV` lanza `transfi_env_unset` (fail-closed);
+  // el modo mock/devnet ni llega acá (retorna antes, en el `if` de las creds).
+  return new TransFiPayoutProvider({ username, password, mid }, resolveTransFiBaseUrl());
 }
