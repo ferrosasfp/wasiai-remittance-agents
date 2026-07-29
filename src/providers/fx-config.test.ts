@@ -118,6 +118,11 @@ describe("resolveFxConfig — spread y fee fijo: validados como los otros guards
   // se haya puesto rojo es la señal de que la atadura funciona, no un test que había que
   // "arreglar" — si alguien lo devuelve a 1.25, el arranque tiene que volver a fallar.
   it("AC-9: se leen en CADA llamada, no una vez (rotarlas surte efecto sin reimportar)", () => {
+    // La premisa del caso de la comisión, EXPLÍCITA: 0.75 sólo es válido si el mínimo es 5 (el
+    // techo es el 20%, o sea 1.00). Sin esta línea el test colgaba del default de OTRA env, y
+    // bajar `DEFAULT_MIN_SEND_USD` lo ponía rojo por un motivo ajeno a lo que verifica. Es la
+    // misma fragilidad que ya se pagó una vez acá.
+    setEnv("FX_MIN_SEND_USD", "5");
     setEnv("FALLBACK_FX_SPREAD_BPS", "100");
     expect(resolveFxConfig().spreadBps).toBe(100);
     setEnv("FALLBACK_FX_SPREAD_BPS", "300");
