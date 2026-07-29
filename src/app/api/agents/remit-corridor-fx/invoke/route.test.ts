@@ -124,6 +124,59 @@ describe("POST /api/agents/remit-corridor-fx/invoke", () => {
     expect(data.error).toBe("invalid_input");
   });
 
+  // ── WKH-314 (AR/CR) — LA TRADUCCIÓN A HTTP DEL RECHAZO POR MONTO ────────────────────────
+  //
+  // El corte por monto ya estaba cubierto en el provider, pero la traducción a HTTP no tenía
+  // NINGÚN test, y es justo lo que consume el caller. Los dos mutantes que lo probaron
+  // compilaban limpio y dejaban la suite entera verde: cambiar `400` por `502`, y borrar el
+  // campo `minSendUsd` del body. O sea que alguien podía volver a aplanar esto en el 502
+  // genérico sin que nada se enterara.
+  //
+  // Por qué importa que sea 400 y no 502: el 502 le dice al caller "volvé más tarde", y este
+  // reintento no va a funcionar NUNCA hasta que cambie el monto.
+  it("T-314-FP2-a: monto bajo el mínimo → 400 con el código y el mínimo, no el 502 genérico", async () => {
+    const res = await invoke({ amountUsd: 0.4 });
+
+    // El contrato que consume el caller, en orden: es un error SUYO (4xx), es distinguible por
+    // código, y trae el dato que necesita para corregirlo sin bisección.
+    expect(res.status).toBe(400);
+    const data = await res.json();
+    expect(data.error).toBe("fx_amount_below_minimum");
+    expect(data.minSendUsd).toBe(5);
+    // Y no se filtró una cotización a medias.
+    expect("result" in data).toBe(false);
+  });
+
+  it("T-314-FP2-b: si el mínimo del error no es numérico, el body lo OMITE — nunca manda null", async () => {
+    // Rama falsa del `Number.isFinite`. Sin ella, `minSendUsd: NaN` sale serializado como
+    // `null` (JSON.stringify convierte NaN en null), que es peor que no mandar el campo: el
+    // caller leería "el mínimo es null" en vez de "no vino el dato".
+    runCorridorFxMock.mockImplementationOnce(async () => {
+      throw new Error("fx_amount_below_minimum:no-es-un-numero");
+    });
+    const res = await invoke({ amountUsd: 100 });
+
+    expect(res.status).toBe(400);
+    const data = await res.json();
+    expect(data.error).toBe("fx_amount_below_minimum");
+    expect("minSendUsd" in data).toBe(false);
+    expect(JSON.stringify(data)).not.toContain("null");
+  });
+
+  // Contra-ejemplo: el 400 nuevo no puede haberse comido al 502. Un mutante que mandara TODO
+  // a 400 dejaría verde a los dos tests de arriba.
+  it("T-314-FP2-c: un fallo del feed sigue siendo 502, no 400 (el rechazo por monto no se tragó al resto)", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new Error("network_down");
+      }),
+    );
+    const res = await invoke({ amountUsd: 100 });
+    expect(res.status).toBe(502);
+    expect((await res.json()).error).toBe("quote_unavailable");
+  });
+
   // AC-7: runCorridorFx lanza (quote inválida / misconfig) → 502 { error: "quote_unavailable" }
   // sin filtrar stack/internals (patrón cobraya: warn estructurado, body opaco).
   it("runCorridorFx lanza → 502 { error: quote_unavailable } sin filtrar internals", async () => {
