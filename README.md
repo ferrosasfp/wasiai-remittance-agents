@@ -177,3 +177,119 @@ lado del agente (lo hace el gateway a2a).
 
 ### Correr local
 `npm run dev` → `http://localhost:3030/api/agents/remit-cashout-payout/invoke`
+
+---
+
+## Manifiesto de cobro (`/manifest`)
+
+Cada agente publica **su propia ficha de cobro** en un endpoint hermano de su `/invoke`. Es lo que el
+operador copia al registro del gateway para que el agente **cobre por su trabajo**. Antes de esto, el
+`payment` de cada agente se escribía a mano en la base, por fuera de toda API: `remit-kyc-validator`
+quedó sin ficha y estuvo **cobrando $0 en silencio** (el caller le pagaba al gateway, el paso corría, y
+el settle hacia el operador se salteaba sin error).
+
+### URLs
+
+| Método | URL |
+|---|---|
+| `GET` | `/api/agents/remit-kyc-validator/manifest` |
+| `GET` | `/api/agents/remit-corridor-fx/manifest` |
+| `GET` | `/api/agents/remit-cashout-payout/manifest` |
+
+Derivación desde el `agentUrl` ya registrado: `manifestUrl = agentUrl.replace(/\/invoke\/?$/, '/manifest')`.
+
+**Códigos posibles: `200` y `503`. Nada más.** Ambas respuestas llevan `Cache-Control: no-store`.
+
+### `200 OK` — exactamente 7 claves de primer nivel
+
+```json
+{
+  "manifestVersion": "1",
+  "slug": "remit-corridor-fx-solana",
+  "name": "remit-corridor-fx-solana",
+  "description": "<texto estático, sin PII>",
+  "capabilities": ["remittance-fx-quote", "usdc-to-pen", "corridor-pricing"],
+  "priceUsdc": 0.03,
+  "payment": { "method": "x402", "chain": "solana-devnet", "contract": "<base58 32B>", "asset": "USDC" }
+}
+```
+
+`payment` tiene exactamente 4 claves (`method`, `chain`, `contract`, `asset`) y **se copia tal cual** al
+registro: no hay transformación ni normalización pendiente del lado del consumidor.
+
+### `503 Service Unavailable` — ficha no publicable (fail-closed)
+
+```json
+{ "error": "manifest_unavailable", "missing": ["payment.contract"], "invalid": [] }
+```
+
+`missing` e `invalid` contienen **nombres de campo, nunca valores**: el valor de la env no se ecoa en el
+body ni en los logs (ni truncado, ni hasheado). Ambas claves están siempre presentes. El body de `503`
+**nunca** lleva una clave `payment`.
+
+### Semántica fail-closed (por qué no hay "200 a medias")
+
+> **Un `200` con ficha a medias es peor que un error, porque alguien lo copia a un registro y el agente
+> termina cobrando $0 en silencio.**
+
+Por eso: sin `payTo` configurado, o con un `payTo` mal formado, el manifiesto **no se emite** (`503`). No
+existe ninguna rama de código que devuelva `200` sin un `payment.contract` válido. En particular se
+rechaza el **cruce de familias** (una address EVM `0x…` en un slot `solana-devnet`, o una base58 en el
+slot `avalanche-fuji`), que es el error más probable del operador al copiar y pegar entre entornos: el
+settle la rechazaría con `INVALID_PAY_TO_FORMAT` y el agente cobraría cero igual, pero con un manifiesto
+diciendo que todo está bien.
+
+El criterio de formato es el **mismo** que aplica el consumidor (EVM: `0x` + 40 hex y distinta de la
+zero-address; Solana: base58 que decodifica a **exactamente 32 bytes**, no "entre 32 y 44 caracteres").
+
+### Env vars (sin default, a propósito)
+
+| Agente | Env del `payTo` | Familia esperada |
+|---|---|---|
+| `remit-kyc-validator` | `REMIT_KYC_VALIDATOR_PAYTO` | EVM (`0x` + 40 hex) |
+| `remit-corridor-fx` | `REMIT_CORRIDOR_FX_PAYTO` | Solana (base58, 32 bytes) |
+| `remit-cashout-payout` | `REMIT_CASHOUT_PAYOUT_PAYTO` | Solana (base58, 32 bytes) |
+
+**Ninguna tiene default.** Sin la env (ausente, vacía o sólo whitespace) el endpoint responde `503`: es el
+comportamiento deseado, no un bug. La `chain` **no** es configurable: vive como constante de código en
+`src/manifest/registry.ts`, tipada como conjunto cerrado (`"avalanche-fuji" | "solana-devnet"`), así que
+ninguna variable de entorno puede llevar un manifiesto a mainnet.
+
+### Tabla `pathSlug` → `slug` canónico → chain
+
+| pathSlug (directorio de la ruta) | slug canónico (registro) | chain |
+|---|---|---|
+| `remit-kyc-validator` | `remit-kyc-validator` | `avalanche-fuji` |
+| `remit-corridor-fx` | `remit-corridor-fx-solana` | `solana-devnet` |
+| `remit-cashout-payout` | `remit-cashout-payout-solana` | `solana-devnet` |
+
+> **`pathSlug ≠ slug` en FX y payout es deliberado.** El directorio de la ruta es el histórico porque el
+> `agentUrl` ya registrado apunta ahí y **no se toca**; el `slug` que el manifiesto declara es el canónico
+> de cobro (`*-solana`). No "corregir" esta asimetría.
+
+### Runbook operativo (el orden importa)
+
+El registro y el deslistado **no los hace este repo**: son **ops `!` humano** en `wasiai-a2a`. Este repo
+sólo publica la ficha.
+
+1. **Setear las 3 envs** en Vercel (Production) y redeploy. Para las 2 de Solana: usar las **mismas**
+   addresses que ya declaran las filas `*-solana` en el registro (leerlas de `/discover` **antes** de
+   setear; no inventar una segunda verdad).
+2. **Verificar los 3 manifiestos por `curl`**: `200`, `payment.chain` correcto y `Cache-Control: no-store`.
+   Con una env borrada a propósito, confirmar el `503` (prueba viva del fail-closed).
+3. **Drift check sin escribir**: comparar el `payment` del manifiesto contra el de `/discover` para los 2
+   slugs `*-solana`. Si difieren, **no** se corrige a mano.
+4. **Registrar/actualizar `remit-kyc-validator`** con su `payment` (requiere la HU hermana del otro repo).
+5. ⚠️ **Deslistar los gemelos Fuji (`remit-corridor-fx`, `remit-cashout-payout`) SÓLO DESPUÉS de haber
+   confirmado el paso 3.** Hacerlo antes deja a FX y payout **sin ninguna ruta de cobro**. El deslistado es
+   reversible; quedarse sin ruta de cobro no es gratis.
+
+### Correr local
+
+```bash
+REMIT_KYC_VALIDATOR_PAYTO=0x… \
+REMIT_CORRIDOR_FX_PAYTO=… \
+REMIT_CASHOUT_PAYOUT_PAYTO=… \
+npm run dev
+curl -sD- http://localhost:3030/api/agents/remit-kyc-validator/manifest
+```
