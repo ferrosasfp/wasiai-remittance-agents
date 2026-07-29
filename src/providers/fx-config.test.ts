@@ -110,13 +110,20 @@ describe("resolveFxConfig — spread y fee fijo: validados como los otros guards
 
   // AC-9/DT-8: el motivo por el que estas dos tienen que vivir acá y no en el scope del módulo.
   // Leídas al importar, rotarlas no surte efecto hasta redeployar — y el README promete lo contrario.
+  //
+  // ⚠️ WKH-314 cambió el valor de la comisión de este test, NO su intención. Antes usaba 1.25,
+  // que con el mínimo por defecto (5) es el 25% del piso y hoy es CONFIG INVÁLIDA por la atadura
+  // comisión↔mínimo. El test verifica que la env se lea en cada llamada, y para eso sirve
+  // cualquier valor válido: se usa 0.75 (15% del mínimo, bajo el techo del 20%). Que este test
+  // se haya puesto rojo es la señal de que la atadura funciona, no un test que había que
+  // "arreglar" — si alguien lo devuelve a 1.25, el arranque tiene que volver a fallar.
   it("AC-9: se leen en CADA llamada, no una vez (rotarlas surte efecto sin reimportar)", () => {
     setEnv("FALLBACK_FX_SPREAD_BPS", "100");
     expect(resolveFxConfig().spreadBps).toBe(100);
     setEnv("FALLBACK_FX_SPREAD_BPS", "300");
     expect(resolveFxConfig().spreadBps).toBe(300); // misma instancia del módulo, valor nuevo
-    setEnv("FALLBACK_FX_FLAT_FEE_USD", "1.25");
-    expect(resolveFxConfig().flatFeeUsd).toBe(1.25);
+    setEnv("FALLBACK_FX_FLAT_FEE_USD", "0.75");
+    expect(resolveFxConfig().flatFeeUsd).toBe(0.75);
   });
 });
 

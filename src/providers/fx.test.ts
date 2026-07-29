@@ -728,4 +728,178 @@ describe("FX mid — cascada, guards y fail-closed", () => {
     expect(q.rate).toBeLessThan(3.9);
     expect(q.rate).toBeGreaterThan(3.8);
   });
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // WKH-314 · UNA COTIZACIÓN NO PUEDE PROMETER CERO (NI CASI CERO)
+  //
+  // Antes de esta HU: `netUsd = max(0, enviado − comisión)`, y con la comisión por defecto
+  // (0.50) cualquier envío de hasta 50 centavos daba `netDeliveredLocal = 0`. El guard de
+  // salida lo aceptaba porque pide NO-NEGATIVO (`>= 0`), no positivo. Resultado: HTTP 200,
+  // etiqueta `fx-mid-live`, tasa real y en banda, y CERO soles para la persona. Todos los
+  // guards de la HU anterior decían que sí; ninguno miraba el resultado.
+  //
+  // Los dos ejes que se candan acá, y hacen falta LOS DOS:
+  //  1. el mínimo corta el envío que entregaría cero;
+  //  2. la configuración no puede volver inútil al mínimo (si no, el guard se apaga solo).
+  // ════════════════════════════════════════════════════════════════════════════
+
+  /** Cotiza con un monto arbitrario; el resto del input es el canónico de la suite. */
+  async function quoteAmount(mod: typeof import("./fx"), amountUsd: number): Promise<FxQuote> {
+    return new mod.LiveMidFxProvider().quote({ ...fxInput, amountUsd });
+  }
+
+  it("T-314-1 (EL test): 40 centavos, que antes daban 200 con CERO soles, ahora cortan — y el feed ni se consulta", async () => {
+    const mod = await freshFx();
+    const fetchMock = stubFetchOk(erBody(3.4)); // feed perfectamente sano: en banda y fresco
+
+    const error = await quoteAmount(mod, 0.4).then(
+      (q) => q,
+      (e: unknown) => e,
+    );
+
+    // ── EL EFECTO DE DINERO PRIMERO ──────────────────────────────────────────
+    // Si estas dos aserciones fueran después del chequeo del mensaje, un mutante que
+    // rompiera el texto mataría el test sin que se llegue a mirar si se emitió cotización.
+    // Lo que importa no es cómo se llama el error: es que NO salió una promesa de cero soles.
+    expect(error, "no puede emitirse una cotización por debajo del mínimo").toBeInstanceOf(Error);
+    expect(
+      fetchMock,
+      "el monto se rechaza ANTES de salir a buscar la tasa: un envío que vamos a rechazar no justifica un fetch",
+    ).not.toHaveBeenCalled();
+
+    // ── y recién ahora, la forma del rechazo ─────────────────────────────────
+    expect((error as Error).message).toMatch(/^fx_amount_below_minimum:/);
+    // El mínimo VIAJA en el error: sin esto el caller lo descubre por bisección.
+    expect((error as Error).message).toBe("fx_amount_below_minimum:5");
+  });
+
+  it("T-314-2: el borde exacto — el mínimo justo SÍ cotiza, un centavo menos NO", async () => {
+    const mod = await freshFx();
+    stubFetchOk(erBody(3.4));
+
+    // Exactamente el mínimo: pasa. El guard es `>=`, no `>`.
+    const enElBorde = await quoteAmount(mod, 5);
+    expect(enElBorde.netDeliveredLocal).toBeGreaterThan(0);
+
+    // Un centavo por debajo: corta.
+    await expect(quoteAmount(mod, 4.99)).rejects.toThrow(/fx_amount_below_minimum/);
+  });
+
+  it("T-314-3: ningún monto aceptado entrega cero (barrido alrededor del punto donde antes fallaba)", async () => {
+    const mod = await freshFx();
+    stubFetchOk(erBody(3.4));
+    // 0.40 y 0.50 daban CERO antes de esta HU; 0.60 daba S/ 0.33 (comisión = 83% del envío).
+    for (const amount of [0.01, 0.4, 0.5, 0.6, 1, 4.99]) {
+      await expect(quoteAmount(mod, amount), `amountUsd=${amount}`).rejects.toThrow(
+        /fx_amount_below_minimum/,
+      );
+    }
+  });
+
+  // ── LA ATADURA: el eje que cierra la CLASE, no sólo el caso ────────────────────────
+  // Un mínimo escrito suelto protege hoy y se apaga solo mañana: `FALLBACK_FX_FLAT_FEE_USD`
+  // es una env sin techo. Con la comisión en 6 y el mínimo en 5, el envío mínimo aceptado
+  // entregaría CERO otra vez, con el mínimo ahí escrito sin proteger nada. Por eso esa
+  // COMBINACIÓN es config inválida y no arranca.
+  it("T-314-4: una comisión que supera el mínimo es CONFIG INVÁLIDA — el mínimo no se puede apagar solo", async () => {
+    const mod = await freshFx();
+    const fetchMock = stubFetchOk(erBody(3.4));
+    vi.stubEnv("FALLBACK_FX_FLAT_FEE_USD", "6"); // > mínimo 5: antes emitía cero
+    vi.stubEnv("FX_MIN_SEND_USD", "5");
+
+    // Efecto primero: con esa configuración NO se cotiza NINGÚN monto, ni siquiera uno grande.
+    await expect(quoteAmount(mod, 100)).rejects.toThrow();
+    expect(fetchMock, "config inválida ⇒ ni se consulta el feed").not.toHaveBeenCalled();
+
+    // Y el error nombra a las DOS variables: la falla es la relación, no una sola env.
+    await expect(quoteAmount(mod, 100)).rejects.toThrow(
+      /fx_mid_config_invalid:FALLBACK_FX_FLAT_FEE_USD_VS_FX_MIN_SEND_USD/,
+    );
+  });
+
+  it("T-314-5: la comisión no puede comerse más del 20% del mínimo (el techo, medido en el borde)", async () => {
+    // Con mínimo 10: 2.00 es exactamente el 20% y pasa; 2.01 lo excede y no arranca.
+    const enElTecho = await freshFx();
+    stubFetchOk(erBody(3.4));
+    vi.stubEnv("FX_MIN_SEND_USD", "10");
+    vi.stubEnv("FALLBACK_FX_FLAT_FEE_USD", "2");
+    expect((await quoteAmount(enElTecho, 10)).netDeliveredLocal).toBeGreaterThan(0);
+
+    const pasado = await freshFx();
+    stubFetchOk(erBody(3.4));
+    vi.stubEnv("FX_MIN_SEND_USD", "10");
+    vi.stubEnv("FALLBACK_FX_FLAT_FEE_USD", "2.01");
+    await expect(quoteAmount(pasado, 10)).rejects.toThrow(
+      /fx_mid_config_invalid:FALLBACK_FX_FLAT_FEE_USD_VS_FX_MIN_SEND_USD/,
+    );
+  });
+
+  // Assert contra el LITERAL, no contra la constante importada: un test que compara la config
+  // contra el mismo default que la produce verifica el cableado, no el valor. Si alguien cambia
+  // el mínimo o la comisión por defecto, este test tiene que ponerse rojo y obligar a una
+  // decisión explícita — es la decisión del founder, no un detalle de implementación.
+  it("T-314-6: los defaults son mínimo 5 y comisión 0.50, o sea 10% en el piso (la mitad del techo)", async () => {
+    const { resolveFxConfig } = await import("./fx-config");
+    const config = resolveFxConfig();
+
+    expect(config.minSendUsd).toBe(5);
+    expect(config.flatFeeUsd).toBe(0.5);
+    // La atadura, escrita como afirmación y no como comentario: en el peor caso aceptado por
+    // la configuración por defecto (un envío exactamente en el mínimo), la comisión es el 10%.
+    expect(config.flatFeeUsd / config.minSendUsd).toBeCloseTo(0.1, 10);
+  });
+
+  // El continuo del que el cero es sólo el borde visible: 60 centavos entregaban S/ 0.33, o sea
+  // una comisión del 83%, y pasaban TODOS los controles. Ese caso no se ataja con un guard
+  // propio: no puede ocurrir, porque el mínimo y la comisión están atados. Este test fija esa
+  // consecuencia para que si alguien desata los dos números, se entere acá.
+  it("T-314-7: la proporción comisión/envío queda acotada POR CONSTRUCCIÓN, no por casualidad", async () => {
+    const { resolveFxConfig } = await import("./fx-config");
+    const { minSendUsd, flatFeeUsd } = resolveFxConfig();
+    // El peor caso posible es el envío mínimo: cualquier envío mayor diluye la comisión.
+    const peorCasoAceptado = flatFeeUsd / minSendUsd;
+    expect(peorCasoAceptado).toBeLessThanOrEqual(0.2);
+    // Y el caso histórico concreto queda del lado prohibido: 0.50 sobre 0.60 es el 83%.
+    expect(0.5 / 0.6).toBeGreaterThan(0.2);
+  });
+
+  it("T-314-8: el mínimo se rota por env sin reimportar el módulo (call-time, como el resto)", async () => {
+    const mod = await freshFx();
+    stubFetchOk(erBody(3.4));
+    vi.stubEnv("FX_RATE_CACHE_TTL_MS", "0");
+
+    vi.stubEnv("FX_MIN_SEND_USD", "50");
+    await expect(quoteAmount(mod, 20)).rejects.toThrow(/fx_amount_below_minimum:50/);
+
+    // MISMA instancia del módulo: si el mínimo se leyera al importar, esto seguiría cortando.
+    vi.stubEnv("FX_MIN_SEND_USD", "10");
+    expect((await quoteAmount(mod, 20)).netDeliveredLocal).toBeGreaterThan(0);
+  });
+
+  it("T-314-9: un mínimo de cero o negativo no es un mínimo — config inválida", async () => {
+    for (const value of ["0", "-1"]) {
+      const mod = await freshFx();
+      stubFetchOk(erBody(3.4));
+      vi.stubEnv("FX_MIN_SEND_USD", value);
+      await expect(quoteAmount(mod, 100), `FX_MIN_SEND_USD=${value}`).rejects.toThrow(
+        /fx_mid_config_invalid:FX_MIN_SEND_USD/,
+      );
+    }
+  });
+
+  // El guard se testea como UNIDAD, mismo criterio que `assertValidQuote` y `checkFreshness`.
+  // La rama del `NaN` no es alcanzable desde la ruta HTTP (Zod exige un número), y por eso
+  // necesita este test: `amountUsd < min` ACEPTA un `NaN` y `!(amountUsd >= min)` lo RECHAZA.
+  // Es la misma trampa que ya mordió a la frescura en la HU anterior.
+  it("T-314-10: assertAmountAboveMinimum rechaza NaN (la comparación ingenua lo aceptaría)", async () => {
+    const { assertAmountAboveMinimum } = await freshFx();
+    const { resolveFxConfig } = await import("./fx-config");
+    const config = resolveFxConfig();
+
+    expect(() => assertAmountAboveMinimum(Number.NaN, config)).toThrow(/fx_amount_below_minimum/);
+    expect(() => assertAmountAboveMinimum(4.99, config)).toThrow(/fx_amount_below_minimum/);
+    // y el lado que debe pasar, para que el guard no sea "rechazar siempre"
+    expect(() => assertAmountAboveMinimum(5, config)).not.toThrow();
+    expect(() => assertAmountAboveMinimum(1000, config)).not.toThrow();
+  });
 });

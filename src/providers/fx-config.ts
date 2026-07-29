@@ -50,6 +50,11 @@ export interface FxConfig {
   readonly spreadBps: number;
   /** Fee fijo en USD que se descuenta del monto antes de convertir. */
   readonly flatFeeUsd: number;
+  /**
+   * Monto mínimo enviable en USD (WKH-314). Atado a `flatFeeUsd` por
+   * `MAX_FEE_SHARE_AT_MINIMUM`: no puede existir un mínimo que la comisión anule.
+   */
+  readonly minSendUsd: number;
 }
 
 /** Monto que la fuente puede mandar como number o como string numérico. */
@@ -142,6 +147,38 @@ const DEFAULT_MAX_USD_PEN = 5.0; // mercado 3.40 → banda ≈ +47%; ataja un ce
 //                                  o la tasa de OTRA moneda (PYG ≈ 7300, EUR ≈ 0.92)
 const DEFAULT_SPREAD_BPS = 250; // 2.5% — conservador y declarado
 const DEFAULT_FLAT_FEE_USD = 0.5;
+/** Monto mínimo enviable, en USD. Decisión del founder (WKH-314). */
+const DEFAULT_MIN_SEND_USD = 5;
+
+/**
+ * Techo de la comisión fija EXPRESADO COMO FRACCIÓN DEL MÍNIMO — la atadura que impide que
+ * el mínimo se apague solo.
+ *
+ * ⚠️ ESTE NÚMERO ES EL QUE CIERRA LA CLASE DE BUG, no el mínimo. Un mínimo de 5 escrito
+ * suelto protege HOY: con `FALLBACK_FX_FLAT_FEE_USD` en 6 (una env sin techo, validada sólo
+ * contra negativos hasta esta HU) vuelve a existir un envío que pasa todos los controles y
+ * entrega CERO — y lo hace en silencio, porque el mínimo sigue ahí, escrito, sin proteger
+ * nada. Es la misma familia que un piso de reputación cuyo default ausente lo apaga solo.
+ *
+ * Con la atadura, esas dos configuraciones no pueden coexistir: si la comisión sube por
+ * encima de esta fracción del mínimo, `resolveFxConfig()` LANZA y no se cotiza. Para cobrar
+ * más comisión hay que subir el mínimo, que es exactamente la decisión que alguien debería
+ * estar tomando conscientemente.
+ *
+ * Por qué 20% y no 10%: la configuración por defecto (mínimo 5, comisión 0.50) deja la
+ * comisión en el 10% del piso, que es el ancla que eligió el founder. Poner el techo
+ * JUSTO en 10% dejaría el default pegado al borde, donde cualquier ajuste menor de la
+ * comisión rompe el arranque. 20% da margen operativo y sigue acotando el continuo: es el
+ * peor caso admisible, no el objetivo.
+ *
+ * COROLARIO, y es la razón por la que la constante vive acá y no en un `if` suelto: la
+ * proporción "comisión sobre lo enviado" queda acotada por CONSTRUCCIÓN. Con el mínimo
+ * vigente, ningún envío aceptado puede tener una comisión mayor a esta fracción. El caso
+ * de los 60 centavos (comisión = 83% del envío, técnicamente válido y comercialmente
+ * indefendible) no se ataja por un guard propio: no puede ocurrir, porque 0.60 < mínimo.
+ * Si alguien desata estos dos números, ese caso vuelve.
+ */
+const MAX_FEE_SHARE_AT_MINIMUM = 0.2;
 
 function invalid(field: string): Error {
   return new Error(`fx_mid_config_invalid:${field}`);
@@ -197,6 +234,20 @@ export function resolveFxConfig(): FxConfig {
   const flatFeeUsd = readNumericEnv("FALLBACK_FX_FLAT_FEE_USD", DEFAULT_FLAT_FEE_USD);
   if (flatFeeUsd < 0) throw invalid("FALLBACK_FX_FLAT_FEE_USD");
 
+  // WKH-314 — el mínimo enviable. Un mínimo de cero o negativo no es un mínimo.
+  const minSendUsd = readNumericEnv("FX_MIN_SEND_USD", DEFAULT_MIN_SEND_USD);
+  if (minSendUsd <= 0) throw invalid("FX_MIN_SEND_USD");
+
+  // WKH-314 — LA ATADURA. Las dos envs se validan por separado más arriba y cada una puede
+  // ser perfectamente razonable por su cuenta; lo que no puede es la COMBINACIÓN. Una
+  // comisión que se come una fracción excesiva del mínimo deja al mínimo escrito pero
+  // inútil: vuelve a haber montos aceptados que entregan casi nada, o nada. Se valida la
+  // RELACIÓN, y por eso el código nombra a las dos: durante un incidente, "subí la comisión"
+  // y "bajá el mínimo" son la misma falla y hay que ver ambas para entenderla.
+  if (flatFeeUsd > minSendUsd * MAX_FEE_SHARE_AT_MINIMUM) {
+    throw invalid("FALLBACK_FX_FLAT_FEE_USD_VS_FX_MIN_SEND_USD");
+  }
+
   const rawSources = process.env.FX_MID_SOURCES;
   const idList = (rawSources === undefined || rawSources.trim() === "" ? DEFAULT_SOURCES : rawSources)
     .split(",")
@@ -214,5 +265,5 @@ export function resolveFxConfig(): FxConfig {
     return { id: source.id, url, parse: source.parse };
   });
 
-  return { sources, cacheTtlMs, maxAgeMs, minRate, maxRate, spreadBps, flatFeeUsd };
+  return { sources, cacheTtlMs, maxAgeMs, minRate, maxRate, spreadBps, flatFeeUsd, minSendUsd };
 }

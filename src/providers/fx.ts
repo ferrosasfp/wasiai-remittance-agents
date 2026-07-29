@@ -70,7 +70,16 @@ const TransFiQuoteResponseSchema = z
 // (`er-api` lee `rates.PEN`, `currency-api` lee `usd.pen`). Tener el parser acá fijo a un solo
 // shape es lo que convertía a una URL configurable en un control muerto.
 
-/** Adapter TransFi — activo con TRANSFI_API_KEY. Devuelve la tasa efectiva real del corredor. */
+/**
+ * Adapter TransFi — activo con TRANSFI_API_KEY. Devuelve la tasa efectiva real del corredor.
+ *
+ * ⚠️ WKH-314: este camino NO aplica el monto mínimo, a propósito y con ticket. Hoy no es
+ * alcanzable (exige `TRANSFI_ADAPTER_READY=true`, que además falla ruidoso si falta), y meter
+ * acá una segunda llamada a `resolveFxConfig()` duplicaría el guard justo cuando **WKH-312**
+ * está por mover TODA la familia de controles de este camino a un punto de salida común. El
+ * mínimo viaja con ellos. Si WKH-312 se cierra sin llevárselo, este camino queda sin mínimo:
+ * está anotado en su work-item.
+ */
 export class TransFiFxProvider implements FxQuoteProvider {
   /** `baseUrl` es OBLIGATORIO y branded: solo `resolveTransFiBaseUrl()` puede producir uno. */
   constructor(
@@ -132,6 +141,9 @@ export class LiveMidFxProvider implements FxQuoteProvider {
     // UNA sola lectura de config por cotización (AC-9): el mid y el precio tienen que salir de la
     // MISMA config. Dos lecturas podrían leer una env a medio rotar y mezclar dos configuraciones.
     const config = resolveFxConfig();
+    // WKH-314 — el monto mínimo, ANTES de salir a buscar la tasa: un envío que vamos a
+    // rechazar no justifica un fetch al feed.
+    assertAmountAboveMinimum(input.amountUsd, config);
     const mid = await getUsdToPenMid(config); // tasa real USD→PEN, o LANZA (fail-closed)
     const effRate = mid.rate * (1 - config.spreadBps / 10000); // spread en contra del cliente
     const netUsd = Math.max(0, input.amountUsd - config.flatFeeUsd);
@@ -335,6 +347,38 @@ async function getUsdToPenMid(config: FxConfig): Promise<MidRate> {
 
   // (3) Fail-closed. El route mapea cualquier throw a 502 `quote_unavailable`.
   throw new Error(`fx_mid_unavailable:${config.sources.length}`);
+}
+
+/**
+ * Prefijo del error de monto por debajo del mínimo. Exportado para que la ruta HTTP pueda
+ * distinguirlo SIN parsear prosa: es un error del CALLER (mandó poco), no una indisponibilidad
+ * del servicio, y esa diferencia decide si reintentar sirve de algo. El valor del mínimo viaja
+ * después de los dos puntos, en el mismo formato que el resto de los códigos del módulo.
+ */
+export const AMOUNT_BELOW_MINIMUM_CODE = "fx_amount_below_minimum";
+
+/**
+ * WKH-314 — guard de POLÍTICA sobre el monto enviado. Lanza si el envío no llega al mínimo.
+ *
+ * ⚠️ ES DELIBERADAMENTE INDEPENDIENTE DE LA FÓRMULA DE LA COTIZACIÓN, y ésa es toda la
+ * idea. El invariante de Chaski (`assertReceiveConsistent`) NO puede atajar este caso, no por
+ * estar mal escrito sino por su forma: recalcula `max(0, enviado − comisión) × tasa` y lo
+ * compara contra lo entregado, así que para 40 centavos su esperado también da cero y
+ * COINCIDE. Un control que reimplementa la operación que vigila sólo detecta discrepancias de
+ * transporte, nunca un error que está DENTRO de la fórmula.
+ *
+ * Por eso acá no se recalcula nada: se compara el monto contra un límite de política. Si en
+ * vez de esto se "arreglara" el invariante para que atrape el cero, el número quedaría escrito
+ * en dos lados y divergiría en el primer cambio.
+ *
+ * Exportada para testearla directo, mismo criterio que `assertValidQuote` y `checkFreshness`.
+ */
+export function assertAmountAboveMinimum(amountUsd: number, config: FxConfig): void {
+  if (!(amountUsd >= config.minSendUsd)) {
+    // `!(a >= b)` y no `a < b`: con `amountUsd = NaN` la primera forma RECHAZA y la segunda
+    // ACEPTA. Es la misma trampa que este módulo ya documentó para la banda y la frescura.
+    throw new Error(`${AMOUNT_BELOW_MINIMUM_CODE}:${config.minSendUsd}`);
+  }
 }
 
 // BLQ-MED-2: guard de salida — un quote solo es válido si los montos de dinero son finitos y

@@ -172,8 +172,17 @@ FX_MID_MAX_AGE_MS=172800000          # 48 h: edad máxima del DATO según la fue
 FX_MID_MIN_USD_PEN=2.50              # banda de plausibilidad, piso
 FX_MID_MAX_USD_PEN=5.00              # banda de plausibilidad, techo
 FALLBACK_FX_SPREAD_BPS=250           # spread declarado (bps). Rango válido: [0, 10000)
-FALLBACK_FX_FLAT_FEE_USD=0.5         # fee flat USD. Rango válido: >= 0
+FALLBACK_FX_FLAT_FEE_USD=0.5         # fee flat USD. Rango válido: >= 0 Y <= 20% de FX_MIN_SEND_USD
+FX_MIN_SEND_USD=5                    # monto mínimo enviable. Rango válido: > 0
 ```
+
+⚠️ **El mínimo y la comisión están ATADOS, y no es un detalle** (WKH-314): la comisión no puede
+superar el **20%** del mínimo. Si lo supera, `resolveFxConfig()` **lanza** y el agente no cotiza
+nada. El motivo es que un mínimo suelto se apaga solo: con la comisión en 6 y el mínimo en 5, el
+envío mínimo aceptado entregaría **cero soles** otra vez, con el mínimo ahí escrito sin proteger
+nada. Para cobrar más comisión hay que subir el mínimo — que es exactamente la decisión que alguien
+debería estar tomando a conciencia. Con los defaults (mínimo 5, comisión 0.50) la comisión es el
+**10%** en el piso, la mitad del techo.
 
 ⚠️ El **spread** y el **fee** también son guards de dinero, no preferencias: la tasa que recibe el
 usuario es `mid * (1 - spread/10000)`, y la banda valida el **mid**, no la tasa emitida. Un spread
