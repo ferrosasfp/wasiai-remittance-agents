@@ -4,7 +4,8 @@
 // Honra el contrato HTTP del gateway a2a: POST /invoke → 200 { result: {...} }.
 
 import { z } from "zod";
-import { getFxQuoteProvider } from "../providers/fx";
+import { assertAmountAboveMinimum, getFxQuoteProvider } from "../providers/fx";
+import { resolveFxConfig } from "../providers/fx-config";
 import type { FxQuote } from "../providers/types";
 
 export const SLUG = "remit-corridor-fx";
@@ -30,6 +31,29 @@ export interface CorridorFxOutput extends FxQuote {
  */
 export async function runCorridorFx(raw: unknown): Promise<CorridorFxOutput> {
   const input = CorridorFxInputSchema.parse(raw);
+  // WKH-314 (AR) — EL MONTO MÍNIMO SE VALIDA ACÁ, ANTES DE ELEGIR PROVEEDOR.
+  //
+  // Vivía dentro de `LiveMidFxProvider`, y ahí protegía UN camino: el día que alguien active
+  // `TRANSFI_ADAPTER_READY` (dos envs, y después de ese opt-in nada vuelve a fallar ruidoso),
+  // el mínimo desaparecía sin que nada avisara. La alternativa que se descartó era repetir la
+  // llamada en el otro proveedor, que es la duplicación que esta HU viene evitando.
+  //
+  // Acá queda en UN solo lugar, cubre a los dos proveedores, y sigue corriendo ANTES de
+  // cualquier fetch al feed porque el núcleo corre antes que el proveedor. Sobre todo:
+  // sobrevive a que WKH-312 reordene lo que quiera aguas abajo, porque no depende de dónde
+  // vivan los guards del proveedor.
+  //
+  // Va después del parseo de Zod (que un monto sea un número positivo es más básico que el
+  // mínimo) y antes de `getFxQuoteProvider()`: resolver el proveedor para un envío que vamos a
+  // rechazar es trabajo al pedo.
+  //
+  // ⚠️ Esta es una SEGUNDA lectura de config por cotización, además de la que hace el proveedor.
+  // No rompe la regla de "una sola lectura": esa regla existe para que el mid y el precio salgan
+  // de la MISMA config, y eso sigue pasando dentro del proveedor. Acá se lee una política
+  // independiente. Si una env rotara justo entre las dos lecturas, el peor caso es una
+  // cotización validada contra un mínimo viejo — y desde el fix del guard de salida, ni siquiera
+  // así puede entregar cero.
+  assertAmountAboveMinimum(input.amountUsd, resolveFxConfig());
   const provider = getFxQuoteProvider();
   const quote = await provider.quote({
     amountUsd: input.amountUsd,

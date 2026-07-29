@@ -759,11 +759,30 @@ describe("FX mid — cascada, guards y fail-closed", () => {
     return new mod.LiveMidFxProvider().quote({ ...fxInput, amountUsd });
   }
 
+  /**
+   * WKH-314 (AR): el guard del monto mínimo se mudó de `LiveMidFxProvider` al núcleo del agente,
+   * para que cubra también el camino de TransFi. Por eso los casos del mínimo se ejercen desde
+   * `runCorridorFx` y NO desde el proveedor: probarlo en el proveedor pasaría a verificar un
+   * lugar donde el guard ya no está.
+   */
+  async function freshCore(): Promise<typeof import("../agents/corridor-fx")> {
+    vi.resetModules();
+    return import("../agents/corridor-fx");
+  }
+
+  async function quoteViaCore(
+    core: typeof import("../agents/corridor-fx"),
+    amountUsd: number,
+  ): Promise<FxQuote> {
+    return core.runCorridorFx({ amountUsd });
+  }
+
   it("T-314-1 (EL test): 40 centavos, que antes daban 200 con CERO soles, ahora cortan — y el feed ni se consulta", async () => {
-    const mod = await freshFx();
+    const core = await freshCore();
+    vi.stubEnv("TRANSFI_API_KEY", ""); // camino del mid real
     const fetchMock = stubFetchOk(erBody(3.4)); // feed perfectamente sano: en banda y fresco
 
-    const error = await quoteAmount(mod, 0.4).then(
+    const error = await quoteViaCore(core, 0.4).then(
       (q) => q,
       (e: unknown) => e,
     );
@@ -785,23 +804,25 @@ describe("FX mid — cascada, guards y fail-closed", () => {
   });
 
   it("T-314-2: el borde exacto — el mínimo justo SÍ cotiza, un centavo menos NO", async () => {
-    const mod = await freshFx();
+    const core = await freshCore();
+    vi.stubEnv("TRANSFI_API_KEY", "");
     stubFetchOk(erBody(3.4));
 
     // Exactamente el mínimo: pasa. El guard es `>=`, no `>`.
-    const enElBorde = await quoteAmount(mod, 5);
+    const enElBorde = await quoteViaCore(core, 5);
     expect(enElBorde.netDeliveredLocal).toBeGreaterThan(0);
 
     // Un centavo por debajo: corta.
-    await expect(quoteAmount(mod, 4.99)).rejects.toThrow(/fx_amount_below_minimum/);
+    await expect(quoteViaCore(core, 4.99)).rejects.toThrow(/fx_amount_below_minimum/);
   });
 
   it("T-314-3: ningún monto aceptado entrega cero (barrido alrededor del punto donde antes fallaba)", async () => {
-    const mod = await freshFx();
+    const core = await freshCore();
+    vi.stubEnv("TRANSFI_API_KEY", "");
     stubFetchOk(erBody(3.4));
     // 0.40 y 0.50 daban CERO antes de esta HU; 0.60 daba S/ 0.33 (comisión = 83% del envío).
     for (const amount of [0.01, 0.4, 0.5, 0.6, 1, 4.99]) {
-      await expect(quoteAmount(mod, amount), `amountUsd=${amount}`).rejects.toThrow(
+      await expect(quoteViaCore(core, amount), `amountUsd=${amount}`).rejects.toThrow(
         /fx_amount_below_minimum/,
       );
     }
@@ -884,13 +905,17 @@ describe("FX mid — cascada, guards y fail-closed", () => {
   // Lo ataja el guard de salida pidiendo entregado > 0, que es la mitad que faltaba: se exigía
   // que la TASA fuera positiva y no que llegara algo a destino.
   it("T-314-FP1-c: un par de config válido con envío en el mínimo ya no puede entregar cero", async () => {
-    const mod = await freshFx();
+    // Va por el NÚCLEO a propósito: así el envío atraviesa de verdad el guard del mínimo (que
+    // lo acepta, porque iguala al mínimo) y llega al guard de salida. Probándolo contra el
+    // proveedor se saltearía el mínimo y el caso dejaría de ser el que el AR encontró.
+    const core = await freshCore();
+    vi.stubEnv("TRANSFI_API_KEY", "");
     stubFetchOk(erBody(3.4));
     vi.stubEnv("FX_MIN_SEND_USD", "0.001");
     vi.stubEnv("FALLBACK_FX_FLAT_FEE_USD", "0.0002"); // exactamente el 20%: la atadura ACEPTA
 
     // Efecto primero: no sale ninguna cotización.
-    const resultado = await quoteAmount(mod, 0.001).then(
+    const resultado = await quoteViaCore(core, 0.001).then(
       (q) => q,
       (e: unknown) => e,
     );
@@ -900,17 +925,61 @@ describe("FX mid — cascada, guards y fail-closed", () => {
     expect((resultado as Error).message).toMatch(/^invalid_quote_net:/);
   });
 
+  // ── AR de WKH-314: el guard se mudó al núcleo para cubrir LOS DOS proveedores ────────────
+  // Cuando vivía dentro de `LiveMidFxProvider`, este escenario NO estaba cubierto: con el
+  // adapter del socio activo (dos envs, y después de ese opt-in nada vuelve a fallar ruidoso),
+  // el mínimo simplemente no existía. Es el test que compra la mudanza; si alguien devuelve el
+  // guard al proveedor del mid, este caso se pone rojo.
+  it("T-314-FP4: con el adapter del socio ACTIVO, el mínimo sigue cortando — y no se le pega al socio", async () => {
+    const core = await freshCore();
+    vi.stubEnv("TRANSFI_API_KEY", "clave-de-prueba"); // credencial ficticia, nunca una real
+    vi.stubEnv("TRANSFI_ADAPTER_READY", "true");
+    vi.stubEnv("TRANSFI_ENV", "sandbox");
+    const fetchMock = stubFetchOk(erBody(3.4));
+
+    const resultado = await quoteViaCore(core, 0.4).then(
+      (q) => q,
+      (e: unknown) => e,
+    );
+
+    // Efecto primero: no salió cotización y NO se llamó al partner. Que el socio no reciba el
+    // request es la mitad que importa: el corte ocurre antes de cualquier I/O, en los dos caminos.
+    expect(resultado).toBeInstanceOf(Error);
+    expect(fetchMock, "no se le pega al socio por un envío que vamos a rechazar").not.toHaveBeenCalled();
+    expect((resultado as Error).message).toMatch(/^fx_amount_below_minimum:/);
+  });
+
+  // Contra-ejemplo del anterior: con el adapter activo y un monto válido, el núcleo SÍ llega al
+  // socio. Sin esto, un mutante que cortara siempre en el camino de TransFi quedaría verde.
+  it("T-314-FP4-neg: con el adapter del socio activo y un monto válido, el request SÍ sale", async () => {
+    const core = await freshCore();
+    vi.stubEnv("TRANSFI_API_KEY", "clave-de-prueba");
+    vi.stubEnv("TRANSFI_ADAPTER_READY", "true");
+    vi.stubEnv("TRANSFI_ENV", "sandbox");
+    const fetchMock = stubFetchOk({
+      rate: 3.6,
+      fee: 0.5,
+      destAmount: 358.4,
+      quoteId: "tq-min",
+    });
+
+    const q = await quoteViaCore(core, 100);
+    expect(q.provenance).toBe("transfi");
+    expect(fetchMock).toHaveBeenCalled();
+  });
+
   it("T-314-8: el mínimo se rota por env sin reimportar el módulo (call-time, como el resto)", async () => {
-    const mod = await freshFx();
+    const core = await freshCore();
+    vi.stubEnv("TRANSFI_API_KEY", "");
     stubFetchOk(erBody(3.4));
     vi.stubEnv("FX_RATE_CACHE_TTL_MS", "0");
 
     vi.stubEnv("FX_MIN_SEND_USD", "50");
-    await expect(quoteAmount(mod, 20)).rejects.toThrow(/fx_amount_below_minimum:50/);
+    await expect(quoteViaCore(core, 20)).rejects.toThrow(/fx_amount_below_minimum:50/);
 
     // MISMA instancia del módulo: si el mínimo se leyera al importar, esto seguiría cortando.
     vi.stubEnv("FX_MIN_SEND_USD", "10");
-    expect((await quoteAmount(mod, 20)).netDeliveredLocal).toBeGreaterThan(0);
+    expect((await quoteViaCore(core, 20)).netDeliveredLocal).toBeGreaterThan(0);
   });
 
   it("T-314-9: un mínimo de cero o negativo no es un mínimo — config inválida", async () => {

@@ -73,12 +73,13 @@ const TransFiQuoteResponseSchema = z
 /**
  * Adapter TransFi — activo con TRANSFI_API_KEY. Devuelve la tasa efectiva real del corredor.
  *
- * ⚠️ WKH-314: este camino NO aplica el monto mínimo, a propósito y con ticket. Hoy no es
- * alcanzable (exige `TRANSFI_ADAPTER_READY=true`, que además falla ruidoso si falta), y meter
- * acá una segunda llamada a `resolveFxConfig()` duplicaría el guard justo cuando **WKH-312**
- * está por mover TODA la familia de controles de este camino a un punto de salida común. El
- * mínimo viaja con ellos. Si WKH-312 se cierra sin llevárselo, este camino queda sin mínimo:
- * está anotado en su work-item.
+ * ⚠️ WKH-314: el monto mínimo YA CUBRE este camino, aunque no aparezca en esta clase: se valida
+ * en `runCorridorFx` (`agents/corridor-fx.ts`) antes de elegir proveedor. La primera versión lo
+ * puso dentro de `LiveMidFxProvider` y dejó a este camino descubierto para el día que alguien
+ * active `TRANSFI_ADAPTER_READY`; el AR lo marcó y se movió al núcleo.
+ *
+ * Lo que sigue SIN cubrir acá es la familia de guards de la TASA (banda, frescura, procedencia),
+ * que vive dentro de `getUsdToPenMid` y este camino no atraviesa: es **WKH-312**.
  */
 export class TransFiFxProvider implements FxQuoteProvider {
   /** `baseUrl` es OBLIGATORIO y branded: solo `resolveTransFiBaseUrl()` puede producir uno. */
@@ -141,9 +142,10 @@ export class LiveMidFxProvider implements FxQuoteProvider {
     // UNA sola lectura de config por cotización (AC-9): el mid y el precio tienen que salir de la
     // MISMA config. Dos lecturas podrían leer una env a medio rotar y mezclar dos configuraciones.
     const config = resolveFxConfig();
-    // WKH-314 — el monto mínimo, ANTES de salir a buscar la tasa: un envío que vamos a
-    // rechazar no justifica un fetch al feed.
-    assertAmountAboveMinimum(input.amountUsd, config);
+    // WKH-314 (AR): el guard del monto mínimo NO vive acá. Se mudó a `runCorridorFx`
+    // (`agents/corridor-fx.ts`), antes de elegir proveedor, para que cubra también el camino
+    // de TransFi en vez de proteger sólo a éste. NO lo re-agregues acá: quedaría escrito en
+    // dos lados y divergiría al primer cambio del mínimo.
     const mid = await getUsdToPenMid(config); // tasa real USD→PEN, o LANZA (fail-closed)
     const effRate = mid.rate * (1 - config.spreadBps / 10000); // spread en contra del cliente
     const netUsd = Math.max(0, input.amountUsd - config.flatFeeUsd);
