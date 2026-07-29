@@ -308,7 +308,12 @@ describe("FX mid — cascada, guards y fail-closed", () => {
   // T2 — AC-1
   it("T2: 2ª llamada dentro del TTL ⇒ fx-mid-cached, SIN nueva llamada de red y con el MISMO rateAsOf", async () => {
     const mod = await freshFx();
-    const fetchMock = stubFetchOk(erBody(3.9));
+    // El dato se fecha UNA HORA ATRÁS (igual que T1). Con `ageMs = 0` la fecha del feed se trunca al
+    // segundo (`.000Z`) y el único dígito que la distingue del momento de servir son los ms: si el
+    // reloj cae justo en `.000Z`, una caché que MINTIERA sobre su frescura (devolviendo "ahora" en vez
+    // de la fecha original) produciría el MISMO string y este test la dejaría pasar. Una corrida de
+    // cada mil daría un falso "el guard está protegido" sobre un guard de dinero.
+    const fetchMock = stubFetchOk(erBody(3.9, 3600_000));
     const first = await quoteWith(mod);
     expect(first.provenance).toBe("fx-mid-live");
     expect(fetchMock.mock.calls.length).toBe(1);
