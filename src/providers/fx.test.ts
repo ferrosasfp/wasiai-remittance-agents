@@ -546,6 +546,34 @@ describe("FX mid — cascada, guards y fail-closed", () => {
     expect(fetchMock.mock.calls.length).toBe(2); // re-fetcheó, no sirvió la caché
   });
 
+  // Espejo de T16 sobre el otro knob. La banda era el ÚNICO control de tiempo real que la caché
+  // ignoraba: la tasa se cacheaba dentro de la banda vigente en ese momento y se seguía sirviendo
+  // hasta 5 minutos aunque el operador la estrechara — y esos 5 minutos caen justo cuando alguien
+  // está respondiendo a un incidente de tasa. La banda se re-evalúa contra la config ACTUAL.
+  it("T16b: tasa cacheada en banda; si la banda se ESTRECHA por debajo, la caché NO se sirve y se re-fetchea", async () => {
+    const mod = await freshFx();
+    vi.stubEnv("FX_MID_SOURCES", "er-api"); // una sola fuente: el contador mide re-fetch
+    const fetchMock = stubFetchOk(erBody(4.9, 3600_000));
+    const first = await quoteWith(mod);
+    expect(first.provenance).toBe("fx-mid-live"); // 4.9 < 5.0 default
+    expect(fetchMock.mock.calls.length).toBe(1);
+
+    // el operador estrecha el techo SIN redeploy (AC-9): 4.9 deja de ser aceptable
+    vi.stubEnv("FX_MID_MAX_USD_PEN", "3.5");
+    await expect(quoteWith(mod)).rejects.toThrow(/fx_mid_unavailable/);
+    expect(fetchMock.mock.calls.length).toBe(2); // re-fetcheó, no sirvió la caché fuera de banda
+  });
+
+  it("T16c: subir el PISO por encima de la tasa cacheada tampoco la sirve", async () => {
+    const mod = await freshFx();
+    vi.stubEnv("FX_MID_SOURCES", "er-api");
+    const fetchMock = stubFetchOk(erBody(3.0, 3600_000));
+    expect((await quoteWith(mod)).provenance).toBe("fx-mid-live");
+    vi.stubEnv("FX_MID_MIN_USD_PEN", "3.2");
+    await expect(quoteWith(mod)).rejects.toThrow(/fx_mid_unavailable/);
+    expect(fetchMock.mock.calls.length).toBe(2);
+  });
+
   // T20 — AC-2, CD-11: la cascada real
   it("T20: er-api 500 → currency-api 200 ⇒ exactamente 2 llamadas, EN ORDEN, y cotiza con la 2ª", async () => {
     const mod = await freshFx();

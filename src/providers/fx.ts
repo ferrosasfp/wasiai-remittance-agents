@@ -242,12 +242,19 @@ async function getUsdToPenMid(config: FxConfig): Promise<MidRate> {
   // próxima cotización, sin redeploy. Si es inválida, `resolveFxConfig()` ya lanzó antes de llegar
   // acá — nunca se cotiza con un guard desactivado.
 
-  // (1) Caché fresca en los DOS ejes: TTL de la caché y edad del dato. El TTL no revive un dato
-  // viejo: una tasa traída hace 1 minuto pero con fecha de hace 5 días sigue siendo vieja.
+  // (1) Caché servible en los TRES ejes vigentes AHORA: TTL de la caché, edad del dato y BANDA.
+  // El TTL no revive un dato viejo: una tasa traída hace 1 minuto pero con fecha de hace 5 días
+  // sigue siendo vieja. Y la banda se re-evalúa contra la config ACTUAL, no contra la que regía
+  // cuando se cacheó: estrechar la banda es la única maniobra de tiempo real que tiene un operador
+  // frente a un incidente de tasa (AC-9, sin redeploy), y si la caché la ignorara seguiría sirviendo
+  // hasta 5 minutos una tasa que el operador acaba de declarar inaceptable. Simétrico con la edad,
+  // donde esto ya se hacía (T16).
   if (
     cache !== null &&
     cache.fetchedAt + config.cacheTtlMs > Date.now() &&
-    checkFreshness(cache.dataAsOf, config.maxAgeMs) === "ok"
+    checkFreshness(cache.dataAsOf, config.maxAgeMs) === "ok" &&
+    cache.rate >= config.minRate &&
+    cache.rate <= config.maxRate
   ) {
     return {
       rate: cache.rate,
