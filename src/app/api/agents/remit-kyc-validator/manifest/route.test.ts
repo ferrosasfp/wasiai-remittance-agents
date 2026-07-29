@@ -160,6 +160,37 @@ describe("GET manifest — fail-closed: nadie puede copiar una ficha a medias", 
     expect(JSON.stringify(body)).not.toContain("DEADBEEF");
   });
 
+  // FIX-PACK CR-MNR-1 — la rama catch (route.ts:31-40) no la ejercitaba nadie: se le podía meter
+  // ahí un 200 con ficha a medias (el bug que esta HU vino a matar) y la suite quedaba verde.
+  it("si buildManifest LANZA: 503 sin payment (no un 200 a medias, no un 500)", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.stubEnv(KYC_ENV, EVM_OK); // env PERFECTA: el 503 sale del catch, no del fail-closed
+    vi.resetModules();
+    vi.doMock("@/manifest/build", () => ({
+      buildManifest: () => {
+        throw new Error("boom-interno-del-manifiesto");
+      },
+    }));
+    try {
+      const { GET: GET_throwing } = await import("./route");
+      const res = await GET_throwing(new NextRequest(ENDPOINT));
+      expect(res.status).toBe(503);
+      expect(res.headers.get("cache-control")).toBe("no-store");
+      const body = await res.json();
+      expect("payment" in body).toBe(false);
+      expect(body.error).toBe("manifest_unavailable");
+      expect(body.missing).toEqual([]);
+      expect(body.invalid).toEqual([]);
+      // el log del catch tampoco ecoa el mensaje del error ni el valor de la env
+      const logged = JSON.stringify(warn.mock.calls);
+      expect(logged).not.toContain("boom-interno-del-manifiesto");
+      expect(logged).not.toContain(EVM_OK);
+    } finally {
+      vi.doUnmock("@/manifest/build");
+      vi.resetModules();
+    }
+  });
+
   it("tampoco lo ecoa en los logs", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.stubEnv(KYC_ENV, "0xDEADBEEF-not-an-address");

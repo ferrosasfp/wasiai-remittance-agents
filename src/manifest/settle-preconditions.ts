@@ -20,11 +20,33 @@ export type SettleVerdict =
   | "INVALID_PAY_TO_FORMAT"
   | "ZERO_PAY_TO";
 
-/** Familias de las chains que el rail downstream conoce y este repo puede declarar. */
+/** Familias de las chains que el rail downstream CONOCE (port de `normalizeChainSlug`). */
 const ORACLE_CHAINS: Readonly<Record<string, ChainFamily>> = Object.freeze({
   "avalanche-fuji": "evm",
   "solana-devnet": "solana",
 });
+
+/**
+ * Chains que el gateway tiene REALMENTE INICIALIZADAS (port de `getAdaptersBundle`).
+ *
+ * POR QUÉ ES UN DATO APARTE Y NO SE DERIVA DE `ORACLE_CHAINS`: la guarda real son DOS
+ * condiciones (`downstream-payment.ts:532-546`), `if (!chainKey || !bundle)`. Que el resolver
+ * conozca el slug NO implica que el registry tenga el bundle: `solana-devnet` sólo entra en
+ * `getSupportedChains()` con `SOLANA_ADAPTER_ENABLED === 'true'`, que es **default OFF**
+ * (`wasiai-a2a/src/adapters/registry.ts:62-75`), y además el slug tiene que estar en el CSV
+ * `WASIAI_A2A_CHAINS`. Con la chain no inicializada el leg NO paga: `CHAIN_NOT_SUPPORTED`.
+ *
+ * ESTE DEFAULT ES CONFIGURACIÓN OBSERVADA, NO UNA GARANTÍA DEL CÓDIGO. Medido contra el
+ * gateway de producción el 2026-07-29 (`GET /capabilities` → `chains[].key`):
+ * `kite-ozone-testnet`, `avalanche-fuji`, `base-sepolia`, `solana-devnet`. De esas, las 2 que
+ * este repo puede declarar son las de abajo. Un entorno nuevo sin el flag NO tiene
+ * `solana-devnet` y los 2 agentes Solana cobran cero: por eso `evaluateSettle` recibe el set
+ * como parámetro y hay un test que fija ese escenario (ver `settle-preconditions.test.ts`).
+ */
+export const PROD_INITIALIZED_CHAINS: readonly string[] = Object.freeze([
+  "avalanche-fuji",
+  "solana-devnet",
+]);
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -36,7 +58,10 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
  * Reproduce, EN ESTE ORDEN, la secuencia de guardas del gateway. El orden ES el contrato: un
  * `payment` puede violar dos reglas a la vez y el skip-code que se emite es el de la primera.
  */
-export function evaluateSettle(payment: unknown): SettleVerdict {
+export function evaluateSettle(
+  payment: unknown,
+  initializedChains: readonly string[] = PROD_INITIALIZED_CHAINS,
+): SettleVerdict {
   // (1) El lector de specs devolvería `undefined` y el leg vería `agent.payment` ausente.
   const spec = asRecord(payment);
   if (spec === undefined) return "NO_PAYMENT_FIELD";
@@ -48,9 +73,15 @@ export function evaluateSettle(payment: unknown): SettleVerdict {
   // (2) Comparación EXACTA: sin trim ni lowercase ("x402 " con espacio NO es x402).
   if (method !== "x402") return "METHOD_NOT_SUPPORTED";
 
-  // (3) Chain que el rail no conoce / no tiene adapter inicializado.
+  // (3a) Chain que el resolver del rail no conoce (`normalizeChainSlug` → undefined).
   const family = ORACLE_CHAINS[chain];
   if (family === undefined) return "CHAIN_NOT_SUPPORTED";
+
+  // (3b) Chain conocida pero SIN bundle en el registry (`getAdaptersBundle` → undefined).
+  //      Mismo skip-code, causa distinta: el rail existe en el código pero está APAGADO en
+  //      este entorno. Borrar esta condición hace que el oráculo afirme que los agentes
+  //      Solana cobran en entornos donde no cobran (BLQ-1 del AR).
+  if (!initializedChains.includes(chain)) return "CHAIN_NOT_SUPPORTED";
 
   // (4) EVM: formato primero, zero-address después.
   if (family === "evm") {
@@ -67,6 +98,12 @@ export function evaluateSettle(payment: unknown): SettleVerdict {
 /**
  * Port del lector de specs del gateway: ¿este objeto sobrevive a la lectura del consumidor?
  * `method` puede venir como `protocol`, y `chain` puede venir en el nivel de arriba (`raw.chain`).
+ *
+ * NO recibe `initializedChains` A PROPÓSITO: el lector real
+ * (`wasiai-a2a/src/lib/payment-spec-reader.ts`, rama `normalizeChainSlug(chainRaw) === undefined`)
+ * sólo exige que el RESOLVER conozca el slug — no mira el registry. La inicialización se chequea
+ * después, en el leg (`evaluateSettle`, guarda 3b). Agregarle el set acá sería más estricto que el
+ * consumidor y el port dejaría de ser fiel.
  */
 export function readPaymentSpecAccepts(raw: Record<string, unknown>): boolean {
   const spec = asRecord(raw.payment);

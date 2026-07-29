@@ -165,4 +165,141 @@
 
 ---
 
+### [2026-07-29 01:05] Fix-pack AR/CR — Portear MEDIA guarda de dinero (BLQ-1)
+
+- **Error**: el oráculo `evaluateSettle` porteó **una** de las **dos** condiciones de la guarda de
+  chain del consumidor. El original es `if (!chainKey || !bundle)`
+  (`wasiai-a2a/src/lib/downstream-payment.ts:532-546`): (a) el resolver conoce el slug **Y** (b) el
+  registry tiene el bundle **inicializado**. El port sólo tenía (a). Consecuencia: el test decía
+  textualmente *"remit-corridor-fx-solana COBRARÍA"* y pasaba, cuando en cualquier entorno sin
+  `SOLANA_ADAPTER_ENABLED=true` (**default OFF**, `wasiai-a2a/src/adapters/registry.ts:62-75`) esos
+  2 agentes **no cobran**.
+
+- **Causa raíz**: al portear una guarda se copió la **forma** (un `if`, un skip-code) en vez de las
+  **condiciones**. Un `||` de dos términos donde el segundo depende de configuración del OTRO repo se
+  lee fácil como "lo mismo dicho dos veces", y no lo es: el primero es código, el segundo es config.
+
+- **Fix**: `evaluateSettle(payment, initializedChains = PROD_INITIALIZED_CHAINS)` con la guarda 3b
+  explícita (`settle-preconditions.ts`), default **medido** contra prod el 2026-07-29
+  (`GET /capabilities` → `chains[].key`: `kite-ozone-testnet`, `avalanche-fuji`, `base-sepolia`,
+  `solana-devnet`), tests que fijan las dos caras (cobra con la chain inicializada,
+  `CHAIN_NOT_SUPPORTED` sin ella) y un test que pinnea el default para que nadie lo cambie sin volver
+  a medir. Mutantes M1 (borrar 3b) y M1b (sacar `solana-devnet` del default): **los dos murieron**.
+
+- **Aplicar en**: **todo port de un guard de dinero** — enumerar los términos booleanos del original
+  uno por uno y mapear cada uno a una línea del port; si un término depende de configuración del
+  entorno del consumidor, **entra como parámetro explícito**, nunca como constante implícita. Y todo
+  título de test que diga "COBRA/COBRARÍA" tiene que nombrar la configuración bajo la que eso vale.
+
+---
+
+### [2026-07-29 01:20] Fix-pack AR — Un gate operativo garantizado a dar verde (BLQ-2)
+
+- **Error**: el runbook (README §Runbook-5, sdd §10-5) condicionaba el deslistado de los gemelos Fuji
+  —la única ruta de cobro viva de FX/payout— a "confirmar el paso 3", y el paso 3 comparaba el
+  `payment` del manifiesto contra el de `/discover`… **que coinciden por construcción**, porque el
+  paso 1 manda copiar las addresses desde esas mismas filas. El gate daba verde sin haber tocado
+  nunca el rail de cobro.
+
+- **Causa raíz**: se confundió **consistencia documental** con **evidencia de efecto**. Un chequeo
+  cuya entrada es la salida de un paso anterior no puede refutar nada.
+
+- **Fix**: paso 5 nuevo = **prueba positiva de cobro** (mínimo: `solana-devnet` presente en
+  `chains[].key` de `/capabilities`; ideal: invocación real en devnet con el settle visible), y el
+  deslistado pasa a ser el paso 6, condicionado a esa prueba. Se agregó en negrita que **un `200` del
+  manifiesto NO implica que el rail esté prendido**, y el §10-3 quedó marcado como chequeo que da
+  verde por construcción.
+
+- **Aplicar en**: cualquier runbook con un paso destructivo/irreversible-en-la-práctica. La
+  precondición tiene que ser una medición **independiente** de los pasos que la preceden; si su
+  entrada la produjo el propio runbook, no es un gate.
+
+---
+
+### [2026-07-29 01:30] Fix-pack CR — Tests vacuos y ramas sin ancla (CR-MNR-1/2/4)
+
+- **Error**: (a) `wallet-format.test.ts` prometía *"detecta la zero-address en cualquier casing"* y su
+  caso de casing era **byte-idéntico** al anterior (la zero-address no tiene letras hexadecimales:
+  `toUpperCase().replace("0X","0x")` devuelve el mismo string); (b) la rama `catch` de las 3 rutas
+  (`route.ts:31-40`) no la ejercitaba **nadie** — se le podía meter ahí un `200` con ficha a medias, o
+  sea el bug exacto que la HU vino a matar, y la suite quedaba verde; (c) 2 guardas de
+  `readPaymentSpecAccepts` sobrevivían a ser borradas.
+
+- **Causa raíz**: el mismo patrón en tres lugares — se testeó el camino **fácil de alcanzar** y se
+  asumió el resto. En (b) además pesó que la rama es defensiva ("no puede pasar"), y una rama que
+  "no puede pasar" es exactamente la que nadie mira cuando empieza a pasar.
+
+- **Fix**: (a) el test dejó de prometer casing y **documenta por qué ese camino es inalcanzable**
+  (ADDRESS_RE exige la `x` minúscula antes); (b) un test por ruta que hace lanzar a `buildManifest`
+  (`vi.doMock` + `vi.resetModules`, con `finally` para no contaminar el resto del archivo) y afirma
+  `503` sin `payment`, sin eco del error ni del payTo — mutantes M5/M6/M7 (catch devolviendo `200`
+  con ficha a medias): **los tres murieron**; (c) 2 casos nuevos en el auto-test del oráculo — sin
+  `method` ni `protocol`, y `chain` no-string que **se coacciona** a un slug conocido (mutantes M3/M4
+  muertos).
+
+- **Aplicar en**: toda rama `catch`/defensiva de una ruta HTTP de dinero (hay que forzar el throw,
+  no confiar en que no ocurra) y todo test cuyo caso "alternativo" salga de transformar el fixture
+  principal: verificar que el valor transformado **no sea igual** al original antes de creerle.
+
+---
+
+### [2026-07-29 01:12] Fix-pack — Mutantes EQUIVALENTES: no perseguirlos (AR MNR-4)
+
+- **Error**: ninguno. Se documenta para que la próxima corrida de mutación **no gaste tiempo** ni,
+  peor, escriba tests que afirmen comportamiento sobre caminos inalcanzables.
+
+- **Los dos mutantes equivalentes verificados**:
+  1. Borrar el `.toLowerCase()` de `wallet-format.ts:20` (`isZeroAddress`). Corre **después** de
+     `isValidEvmAddress`, y la zero-address no tiene ni una letra hexadecimal ⇒ no hay entrada
+     alcanzable que distinga las dos versiones. Matarlo exigiría llamar `isZeroAddress("0X000…")`
+     directo, que el pipeline nunca produce: sería un test que afirma un camino muerto.
+  2. La rama de familia `solana` que exige que una **base58** caiga en el brazo EVM (o al revés) con
+     una address que ninguna base58 puede alcanzar. Misma razón: no existe entrada que la distinga.
+
+- **Regla**: un mutante sobreviviente es una señal, **no** una orden. Antes de escribir el test hay
+  que responder: *¿existe una entrada ALCANZABLE que distinga original y mutante?* Si no, es
+  equivalente: se anota acá y se cierra. Escribir el test igual **empeora** la suite (fija
+  comportamiento de código muerto y estorba refactors legítimos).
+
+---
+
+### [2026-07-29 01:35] Fix-pack — Asimetrías CONOCIDAS del port (AR MNR-1 y MNR-3, no se arreglan)
+
+- **Error**: ninguno. Son diferencias **deliberadas** entre el oráculo y el consumidor, y se dejan
+  documentadas para que la próxima revisión no las relea como huecos.
+
+- **MNR-3 — no hay análogo Solana de la zero-address**: el manifiesto rechaza la zero-address EVM
+  (`ZERO_PAY_TO`) pero no tiene un rechazo equivalente para una base58 "nula" (p.ej. el System
+  Program, 32 bytes en cero). Es fiel al consumidor: `downstream-payment.ts` sólo corta el zero-check
+  en el brazo EVM (`:218-231`); el brazo Solana (`:255-262`) sólo valida formato. Agregarlo acá
+  volvería el manifiesto **más estricto** que el settle, que es la otra forma de mentir.
+
+- **MNR-1 — el `priceUsdc` no está porteado al oráculo**: `evaluateSettle` no evalúa el precio porque
+  las guardas del leg tampoco lo hacen; el precio vive en el `payment` del registro, no en la decisión
+  de saltear o pagar. El manifiesto lo publica desde `PRICE_USDC` (fuente única) y ahí se agota su
+  responsabilidad en esta HU.
+
+- **Regla**: el port es fiel al consumidor **por diseño**. Cualquier chequeo extra que se agregue del
+  lado del manifiesto tiene que justificarse como "el settle también lo rechaza", con archivo:línea.
+
+---
+
+### [2026-07-29 01:08] Fix-pack — Una aserción "documental" que también hay que verificar
+
+- **Error**: al reescribir el test vacuo de casing escribí `expect(EVM_ZERO.toUpperCase()).toBe(EVM_ZERO)`
+  para documentar que la zero-address no tiene letras. **Rojo**: `toUpperCase()` sí toca la `x` del
+  prefijo (`0X0000…`). La afirmación correcta es la del valor original del test viejo
+  (`.toUpperCase().replace("0X","0x")`), que es lo que lo volvía vacuo.
+
+- **Causa raíz**: escribí la aserción "de documentación" de memoria, sin correrla, porque parecía
+  trivialmente verdadera. Las aserciones que explican **por qué otro test era falso** son
+  exactamente las que hay que ejecutar.
+
+- **Fix**: se corrigió a `EVM_ZERO.toUpperCase().replace("0X", "0x")` y se corrió el archivo (15/15).
+
+- **Aplicar en**: cualquier aserción agregada "para dejar constancia" — se corre igual que las demás,
+  y si es sobre un string, se verifica el string real, no el que uno cree recordar.
+
+---
+
 *Auto-Blindaje de F3 (Dev) — NexusAgil*

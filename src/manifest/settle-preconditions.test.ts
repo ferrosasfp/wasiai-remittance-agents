@@ -4,7 +4,11 @@
 // y afirman el EFECTO. Un rojo acá se lee, sin abrir el código: "este agente cobraría cero, y por qué".
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { buildManifest } from "./build";
-import { evaluateSettle, readPaymentSpecAccepts } from "./settle-preconditions";
+import {
+  evaluateSettle,
+  readPaymentSpecAccepts,
+  PROD_INITIALIZED_CHAINS,
+} from "./settle-preconditions";
 import type { AgentPaymentSpec } from "./types";
 
 // Fixtures de FORMATO (no son wallets reales — no usar en ningún runbook).
@@ -33,6 +37,9 @@ function emittedPayment(pathSlug: string): AgentPaymentSpec {
 }
 
 // T2 — AC-1, AC-5
+// TODA afirmación de "cobra" de este bloque está CONDICIONADA al set de chains inicializadas que
+// se le pasa al oráculo. Sin esa condición explícita el título mentiría en cualquier entorno con
+// `SOLANA_ADAPTER_ENABLED` apagado (BLQ-1 del AR).
 describe("¿cobra cada agente? — el payment emitido pasado por las guardas reales del gateway", () => {
   beforeEach(() => {
     vi.stubEnv(KYC_ENV, EVM_OK);
@@ -40,17 +47,23 @@ describe("¿cobra cada agente? — el payment emitido pasado por las guardas rea
     vi.stubEnv(PAYOUT_ENV, SOL_OK);
   });
 
-  it("remit-kyc-validator COBRARÍA (WOULD_SETTLE) con su payTo Fuji configurado", () => {
-    expect(evaluateSettle(emittedPayment("remit-kyc-validator"))).toBe("WOULD_SETTLE");
+  it("remit-kyc-validator COBRARÍA (WOULD_SETTLE) con su payTo Fuji y avalanche-fuji inicializada", () => {
+    expect(evaluateSettle(emittedPayment("remit-kyc-validator"), ["avalanche-fuji"])).toBe(
+      "WOULD_SETTLE",
+    );
   });
 
   // T4 — AC-2, AC-5
-  it("remit-corridor-fx-solana COBRARÍA (WOULD_SETTLE) con su payTo Solana configurado", () => {
-    expect(evaluateSettle(emittedPayment("remit-corridor-fx"))).toBe("WOULD_SETTLE");
+  it("remit-corridor-fx-solana COBRARÍA (WOULD_SETTLE) SÓLO si el gateway tiene solana-devnet inicializada", () => {
+    expect(evaluateSettle(emittedPayment("remit-corridor-fx"), ["solana-devnet"])).toBe(
+      "WOULD_SETTLE",
+    );
   });
 
-  it("remit-cashout-payout-solana COBRARÍA (WOULD_SETTLE) con su payTo Solana configurado", () => {
-    expect(evaluateSettle(emittedPayment("remit-cashout-payout"))).toBe("WOULD_SETTLE");
+  it("remit-cashout-payout-solana COBRARÍA (WOULD_SETTLE) SÓLO si el gateway tiene solana-devnet inicializada", () => {
+    expect(evaluateSettle(emittedPayment("remit-cashout-payout"), ["solana-devnet"])).toBe(
+      "WOULD_SETTLE",
+    );
   });
 
   // T9 — AC-5
@@ -60,11 +73,62 @@ describe("¿cobra cada agente? — el payment emitido pasado por las guardas rea
     }
   });
 
-  it("ninguno de los 3 dispara un skip-code del leg downstream", () => {
+  it("con el rail que prod tiene prendido HOY, ninguno de los 3 dispara un skip-code", () => {
     const verdicts = ["remit-kyc-validator", "remit-corridor-fx", "remit-cashout-payout"].map(
-      (pathSlug) => evaluateSettle(emittedPayment(pathSlug)),
+      (pathSlug) => evaluateSettle(emittedPayment(pathSlug), PROD_INITIALIZED_CHAINS),
     );
     expect(verdicts).toEqual(["WOULD_SETTLE", "WOULD_SETTLE", "WOULD_SETTLE"]);
+  });
+});
+
+// FIX-PACK AR BLQ-1 — la segunda mitad de la guarda `if (!chainKey || !bundle)`.
+// El rail Solana está flag-gated y default OFF en el gateway (`SOLANA_ADAPTER_ENABLED`), así que
+// "el manifiesto está bien" y "el agente cobra" son afirmaciones DISTINTAS.
+describe("el rail tiene que estar PRENDIDO: chain no inicializada ⇒ el agente no cobra", () => {
+  beforeEach(() => {
+    vi.stubEnv(KYC_ENV, EVM_OK);
+    vi.stubEnv(FX_ENV, SOL_OK);
+    vi.stubEnv(PAYOUT_ENV, SOL_OK);
+  });
+
+  it("gateway SIN solana-devnet inicializada: los 2 agentes Solana cobran $0 (CHAIN_NOT_SUPPORTED)", () => {
+    const sinSolana = ["avalanche-fuji"]; // entorno con SOLANA_ADAPTER_ENABLED != 'true'
+    expect(evaluateSettle(emittedPayment("remit-corridor-fx"), sinSolana)).toBe(
+      "CHAIN_NOT_SUPPORTED",
+    );
+    expect(evaluateSettle(emittedPayment("remit-cashout-payout"), sinSolana)).toBe(
+      "CHAIN_NOT_SUPPORTED",
+    );
+    // …y el corte es POR CHAIN, no un apagón global: el de Fuji sigue cobrando.
+    expect(evaluateSettle(emittedPayment("remit-kyc-validator"), sinSolana)).toBe("WOULD_SETTLE");
+  });
+
+  it("el manifiesto se emite igual: un 200 NO prueba que el rail de cobro esté prendido", () => {
+    // El mismo `payment`, byte por byte, cobra o no cobra según la config del gateway.
+    const fx = emittedPayment("remit-corridor-fx");
+    expect(evaluateSettle(fx, ["avalanche-fuji", "solana-devnet"])).toBe("WOULD_SETTLE");
+    expect(evaluateSettle(fx, ["avalanche-fuji"])).toBe("CHAIN_NOT_SUPPORTED");
+    expect(evaluateSettle(fx, [])).toBe("CHAIN_NOT_SUPPORTED");
+  });
+
+  it("chain conocida por el resolver pero sin bundle ⇒ CHAIN_NOT_SUPPORTED (las 2 familias)", () => {
+    expect(
+      evaluateSettle({ method: "x402", chain: "avalanche-fuji", contract: EVM_OK, asset: "USDC" }, [
+        "solana-devnet",
+      ]),
+    ).toBe("CHAIN_NOT_SUPPORTED");
+    expect(
+      evaluateSettle({ method: "x402", chain: "solana-devnet", contract: SOL_OK, asset: "USDC" }, [
+        "avalanche-fuji",
+      ]),
+    ).toBe("CHAIN_NOT_SUPPORTED");
+  });
+
+  it("el default del oráculo declara EXACTAMENTE lo que prod tenía prendido al medirlo", () => {
+    // Medición: GET /capabilities del gateway de prod, 2026-07-29 → chains[].key incluye
+    // avalanche-fuji y solana-devnet (más kite-ozone-testnet y base-sepolia, que este repo no
+    // declara). Si alguien cambia el default sin volver a medir, este test se pone rojo.
+    expect([...PROD_INITIALIZED_CHAINS].sort()).toEqual(["avalanche-fuji", "solana-devnet"]);
   });
 });
 
@@ -206,6 +270,39 @@ describe("auto-test del oráculo: cada guarda del gateway, en su orden exacto", 
     );
     expect(
       readPaymentSpecAccepts({ payment: { method: "x402", chain: "polygon", contract: EVM_OK } }),
+    ).toBe(false);
+  });
+
+  // FIX-PACK CR-MNR-4 — las 2 guardas del lector que ningún test ejercitaba. Si el oráculo se
+  // vuelve MÁS PERMISIVO que el lector real, afirma que un registro cobra cuando el consumidor
+  // ni siquiera produciría un spec.
+  it("readPaymentSpecAccepts: sin method NI protocol ⇒ false, aunque chain y contract sean válidos", () => {
+    expect(readPaymentSpecAccepts({ payment: { chain: "avalanche-fuji", contract: EVM_OK } })).toBe(
+      false,
+    );
+    // `protocol` presente pero no-string tampoco alcanza (el lector exige typeof string)
+    expect(
+      readPaymentSpecAccepts({ payment: { protocol: 402, chain: "solana-devnet", contract: SOL_OK } }),
+    ).toBe(false);
+  });
+
+  it("readPaymentSpecAccepts: chain no-string ⇒ false, incluso si se COACCIONA a un slug conocido", () => {
+    expect(
+      readPaymentSpecAccepts({ payment: { method: "x402", chain: 43113, contract: EVM_OK } }),
+    ).toBe(false);
+    // El caso que separa "typeof string" de "indexar el mapa": este objeto se coacciona a
+    // "avalanche-fuji" al usarlo como clave, pero el lector real lo descarta antes.
+    expect(
+      readPaymentSpecAccepts({
+        payment: { method: "x402", chain: { toString: () => "avalanche-fuji" }, contract: EVM_OK },
+      }),
+    ).toBe(false);
+    // …y lo mismo por el fallback de nivel superior (`raw.chain`).
+    expect(
+      readPaymentSpecAccepts({
+        chain: { toString: () => "solana-devnet" },
+        payment: { method: "x402", contract: SOL_OK },
+      }),
     ).toBe(false);
   });
 });

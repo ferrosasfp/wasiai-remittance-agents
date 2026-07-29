@@ -343,13 +343,23 @@ Capabilities verificadas contra los registros originales:
   El settle real vive en otro repo y necesita cadena, operador y fondos. Para medir **efecto** y no
   "se llamó a una función", F10 portea las 5 guardas que deciden si un leg paga o se saltea
   (`downstream-payment.ts:506-546,218-231,255-262`) en una función pura de test:
-  `evaluateSettle(payment) → 'WOULD_SETTLE' | 'NO_PAYMENT_FIELD' | 'METHOD_NOT_SUPPORTED' |
+  `evaluateSettle(payment, initializedChains) → 'WOULD_SETTLE' | 'NO_PAYMENT_FIELD' | 'METHOD_NOT_SUPPORTED' |
   'CHAIN_NOT_SUPPORTED' | 'INVALID_PAY_TO_FORMAT' | 'ZERO_PAY_TO'`. Los tests de F11 afirman
   `WOULD_SETTLE` sobre el `payment` **realmente emitido** por el manifiesto, y nombran el skip-code
   esperado en los casos negativos: un rojo se lee como *"este agente cobraría $0 por X"*.
   La duplicación tiene riesgo de drift (R-3): se mitiga con (a) cabecera que cita archivo:línea de
   origen, (b) el test espejo que la HU hermana agrega **en `wasiai-a2a`** contra el manifiesto real
   (§8.4), que es donde el drift se detecta de verdad.
+
+  **Fix-pack AR BLQ-1** — la guarda de chain son **DOS** condiciones (`if (!chainKey || !bundle)`),
+  no una: slug conocido por el resolver **Y** bundle inicializado en el registry. La 2ª es
+  configuración del gateway (`SOLANA_ADAPTER_ENABLED`, **default OFF**), así que el oráculo la recibe
+  como parámetro explícito `initializedChains` (default = lo medido en prod el 2026-07-29 vía
+  `GET /capabilities`: `avalanche-fuji` + `solana-devnet`). Sin ese parámetro el oráculo afirmaba
+  "COBRARÍA" en entornos donde los 2 agentes Solana no cobran. Los tests fijan las dos caras: cobra
+  con la chain inicializada, `CHAIN_NOT_SUPPORTED` sin ella.
+  ⚠️ `readPaymentSpecAccepts` **no** recibe ese set a propósito: el lector real
+  (`payment-spec-reader.ts`) sólo exige `normalizeChainSlug` — la inicialización la chequea el leg.
 
 ### 4.5 Flujo principal (Happy Path)
 
@@ -640,12 +650,27 @@ en el repo donde vive la verdad — que es exactamente donde tiene que romperse.
 3. **Drift check** (sin escribir): comparar `payment` del manifiesto vs el de `/discover` para los 2
    slugs `*-solana`. Si difieren, **no** se corrige a mano: se corrige vía el write-path de la HU
    hermana.
+   ⚠️ **Fix-pack AR BLQ-2**: este paso **no prueba nada del cobro**. Manifiesto y `/discover`
+   coinciden **por construcción** (el paso 1 manda copiar las addresses desde esas mismas filas), así
+   que el chequeo está **garantizado a dar verde** sin haber tocado el rail. Es consistencia
+   documental, no evidencia de settle.
 4. **Registrar/actualizar `remit-kyc-validator`** con `payment` — requiere la HU hermana mergeada.
    Verificación de éxito: `GET /discover` muestra `payment` para ese slug **y** un `/compose` sobre él
    deja de loguear `NO_PAYMENT_FIELD` (AC-5 e2e).
-5. **Deslistar los gemelos Fuji** (`remit-corridor-fx`, `remit-cashout-payout`) — decisión del
-   founder (DT-5). Ejecutar **después** de confirmar el paso 3, para no quedarse sin ninguna ruta de
-   cobro para FX/payout si algo del par Solana estuviera mal.
+5. **Prueba positiva de cobro** (precondición REAL del paso 6):
+   - **Mínimo obligatorio**: `GET /capabilities` del gateway → `chains[].key` debe incluir
+     `solana-devnet`. El rail Solana es flag-gated con **default OFF**
+     (`wasiai-a2a/src/adapters/registry.ts:62-75`, `SOLANA_ADAPTER_ENABLED`): sin él,
+     `getAdaptersBundle('solana-devnet')` devuelve `undefined` y el leg se saltea con
+     `CHAIN_NOT_SUPPORTED` (`downstream-payment.ts:532-546`) — los 2 agentes `*-solana` cobran $0 con
+     manifiesto `200`. Medición del 2026-07-29 sobre prod: `solana-devnet` **está** inicializada.
+   - **Ideal**: invocación real en devnet contra cada slug `*-solana`, con el settle visible (ningún
+     skip-code en el log del leg).
+   - Espejo en tests: `settle-preconditions.test.ts` (describe *"el rail tiene que estar PRENDIDO"*)
+     fija que el mismo `payment`, byte por byte, **no cobra** si la chain no está inicializada.
+6. **Deslistar los gemelos Fuji** (`remit-corridor-fx`, `remit-cashout-payout`) — decisión del
+   founder (DT-5). Ejecutar **después de la prueba positiva del paso 5**, no del paso 3: el paso 5 es
+   el único que toca el rail de cobro, y el 6 apaga la única ruta que hoy sí cobra para FX/payout.
 
 ---
 
@@ -653,7 +678,7 @@ en el repo donde vive la verdad — que es exactamente donde tiene que romperse.
 
 | # | Riesgo | Prob. | Impacto | Mitigación |
 |---|---|---|---|---|
-| R-1 | Se deslistan los gemelos Fuji antes de confirmar que los `*-solana` cobran ⇒ FX/payout sin ruta de cobro | M | Alto | Orden explícito del runbook (§10-5 después de §10-3); el deslistado es reversible (re-enable) |
+| R-1 | Se deslistan los gemelos Fuji antes de confirmar que los `*-solana` cobran ⇒ FX/payout sin ruta de cobro | M | Alto | Orden explícito del runbook (§10-6 después de la **prueba positiva** del §10-5; el §10-3 NO alcanza: da verde por construcción — fix-pack AR BLQ-2); el deslistado es reversible (re-enable) |
 | R-2 | Next 14 evalúa el `GET` en build y sirve un `payTo` congelado | **A** (default del framework) | Alto (rotar la env no surte efecto) | DT-10 + CD-11 + T14 (dos `GET` con envs distintas dentro del mismo test) + `npm run build` en el gate de W2 |
 | R-3 | Drift entre el validador porteado (F2/F10) y el original de `wasiai-a2a` | M | Alto (el manifiesto diría OK y el settle rechazaría) | Cabecera con archivo:línea de origen; §8.4 pide el test espejo en el repo dueño de la verdad; M1 mata el criterio laxo |
 | R-4 | El operador copia el payTo Fuji al slot Solana (o al revés) | M | Alto ($0 silencioso otra vez) | T13 (cross-family) + fail-closed 503 |

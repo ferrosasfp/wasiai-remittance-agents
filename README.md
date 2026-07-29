@@ -198,7 +198,11 @@ el settle hacia el operador se salteaba sin error).
 
 Derivación desde el `agentUrl` ya registrado: `manifestUrl = agentUrl.replace(/\/invoke\/?$/, '/manifest')`.
 
-**Códigos posibles: `200` y `503`. Nada más.** Ambas respuestas llevan `Cache-Control: no-store`.
+**El `GET` responde `200` o `503`, nada más** (no hay un tercer código para el método soportado). Ambas
+respuestas llevan `Cache-Control: no-store`. Otros métodos y otros paths no son parte del contrato y los
+resuelve el framework: un `POST` al mismo path devuelve `405`, y un path inexistente devuelve `404` — en
+particular el **slug canónico** (`/api/agents/remit-corridor-fx-solana/manifest`) **no es una URL**: las 3
+URLs válidas son las de la tabla de arriba, que usan el `pathSlug`.
 
 ### `200 OK` — exactamente 7 claves de primer nivel
 
@@ -279,10 +283,23 @@ sólo publica la ficha.
    Con una env borrada a propósito, confirmar el `503` (prueba viva del fail-closed).
 3. **Drift check sin escribir**: comparar el `payment` del manifiesto contra el de `/discover` para los 2
    slugs `*-solana`. Si difieren, **no** se corrige a mano.
+   > ⚠️ Este chequeo **no prueba nada sobre el cobro**: coinciden **por construcción**, porque el paso 1
+   > manda copiar las addresses **desde esas mismas filas**. Es un chequeo de consistencia documental.
 4. **Registrar/actualizar `remit-kyc-validator`** con su `payment` (requiere la HU hermana del otro repo).
-5. ⚠️ **Deslistar los gemelos Fuji (`remit-corridor-fx`, `remit-cashout-payout`) SÓLO DESPUÉS de haber
-   confirmado el paso 3.** Hacerlo antes deja a FX y payout **sin ninguna ruta de cobro**. El deslistado es
-   reversible; quedarse sin ruta de cobro no es gratis.
+5. **Probar que el rail de cobro está PRENDIDO** (prueba positiva, no coincidencia de documentos):
+   - **Mínimo obligatorio**: `GET /capabilities` del gateway y verificar que `chains[].key` incluye
+     `solana-devnet`. Si no está, el adapter Solana está apagado (`SOLANA_ADAPTER_ENABLED`, **default
+     OFF**) y el leg downstream de los 2 agentes `*-solana` se saltea con `CHAIN_NOT_SUPPORTED`: cobran
+     **$0**, con manifiesto `200` y todo.
+   - **Ideal**: una invocación real en devnet contra cada slug `*-solana` y confirmar en el resultado /
+     los logs del gateway que el leg **settleó** (ninguno de los skip-codes `NO_PAYMENT_FIELD`,
+     `METHOD_NOT_SUPPORTED`, `CHAIN_NOT_SUPPORTED`, `INVALID_PAY_TO_FORMAT`).
+   > **Un `200` del manifiesto NO implica que el rail esté prendido.** El manifiesto declara *dónde*
+   > cobra el agente; que el gateway *pueda* pagarle ahí es configuración del gateway, no de este repo.
+6. ⚠️ **Deslistar los gemelos Fuji (`remit-corridor-fx`, `remit-cashout-payout`) SÓLO DESPUÉS de que el
+   paso 5 haya dado prueba positiva de cobro** (los pasos 2 y 3 no alcanzan: los dos dan verde sin haber
+   tocado nunca el rail). Hacerlo antes deja a FX y payout **sin ninguna ruta de cobro**. El deslistado
+   es reversible; quedarse sin ruta de cobro no es gratis.
 
 ### Correr local
 

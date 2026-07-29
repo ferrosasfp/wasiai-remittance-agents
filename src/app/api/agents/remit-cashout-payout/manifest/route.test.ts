@@ -153,4 +153,33 @@ describe("GET manifest — fail-closed", () => {
     expect(res.status).toBe(503);
     expect(JSON.stringify(await res.json())).not.toContain("DEADBEEF");
   });
+
+  // FIX-PACK CR-MNR-1 — la rama catch (route.ts:31-40) no la ejercitaba nadie.
+  it("si buildManifest LANZA: 503 sin payment (no un 200 a medias, no un 500)", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.stubEnv(PAYOUT_ENV, SOL_OK); // env PERFECTA: el 503 sale del catch, no del fail-closed
+    vi.resetModules();
+    vi.doMock("@/manifest/build", () => ({
+      buildManifest: () => {
+        throw new Error("boom-interno-del-manifiesto");
+      },
+    }));
+    try {
+      const { GET: GET_throwing } = await import("./route");
+      const res = await GET_throwing(new NextRequest(ENDPOINT));
+      expect(res.status).toBe(503);
+      expect(res.headers.get("cache-control")).toBe("no-store");
+      const body = await res.json();
+      expect("payment" in body).toBe(false);
+      expect(body.error).toBe("manifest_unavailable");
+      expect(body.missing).toEqual([]);
+      expect(body.invalid).toEqual([]);
+      const logged = JSON.stringify(warn.mock.calls);
+      expect(logged).not.toContain("boom-interno-del-manifiesto");
+      expect(logged).not.toContain(SOL_OK);
+    } finally {
+      vi.doUnmock("@/manifest/build");
+      vi.resetModules();
+    }
+  });
 });
