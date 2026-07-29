@@ -562,6 +562,64 @@ describe("FX mid — cascada, guards y fail-closed", () => {
     expect(q.quoteId).toMatch(/^fxmid-/);
   });
 
+  // ── El spread: la otra puerta por la que salía el MISMO error que la HU vino a cerrar ──────
+  // Los tres valores de abajo se MIDIERON contra un mid de mercado de 3.40 antes del arreglo, con
+  // el código sin mutar: los tres emitían HTTP 200 etiquetado `fx-mid-live`. Ahora los tres cortan.
+  it("spread absurdo ⇒ NO se emite cotización (los tres valores medidos, con el feed sano y en banda)", async () => {
+    const casos: { bps: string; emitiaAntes: string; error: RegExp }[] = [
+      // +10.0% sobre el mercado: numéricamente el mismo incidente que la constante 3.75
+      { bps: "-1000", emitiaAntes: "3.74", error: /fx_mid_config_invalid:FALLBACK_FX_SPREAD_BPS/ },
+      // el doble del mercado
+      { bps: "-10000", emitiaAntes: "6.8", error: /fx_mid_config_invalid:FALLBACK_FX_SPREAD_BPS/ },
+      // 0.14 PEN por 400 dólares — pasa el rango de config, lo ataja la banda sobre la tasa EMITIDA
+      { bps: "9999", emitiaAntes: "0.00034", error: /fx_rate_out_of_band/ },
+    ];
+    for (const c of casos) {
+      const mod = await freshFx();
+      vi.stubEnv("FALLBACK_FX_SPREAD_BPS", c.bps);
+      stubFetchOk(erBody(3.4)); // feed sano: en banda, fresco, shape válido
+      await expect(quoteWith(mod), `bps=${c.bps} (antes emitía ${c.emitiaAntes})`).rejects.toThrow(
+        c.error,
+      );
+    }
+  });
+
+  // La banda valida el MID (fx.ts, guard G4). Esto valida lo que SALE, que es lo que el usuario
+  // recibe: un spread grande-pero-válido por rango puede dejar la tasa emitida bajo el piso.
+  it("la tasa EMITIDA pasa por la banda, no sólo el mid que entró", async () => {
+    const mod = await freshFx();
+    vi.stubEnv("FALLBACK_FX_SPREAD_BPS", "3000"); // 30%: 3.40 → 2.38, bajo el piso de 2.5
+    stubFetchOk(erBody(3.4));
+    await expect(quoteWith(mod)).rejects.toThrow(/fx_rate_out_of_band/);
+  });
+
+  it("un fee fijo negativo ⇒ no cotiza (entregaría de más)", async () => {
+    const mod = await freshFx();
+    vi.stubEnv("FALLBACK_FX_FLAT_FEE_USD", "-5");
+    stubFetchOk(erBody(3.4));
+    await expect(quoteWith(mod)).rejects.toThrow(
+      /fx_mid_config_invalid:FALLBACK_FX_FLAT_FEE_USD/,
+    );
+  });
+
+  // AC-9/DT-8 extremo a extremo: el mutante que congela la lectura al importar muere acá.
+  it("AC-9: rotar el spread cambia la tasa SIN reimportar el módulo (no se lee al importar)", async () => {
+    const mod = await freshFx();
+    vi.stubEnv("FX_MID_SOURCES", "er-api");
+    vi.stubEnv("FX_RATE_CACHE_TTL_MS", "0"); // sin caché: cada quote re-resuelve
+    stubFetchOk(erBody(3.4));
+
+    vi.stubEnv("FALLBACK_FX_SPREAD_BPS", "0");
+    const sinSpread = await quoteWith(mod);
+    expect(sinSpread.rate).toBe(3.4);
+
+    // MISMA instancia del módulo: si el spread se leyera al importar, esto seguiría dando 3.4
+    vi.stubEnv("FALLBACK_FX_SPREAD_BPS", "1000"); // 10%
+    const conSpread = await quoteWith(mod);
+    expect(conSpread.rate).toBe(3.06);
+    expect(conSpread.rate).toBeLessThan(sinSpread.rate);
+  });
+
   it("feed con las ~160 monedas extra → sigue leyendo PEN (passthrough)", async () => {
     const mod = await freshFx();
     stubFetchOk({

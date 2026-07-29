@@ -147,10 +147,12 @@ Env vars (ver §Env vars del deploy). El `agent_url` a registrar es
 
 Env vars relevantes de etapa 1:
 ```
-FALLBACK_FX_SPREAD_BPS=250        # spread declarado (bps). Si se omite, el código usa 250.
-FALLBACK_FX_FLAT_FEE_USD=0.5      # fee flat USD. Si se omite, el código usa 0.5.
 # NO setear en etapa 1: TRANSFI_API_KEY, TRANSFI_ADAPTER_READY (TransFi es etapa 2).
 ```
+El spread y el fee fijo (`FALLBACK_FX_SPREAD_BPS`, `FALLBACK_FX_FLAT_FEE_USD`) se documentan abajo,
+junto al resto de la config del FX mid: son parte del **mismo** mecanismo (call-time + validación de
+rango), no un bloque aparte. Estaban acá, tres líneas arriba de la promesa de "se leen en cada
+cotización", cuando en realidad se leían **al importar** y sin validar.
 
 ⚠️ **`STATIC_USD_PEN` es OBSOLETA y NO TIENE EFECTO.** Ya no se lee en ningún lado del código. Era la
 constante de respaldo (3.75) que cotizaba +10.2% sobre el mercado real; setearla hoy no mueve ninguna
@@ -169,7 +171,16 @@ FX_RATE_CACHE_TTL_MS=300000          # 5 min de caché en memoria (0 la deshabil
 FX_MID_MAX_AGE_MS=172800000          # 48 h: edad máxima del DATO según la fuente
 FX_MID_MIN_USD_PEN=2.50              # banda de plausibilidad, piso
 FX_MID_MAX_USD_PEN=5.00              # banda de plausibilidad, techo
+FALLBACK_FX_SPREAD_BPS=250           # spread declarado (bps). Rango válido: [0, 10000)
+FALLBACK_FX_FLAT_FEE_USD=0.5         # fee flat USD. Rango válido: >= 0
 ```
+
+⚠️ El **spread** y el **fee** también son guards de dinero, no preferencias: la tasa que recibe el
+usuario es `mid * (1 - spread/10000)`, y la banda valida el **mid**, no la tasa emitida. Un spread
+negativo cotiza **por encima del mercado** — medido contra un mid de 3.40, `-1000` bps emitía 3.74
+(+10.0%), que es el mismo error de la constante 3.75 que esta HU vino a matar, por otra puerta. Por
+eso hoy están validados por rango y la **tasa emitida** pasa también por la banda
+(`fx_rate_out_of_band`).
 
 Cada default **afirma algo sobre el mundo externo** (evidencia medida el 2026-07-29): las dos fuentes
 están vivas y publican USD/PEN con fecha; el feed promete ciclo de ~24 h, así que 48 h tolera **un**

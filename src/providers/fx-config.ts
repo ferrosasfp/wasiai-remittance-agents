@@ -46,6 +46,10 @@ export interface FxConfig {
   readonly maxAgeMs: number;
   readonly minRate: number;
   readonly maxRate: number;
+  /** Spread en bps contra el cliente. Validado: la tasa emitida se deriva de él. */
+  readonly spreadBps: number;
+  /** Fee fijo en USD que se descuenta del monto antes de convertir. */
+  readonly flatFeeUsd: number;
 }
 
 /** Monto que la fuente puede mandar como number o como string numérico. */
@@ -136,6 +140,8 @@ const DEFAULT_MAX_AGE_MS = 172800000; // 48 h — el feed promete ciclo ~24 h: t
 const DEFAULT_MIN_USD_PEN = 2.5; // mercado 3.40 → banda ≈ −27%
 const DEFAULT_MAX_USD_PEN = 5.0; // mercado 3.40 → banda ≈ +47%; ataja un cero, un orden de magnitud
 //                                  o la tasa de OTRA moneda (PYG ≈ 7300, EUR ≈ 0.92)
+const DEFAULT_SPREAD_BPS = 250; // 2.5% — conservador y declarado
+const DEFAULT_FLAT_FEE_USD = 0.5;
 
 function invalid(field: string): Error {
   return new Error(`fx_mid_config_invalid:${field}`);
@@ -175,6 +181,22 @@ export function resolveFxConfig(): FxConfig {
   // `max <= min` es una banda vacía: ninguna tasa la satisface y toda cotización fallaría.
   if (maxRate <= minRate) throw invalid("FX_MID_MAX_USD_PEN");
 
+  // El spread y el fee fijo son los DOS números que multiplican y restan la plata prometida:
+  // `effRate = mid * (1 - spreadBps/10000)`. La banda de plausibilidad valida el MID, no la tasa
+  // EMITIDA, y `assertValidQuote` sólo exige finito y > 0 — así que sin esta validación un valor
+  // finito pero absurdo produce una tasa que nadie verificó, con etiqueta `fx-mid-live` y HTTP 200.
+  // Medido contra un mid de mercado de 3.40 antes de este arreglo: −1000 bps emitía 3.74 (+10.0%,
+  // NUMÉRICAMENTE EL MISMO INCIDENTE que originó la HU, por otra puerta), −10000 emitía 6.8 (el
+  // doble), y 9999 emitía 0.00034 (0.14 PEN por 400 dólares). Sólo el no-numérico se atajaba.
+  const spreadBps = readNumericEnv("FALLBACK_FX_SPREAD_BPS", DEFAULT_SPREAD_BPS);
+  // Negativo = pagar MÁS que el mercado (regalar plata que alguien tiene que poner).
+  // >= 10000 = anular la tasa (o invertirla): el cliente recibe ~nada.
+  if (!(spreadBps >= 0 && spreadBps < 10000)) throw invalid("FALLBACK_FX_SPREAD_BPS");
+
+  // Un fee negativo le SUMA al monto convertido (entrega de más); no tiene lectura legítima.
+  const flatFeeUsd = readNumericEnv("FALLBACK_FX_FLAT_FEE_USD", DEFAULT_FLAT_FEE_USD);
+  if (flatFeeUsd < 0) throw invalid("FALLBACK_FX_FLAT_FEE_USD");
+
   const rawSources = process.env.FX_MID_SOURCES;
   const idList = (rawSources === undefined || rawSources.trim() === "" ? DEFAULT_SOURCES : rawSources)
     .split(",")
@@ -192,5 +214,5 @@ export function resolveFxConfig(): FxConfig {
     return { id: source.id, url, parse: source.parse };
   });
 
-  return { sources, cacheTtlMs, maxAgeMs, minRate, maxRate };
+  return { sources, cacheTtlMs, maxAgeMs, minRate, maxRate, spreadBps, flatFeeUsd };
 }

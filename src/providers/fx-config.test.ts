@@ -11,6 +11,8 @@ const MANAGED_ENVS = [
   "FX_MID_MAX_AGE_MS",
   "FX_MID_MIN_USD_PEN",
   "FX_MID_MAX_USD_PEN",
+  "FALLBACK_FX_SPREAD_BPS",
+  "FALLBACK_FX_FLAT_FEE_USD",
 ] as const;
 
 let envSnapshot: Record<string, string | undefined> = {};
@@ -33,12 +35,14 @@ afterEach(() => {
 
 // T19 — SDD §4.3
 describe("resolveFxConfig — defaults (cada uno afirma algo sobre el mundo externo)", () => {
-  it("sin ninguna env, los 6 defaults son exactamente los declarados", () => {
+  it("sin ninguna env, los defaults son exactamente los declarados", () => {
     const config = resolveFxConfig();
     expect(config.cacheTtlMs).toBe(300000); // 5 min
     expect(config.maxAgeMs).toBe(172800000); // 48 h
     expect(config.minRate).toBe(2.5);
     expect(config.maxRate).toBe(5.0);
+    expect(config.spreadBps).toBe(250); // 2.5%
+    expect(config.flatFeeUsd).toBe(0.5);
     expect(config.sources.map((s) => s.id)).toEqual(["er-api", "currency-api"]);
     expect(config.sources.map((s) => s.url)).toEqual([
       "https://open.er-api.com/v6/latest/USD",
@@ -55,6 +59,64 @@ describe("resolveFxConfig — defaults (cada uno afirma algo sobre el mundo exte
     expect(37.5).toBeGreaterThan(maxRate); // un orden de magnitud
     expect(7300).toBeGreaterThan(maxRate); // la tasa de OTRA moneda (PYG)
     expect(0.92).toBeLessThan(minRate); // EUR
+  });
+});
+
+// El spread y el fee fijo son los dos números que MULTIPLICAN y RESTAN la plata prometida
+// (`effRate = mid * (1 - spreadBps/10000)`). Vivían fuera de la validación: leídos al importar y
+// con `Number(...)` pelado. Los valores de abajo NO son hipotéticos: se midieron contra un mid de
+// mercado de 3.40 antes del arreglo, y son los que emitía el agente con HTTP 200 y `fx-mid-live`.
+describe("resolveFxConfig — spread y fee fijo: validados como los otros guards", () => {
+  it("un spread NEGATIVO es config inválida (emitía 3.74 sobre un mid de 3.40: +10%, el bug original)", () => {
+    setEnv("FALLBACK_FX_SPREAD_BPS", "-1000");
+    expect(() => resolveFxConfig()).toThrow(/fx_mid_config_invalid:FALLBACK_FX_SPREAD_BPS/);
+    // el doble del mercado
+    setEnv("FALLBACK_FX_SPREAD_BPS", "-10000");
+    expect(() => resolveFxConfig()).toThrow(/fx_mid_config_invalid:FALLBACK_FX_SPREAD_BPS/);
+  });
+
+  it("un spread >= 10000 bps es config inválida (emitía 0.00034: 0.14 PEN por 400 dólares)", () => {
+    for (const bad of ["9999", "10000", "20000"]) {
+      setEnv("FALLBACK_FX_SPREAD_BPS", bad);
+      if (bad === "9999") {
+        // 9999 es "válido" por rango pero deja la tasa muy por debajo del piso: lo ataja la banda
+        // sobre la tasa EMITIDA (ver fx.test.ts), no esta validación. Acá sólo se fija el límite.
+        expect(resolveFxConfig().spreadBps).toBe(9999);
+        continue;
+      }
+      expect(() => resolveFxConfig()).toThrow(/fx_mid_config_invalid:FALLBACK_FX_SPREAD_BPS/);
+    }
+  });
+
+  it("un spread no numérico sigue siendo config inválida (no NaN silencioso)", () => {
+    setEnv("FALLBACK_FX_SPREAD_BPS", "abc");
+    expect(() => resolveFxConfig()).toThrow(/fx_mid_config_invalid:FALLBACK_FX_SPREAD_BPS/);
+  });
+
+  it("un fee fijo NEGATIVO es config inválida (le sumaría al monto convertido)", () => {
+    setEnv("FALLBACK_FX_FLAT_FEE_USD", "-5");
+    expect(() => resolveFxConfig()).toThrow(/fx_mid_config_invalid:FALLBACK_FX_FLAT_FEE_USD/);
+    setEnv("FALLBACK_FX_FLAT_FEE_USD", "abc");
+    expect(() => resolveFxConfig()).toThrow(/fx_mid_config_invalid:FALLBACK_FX_FLAT_FEE_USD/);
+  });
+
+  it("los valores válidos pasan (0 bps y fee 0 son legítimos)", () => {
+    setEnv("FALLBACK_FX_SPREAD_BPS", "0");
+    setEnv("FALLBACK_FX_FLAT_FEE_USD", "0");
+    const config = resolveFxConfig();
+    expect(config.spreadBps).toBe(0);
+    expect(config.flatFeeUsd).toBe(0);
+  });
+
+  // AC-9/DT-8: el motivo por el que estas dos tienen que vivir acá y no en el scope del módulo.
+  // Leídas al importar, rotarlas no surte efecto hasta redeployar — y el README promete lo contrario.
+  it("AC-9: se leen en CADA llamada, no una vez (rotarlas surte efecto sin reimportar)", () => {
+    setEnv("FALLBACK_FX_SPREAD_BPS", "100");
+    expect(resolveFxConfig().spreadBps).toBe(100);
+    setEnv("FALLBACK_FX_SPREAD_BPS", "300");
+    expect(resolveFxConfig().spreadBps).toBe(300); // misma instancia del módulo, valor nuevo
+    setEnv("FALLBACK_FX_FLAT_FEE_USD", "1.25");
+    expect(resolveFxConfig().flatFeeUsd).toBe(1.25);
   });
 });
 

@@ -16,7 +16,7 @@
 // tasa: es un límite, y vive en `fx-config.ts`.
 
 import { z } from "zod";
-import { resolveFxConfig } from "./fx-config";
+import { type FxConfig, resolveFxConfig } from "./fx-config";
 import { resolveTransFiBaseUrl, type TransFiBaseUrl } from "./transfi-env";
 import type { FxProvenance, FxQuote, FxQuoteInput, FxQuoteProvider } from "./types";
 
@@ -26,9 +26,13 @@ import type { FxProvenance, FxQuote, FxQuoteInput, FxQuoteProvider } from "./typ
 // El host llega ahora inyectado como `TransFiBaseUrl` (branded) desde `transfi-env.ts`, que es la
 // única fuente de verdad. Volver a poner un default local acá no compila como argumento del
 // adapter y además pone en rojo `transfi-env.test.ts` (test estructural).
-// spread del fallback (bps) — conservador, declarado. TransFi reemplaza esto con su tasa real.
-const FALLBACK_SPREAD_BPS = Number(process.env.FALLBACK_FX_SPREAD_BPS ?? 250); // 2.5%
-const FALLBACK_FLAT_FEE_USD = Number(process.env.FALLBACK_FX_FLAT_FEE_USD ?? 0.5);
+// 🔴 ACÁ VIVÍAN `FALLBACK_SPREAD_BPS` y `FALLBACK_FLAT_FEE_USD`, leídos AL IMPORTAR y SIN validar.
+// Se mudaron a `resolveFxConfig()` (call-time + rango), que es donde ya viven los otros cinco guards.
+// Por qué importaba: la tasa que se emite es `mid * (1 - spread/10000)`, y la banda de plausibilidad
+// valida el MID, no la tasa emitida. Un spread finito pero absurdo se colaba entero: −1000 bps sobre
+// un mid de 3.40 emitía 3.74 (+10.0%), que es NUMÉRICAMENTE EL MISMO ERROR que la constante 3.75 que
+// esta HU vino a matar — con etiqueta `fx-mid-live` y HTTP 200. Además, leerlas al importar hacía que
+// rotarlas no surtiera efecto hasta redeployar, justo lo que AC-9/DT-8 prohíben.
 
 // ── Shape de las respuestas EXTERNAS ─────────────────────────────────────────
 // Reemplazan al cast crudo sin validar que había sobre `res.json()`. Dos reglas:
@@ -125,15 +129,25 @@ export class TransFiFxProvider implements FxQuoteProvider {
  */
 export class LiveMidFxProvider implements FxQuoteProvider {
   async quote(input: FxQuoteInput): Promise<FxQuote> {
-    const mid = await getUsdToPenMid(); // tasa real USD→PEN, o LANZA (fail-closed)
-    const effRate = mid.rate * (1 - FALLBACK_SPREAD_BPS / 10000); // spread en contra del cliente
-    const netUsd = Math.max(0, input.amountUsd - FALLBACK_FLAT_FEE_USD);
+    // UNA sola lectura de config por cotización (AC-9): el mid y el precio tienen que salir de la
+    // MISMA config. Dos lecturas podrían leer una env a medio rotar y mezclar dos configuraciones.
+    const config = resolveFxConfig();
+    const mid = await getUsdToPenMid(config); // tasa real USD→PEN, o LANZA (fail-closed)
+    const effRate = mid.rate * (1 - config.spreadBps / 10000); // spread en contra del cliente
+    const netUsd = Math.max(0, input.amountUsd - config.flatFeeUsd);
     const netDeliveredLocal = Number((netUsd * effRate).toFixed(2));
+    // La tasa EMITIDA pasa por la misma banda que el mid. El mid ya está en banda y el spread está
+    // acotado a [0, 10000), así que esto sólo puede dispararse con un spread grande-pero-válido
+    // (p.ej. 3000 bps sobre 3.40 ⇒ 2.38, por debajo del piso): lo que sale al usuario se verifica,
+    // no sólo lo que entró. La banda es un límite, NUNCA una tasa de reemplazo (no hay clamp acá).
+    if (effRate < config.minRate || effRate > config.maxRate) {
+      throw new Error(`fx_rate_out_of_band:${effRate.toFixed(6)}`);
+    }
     // MNR-1 (re-AR): el fallback también pasa por el guard — un env misconfig
-    // (FALLBACK_FX_* no numérico) NO debe emitir una cotización con NaN.
+    // NO debe emitir una cotización con NaN.
     return assertValidQuote({
       rate: Number(effRate.toFixed(6)),
-      feeUsd: FALLBACK_FLAT_FEE_USD,
+      feeUsd: config.flatFeeUsd,
       netDeliveredLocal,
       localCurrency: "PEN",
       etaMinutes: 30,
@@ -183,10 +197,10 @@ function rejectSource(sourceId: string, code: string): void {
  * que nadie puede respaldar en el momento de usarlo. Al vencer se re-fetchea; si el fetch falla,
  * se falla.
  */
-async function getUsdToPenMid(): Promise<MidRate> {
-  // Config CALL-TIME (AC-9): rotar una env surte efecto en la próxima cotización, sin redeploy.
-  // Si la config es inválida esto LANZA — nunca se cotiza con un guard desactivado.
-  const config = resolveFxConfig();
+async function getUsdToPenMid(config: FxConfig): Promise<MidRate> {
+  // La config llega YA resuelta por el caller (call-time, AC-9): rotar una env surte efecto en la
+  // próxima cotización, sin redeploy. Si es inválida, `resolveFxConfig()` ya lanzó antes de llegar
+  // acá — nunca se cotiza con un guard desactivado.
 
   // (1) Caché fresca en los DOS ejes: TTL de la caché y edad del dato. El TTL no revive un dato
   // viejo: una tasa traída hace 1 minuto pero con fecha de hace 5 días sigue siendo vieja.
