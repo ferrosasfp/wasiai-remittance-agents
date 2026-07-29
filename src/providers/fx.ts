@@ -387,7 +387,21 @@ export function assertValidQuote(q: FxQuote): FxQuote {
   const finitePos = (n: number) => Number.isFinite(n) && n > 0;
   const finiteNonNeg = (n: number) => Number.isFinite(n) && n >= 0;
   if (!finitePos(q.rate)) throw new Error(`invalid_quote_rate:${q.rate}`);
-  if (!finiteNonNeg(q.netDeliveredLocal)) throw new Error(`invalid_quote_net:${q.netDeliveredLocal}`);
+  // WKH-314 (AR) — LO QUE RECIBE EL BENEFICIARIO TAMBIÉN TIENE QUE SER > 0, igual que la tasa.
+  //
+  // Esta línea pedía `>= 0` mientras la de arriba pedía `> 0`: se exigía que el tipo de cambio
+  // fuera positivo y NO que llegara algo a destino. El mínimo enviable y su atadura con la
+  // comisión acotan la PROPORCIÓN, no el monto entregado, así que un par de configuración
+  // válido seguía produciendo un cero:
+  //
+  //     FX_MIN_SEND_USD=0.001 · FALLBACK_FX_FLAT_FEE_USD=0.0002   (exactamente el 20%: la
+  //     atadura ACEPTA) · envío 0.001 (≥ el mínimo: el guard ACEPTA) ⇒ entregado 0.
+  //
+  // Con `finitePos` acá, "una cotización que entrega cero no es válida" pasa a ser cierto SEA
+  // CUAL SEA la configuración, que es lo que el docstring de `MAX_FEE_SHARE_AT_MINIMUM` afirma.
+  // Este guard es además el único punto por el que pasan LOS DOS proveedores.
+  if (!finitePos(q.netDeliveredLocal)) throw new Error(`invalid_quote_net:${q.netDeliveredLocal}`);
+  // El fee SÍ puede ser 0 (una remesa sin comisión es legítima); `finiteNonNeg` es correcto acá.
   if (!finiteNonNeg(q.feeUsd)) throw new Error(`invalid_quote_fee:${q.feeUsd}`);
   if (!q.quoteId) throw new Error("invalid_quote_id");
   return q;

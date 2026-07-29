@@ -73,6 +73,17 @@ describe("assertValidQuote (BLQ-MED-2: no NaN en montos)", () => {
   it("lanza si quoteId vacío", () => {
     expect(() => assertValidQuote({ ...goodQuote, quoteId: "" })).toThrow(/invalid_quote_id/);
   });
+
+  // WKH-314 (AR) — la asimetría que quedaba: se exigía tasa > 0 pero entregado >= 0.
+  it("T-314-FP1-a: lanza si netDeliveredLocal = 0 (una cotización que no entrega nada no es válida)", () => {
+    expect(() => assertValidQuote({ ...goodQuote, netDeliveredLocal: 0 })).toThrow(
+      /invalid_quote_net/,
+    );
+  });
+
+  it("T-314-FP1-b: el fee SÍ puede ser 0 — una remesa sin comisión es legítima", () => {
+    expect(assertValidQuote({ ...goodQuote, feeUsd: 0 })).toBeTruthy();
+  });
 });
 
 describe("LiveMidFxProvider (FX mid real + spread en contra del cliente)", () => {
@@ -861,6 +872,32 @@ describe("FX mid — cascada, guards y fail-closed", () => {
     expect(peorCasoAceptado).toBeLessThanOrEqual(0.2);
     // Y el caso histórico concreto queda del lado prohibido: 0.50 sobre 0.60 es el 83%.
     expect(0.5 / 0.6).toBeGreaterThan(0.2);
+  });
+
+  // ── AR de WKH-314: la atadura acota la PROPORCIÓN, no el monto entregado ──────────────
+  // Este par de configuración pasa TODOS los guards de arriba: el mínimo es > 0, la comisión es
+  // exactamente el 20% del mínimo (la atadura acepta, está justo en el techo) y el envío iguala
+  // al mínimo (el guard acepta). Y aun así entregaba CERO — no porque `netUsd` sea cero (es
+  // 0.0008), sino porque 0.0026 soles REDONDEAN a 0.00 al pasar a céntimos. La plata se perdía
+  // en el redondeo, con todos los controles en verde.
+  //
+  // Lo ataja el guard de salida pidiendo entregado > 0, que es la mitad que faltaba: se exigía
+  // que la TASA fuera positiva y no que llegara algo a destino.
+  it("T-314-FP1-c: un par de config válido con envío en el mínimo ya no puede entregar cero", async () => {
+    const mod = await freshFx();
+    stubFetchOk(erBody(3.4));
+    vi.stubEnv("FX_MIN_SEND_USD", "0.001");
+    vi.stubEnv("FALLBACK_FX_FLAT_FEE_USD", "0.0002"); // exactamente el 20%: la atadura ACEPTA
+
+    // Efecto primero: no sale ninguna cotización.
+    const resultado = await quoteAmount(mod, 0.001).then(
+      (q) => q,
+      (e: unknown) => e,
+    );
+    expect(resultado, "no puede emitirse una cotización que entrega cero").toBeInstanceOf(Error);
+    // Y el rechazo NO viene del mínimo ni de la atadura (los dos aceptan esta config): viene del
+    // guard de salida. Si viniera de otro lado, este caso no estaría realmente cubierto.
+    expect((resultado as Error).message).toMatch(/^invalid_quote_net:/);
   });
 
   it("T-314-8: el mínimo se rota por env sin reimportar el módulo (call-time, como el resto)", async () => {
