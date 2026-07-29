@@ -460,12 +460,21 @@ describe("FX mid — cascada, guards y fail-closed", () => {
     await expect(quoteWith(mod)).rejects.toThrow(/fx_mid_unavailable/);
   });
 
-  // M9 lo mata acá: `pen > 0` ⇒ `pen >= 0` dejaría pasar el 0
-  it("T12c: una tasa 0 no pasa el guard de usabilidad", async () => {
+  // T12c: una tasa 0 la rechazan DOS guards distintos, y cuál de los dos actúa importa.
+  // El efecto de dinero es el mismo (no se cotiza) porque la banda también ataja el 0 — por eso
+  // afirmar sólo "rejects" acá NO distingue `pen > 0` de `pen >= 0`. Lo que sí distingue es el
+  // CÓDIGO: "la fuente nos dio un cero" y "la fuente está fuera de banda" son diagnósticos
+  // distintos, y es lo que lee el operador para saber qué se rompió.
+  it("T12c: una tasa 0 se rechaza como NO USABLE (no como fuera de banda) y no cotiza", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const mod = await freshFx();
     vi.stubEnv("FX_MID_SOURCES", "er-api");
     stubFetchOk(erBody(0));
     await expect(quoteWith(mod)).rejects.toThrow(/fx_mid_unavailable/);
+    expect(warn).toHaveBeenCalledWith("[remit-fx] fx_mid_source_rejected", {
+      sourceId: "er-api",
+      code: "fx_mid_no_usable_pen_rate",
+    });
   });
 
   // T13 — AC-6: el límite es EL que decide
