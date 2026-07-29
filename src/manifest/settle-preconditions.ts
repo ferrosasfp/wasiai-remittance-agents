@@ -57,10 +57,18 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 /**
  * Reproduce, EN ESTE ORDEN, la secuencia de guardas del gateway. El orden ES el contrato: un
  * `payment` puede violar dos reglas a la vez y el skip-code que se emite es el de la primera.
+ *
+ * `initializedChains` es OBLIGATORIO (fix-pack AR MNR-6). Tuvo un default (`PROD_INITIALIZED_CHAINS`)
+ * y se lo sacamos: un default es una afirmación sobre la config de OTRO repo, escondida en la firma,
+ * que ningún test podía fijar (el test de la constante afirma su CONTENIDO, no que el default SEA la
+ * constante — cambiar el default dejaba los 158 en verde). Sin default, la clase entera desaparece:
+ * el compilador obliga a que cada llamada NOMBRE la configuración bajo la cual afirma "cobra". Es la
+ * misma lección de BLQ-1, aplicada a la firma. NO reponer el default: `evaluateSettle.length === 2`
+ * está fijado en un test justamente para que reponerlo se ponga rojo.
  */
 export function evaluateSettle(
   payment: unknown,
-  initializedChains: readonly string[] = PROD_INITIALIZED_CHAINS,
+  initializedChains: readonly string[],
 ): SettleVerdict {
   // (1) El lector de specs devolvería `undefined` y el leg vería `agent.payment` ausente.
   const spec = asRecord(payment);
@@ -81,6 +89,13 @@ export function evaluateSettle(
   //      Mismo skip-code, causa distinta: el rail existe en el código pero está APAGADO en
   //      este entorno. Borrar esta condición hace que el oráculo afirme que los agentes
   //      Solana cobran en entornos donde no cobran (BLQ-1 del AR).
+  //      SU POSICIÓN ES PARTE DEL CONTRATO (fix-pack AR MNR-7): va ANTES de los chequeos de
+  //      formato porque en el gateway las dos condiciones de chain viven en el MISMO `if`
+  //      (`downstream-payment.ts:532-546`), que corta antes de `validatePayTo` /
+  //      `isValidSolanaAddress` (`:218-231`, `:255-262`). Moverla abajo no cambia la plata (en los
+  //      dos casos no cobra) pero sí el DIAGNÓSTICO: un payment con chain apagada Y payTo malo
+  //      reportaría INVALID_PAY_TO_FORMAT mientras el gateway reporta CHAIN_NOT_SUPPORTED, y el
+  //      operador iría a arreglar la address en vez de a prender el rail.
   if (!initializedChains.includes(chain)) return "CHAIN_NOT_SUPPORTED";
 
   // (4) EVM: formato primero, zero-address después.

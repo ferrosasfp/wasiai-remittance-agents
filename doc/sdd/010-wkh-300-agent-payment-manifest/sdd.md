@@ -354,10 +354,14 @@ Capabilities verificadas contra los registros originales:
   **Fix-pack AR BLQ-1** — la guarda de chain son **DOS** condiciones (`if (!chainKey || !bundle)`),
   no una: slug conocido por el resolver **Y** bundle inicializado en el registry. La 2ª es
   configuración del gateway (`SOLANA_ADAPTER_ENABLED`, **default OFF**), así que el oráculo la recibe
-  como parámetro explícito `initializedChains` (default = lo medido en prod el 2026-07-29 vía
-  `GET /capabilities`: `avalanche-fuji` + `solana-devnet`). Sin ese parámetro el oráculo afirmaba
-  "COBRARÍA" en entornos donde los 2 agentes Solana no cobran. Los tests fijan las dos caras: cobra
-  con la chain inicializada, `CHAIN_NOT_SUPPORTED` sin ella.
+  como parámetro **obligatorio** `initializedChains` — sin valor por defecto (fix-pack AR MNR-6: un
+  default es una afirmación sobre la config de otro repo escondida en la firma, y ningún test la
+  fijaba). Cada llamada nombra el rail bajo el que afirma; `PROD_INITIALIZED_CHAINS` queda exportada
+  como **la medición** (prod, 2026-07-29, `GET /capabilities`: `avalanche-fuji` + `solana-devnet`),
+  no como default. Sin esa condición el oráculo afirmaba "COBRARÍA" en entornos donde los 2 agentes
+  Solana no cobran. Los tests fijan las dos caras (cobra con la chain inicializada,
+  `CHAIN_NOT_SUPPORTED` sin ella), la **arity 2** (para que reponer el default se ponga rojo) y la
+  **posición** de la guarda (MNR-7: va antes de los chequeos de formato, como en el gateway).
   ⚠️ `readPaymentSpecAccepts` **no** recibe ese set a propósito: el lector real
   (`payment-spec-reader.ts`) sólo exige `normalizeChainSlug` — la inicialización la chequea el leg.
 
@@ -612,6 +616,23 @@ persistir**.
   daño a sí mismo), y un compromiso del deploy del agente permite rotar su propio payTo. La prueba de
   posesión (firma EIP-191 / ed25519 sobre un challenge con `slug`+`owner_ref`) es HU de seguimiento —
   se documenta, no se promete. (Mismo criterio de honestidad que WKH-204 §"Alcance real".)
+
+### 8.3b Residuo ASIGNADO: alerta por acumulación de `CHAIN_NOT_SUPPORTED` (HU de seguimiento en `wasiai-a2a`)
+
+**El residuo que deja BLQ-1/BLQ-2**: este repo puede publicar una ficha impecable (`200`) y aun así el
+agente cobrar $0, porque quien decide es la configuración del gateway (`SOLANA_ADAPTER_ENABLED` +
+`WASIAI_A2A_CHAINS`). El runbook (§10-5) lo verifica **en el momento de la activación**; nada avisa si
+el rail se apaga **después** (redeploy sin la env, CSV editado, rollback de config).
+
+**Dónde se detecta de verdad**: sólo en `wasiai-a2a`, y **el enganche ya existe** — el leg ya emite
+`code: 'CHAIN_NOT_SUPPORTED'` con `chain` y `initialized: getInitializedChainKeys()` en el log
+(`src/lib/downstream-payment.ts:535-543`). Falta convertir esa traza en señal: alertar cuando el
+skip-code se **acumula** para una `chain`/`agentSlug` (es un rail apagado, no un agent card raro), en
+la línea del trípode de observabilidad ya existente.
+
+**Estado: HU de seguimiento asignada** (la abre el coordinador en `wasiai-a2a`). Se registra acá para
+que el residuo deje de estar sólo "documentado y esperado" y pase a tener dueño; **no** es alcance de
+esta HU (este repo no puede observar el rail del consumidor).
 
 ### 8.4 Test espejo pedido a la HU hermana (anti-drift de DT-13)
 

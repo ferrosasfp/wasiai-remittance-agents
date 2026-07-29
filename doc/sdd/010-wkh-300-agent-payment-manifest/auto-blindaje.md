@@ -302,4 +302,52 @@
 
 ---
 
+### [2026-07-29 02:10] Fix-pack it2 — El default de un parámetro es una afirmación que nadie fija (MNR-6)
+
+- **Error**: al cerrar BLQ-1 dejé `initializedChains: readonly string[] = PROD_INITIALIZED_CHAINS`. El
+  test que agregué fija el **contenido de la constante**, nunca que el **default sea** esa constante:
+  cambiar el default (dejando la constante intacta) dejaba los 158 tests en verde. Es una miniatura
+  exacta del bloqueante que acababa de cerrar, movida de la guarda a la firma.
+
+- **Causa raíz**: pensé el default como "documentación ejecutable" de la config de prod. No lo es:
+  es un valor que se **usa** cuando nadie mira, y lo que no se nombra en la llamada no se verifica en
+  el test.
+
+- **Fix**: se eligió la salida ruidosa — **se eliminó el default** (parámetro obligatorio) y se
+  actualizaron los ~20 call-sites para que cada aserción nombre su rail. Fundamento: la otra opción
+  (una aserción "llamar sin el parámetro == llamar con la constante") deja la clase viva — protege
+  ESE default, no el próximo. Sin default, el compilador obliga a nombrar la config y la clase
+  desaparece. Se agregó igual una aserción matable: `expect(evaluateSettle.length).toBe(2)` (un
+  parámetro con default NO cuenta en `Function.length`), para que **reponer** el default se ponga
+  rojo. Mutante M9 (reponer default con una 3ª chain): **compila y muere** en esa aserción.
+
+- **Aplicar en**: todo parámetro cuyo valor sea una afirmación sobre un entorno externo (config de
+  otro repo, red, feature-flag). **Sin default**: que el call-site lo nombre. Y si por ergonomía hace
+  falta un default, el test tiene que compararlo con la llamada explícita, no describir la constante.
+
+---
+
+### [2026-07-29 02:25] Fix-pack it2 — "El orden ES el contrato" sin ningún test que lo fije (MNR-7)
+
+- **Error**: el módulo declara en su docstring que el orden de las guardas es el contrato, y mover la
+  guarda de inicialización **debajo** de los chequeos de formato dejaba los 158 en verde. No hay
+  diferencia de plata (no cobra en ninguno de los dos casos), pero sí de **diagnóstico**: un payment
+  con chain apagada Y payTo malo reportaría `INVALID_PAY_TO_FORMAT` mientras el gateway reporta
+  `CHAIN_NOT_SUPPORTED` — el operador iría a arreglar la address en vez de a prender el rail.
+
+- **Causa raíz**: los tests de orden que ya existían cubrían los pares viejos (method > chain, chain >
+  contract) y el par nuevo (**inicialización** > formato) nació sin test porque la guarda se agregó
+  después. Una propiedad afirmada en prosa no se hereda a las líneas nuevas.
+
+- **Fix**: aserción con las dos violaciones simultáneas en las 2 familias (+ controles con la chain
+  prendida, que sí reportan formato/zero). Mutante M8 (guarda 3b movida después de los chequeos de
+  formato): **compila y muere** exactamente ahí. Se documentó la posición en el código, con el
+  archivo:línea del gateway que la justifica.
+
+- **Aplicar en**: cuando un módulo declara una propiedad global ("el orden es el contrato",
+  "fail-closed", "sin I/O"), **cada línea nueva** que participa de esa propiedad necesita su propia
+  aserción. La declaración no cubre lo que se agregue después.
+
+---
+
 *Auto-Blindaje de F3 (Dev) — NexusAgil*
