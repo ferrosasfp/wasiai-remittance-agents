@@ -179,9 +179,49 @@ interface MidRate {
  */
 let cache: { rate: number; sourceId: string; dataAsOf: string; fetchedAt: number } | null = null;
 
-/** Edad del dato en ms, según la fecha que declara la fuente. */
-function ageOf(dataAsOf: string): number {
-  return Date.now() - Date.parse(dataAsOf);
+/**
+ * Edad del dato en ms, según la fecha que declara la fuente. `null` si la fecha no es parseable.
+ *
+ * Devolver `NaN` era peor que devolver un error: `NaN > maxAgeMs` es `false` (el guard de frescura
+ * ACEPTABA) y `NaN <= maxAgeMs` también es `false` (la caché RECHAZABA). El mismo dato roto movía
+ * los dos controles en direcciones opuestas, y el que fallaba abierto era el que emite la tasa.
+ * Con `null` el caller está OBLIGADO a decidir explícitamente, y las dos decisiones son rechazar.
+ */
+function ageOf(dataAsOf: string): number | null {
+  const parsed = Date.parse(dataAsOf);
+  if (!Number.isFinite(parsed)) return null;
+  return Date.now() - parsed;
+}
+
+/**
+ * Tolerancia de desfasaje de reloj entre nuestro server y la fuente. Una fecha levemente futura es
+ * skew normal; una fecha MUY futura desactiva el guard de frescura para siempre (edad negativa nunca
+ * supera el máximo), que es justo lo que el guard existe para atajar.
+ */
+const MAX_CLOCK_SKEW_MS = 120_000; // 2 min
+
+/**
+ * Veredicto de frescura del dato. Existe para que la caché y el guard G5 usen EXACTAMENTE el mismo
+ * criterio: antes cada uno escribía su propia comparación y con una fecha rota se movían en
+ * direcciones opuestas (la caché rechazaba, el guard aceptaba).
+ */
+export type FreshnessVerdict = "ok" | "unparseable" | "stale" | "future";
+
+/**
+ * Exportada para poder testearla DIRECTO, igual que `assertValidQuote` (mismo criterio en este
+ * archivo: los guards de dinero se testean como unidad, no sólo por su efecto). La rama
+ * `unparseable` es hoy inalcanzable desde afuera —los parsers de las fuentes validan la fecha antes
+ * de llegar acá— y precisamente por eso necesita un test directo: es la que fallaba ABIERTA.
+ */
+export function checkFreshness(dataAsOf: string, maxAgeMs: number): FreshnessVerdict {
+  const age = ageOf(dataAsOf);
+  if (age === null) return "unparseable";
+  if (age > maxAgeMs) return "stale";
+  // Fecha por delante de nuestro reloj más allá del skew tolerable: una fuente que sella hacia
+  // adelante tendría edad negativa PARA SIEMPRE, y una edad negativa nunca supera el máximo — el
+  // guard de frescura quedaría permanentemente desactivado para ella.
+  if (age < -MAX_CLOCK_SKEW_MS) return "future";
+  return "ok";
 }
 
 /** Warn value-free: SÓLO id de fuente + código. Nunca el body, la URL completa, ni datos del caller. */
@@ -207,7 +247,7 @@ async function getUsdToPenMid(config: FxConfig): Promise<MidRate> {
   if (
     cache !== null &&
     cache.fetchedAt + config.cacheTtlMs > Date.now() &&
-    ageOf(cache.dataAsOf) <= config.maxAgeMs
+    checkFreshness(cache.dataAsOf, config.maxAgeMs) === "ok"
   ) {
     return {
       rate: cache.rate,
@@ -257,8 +297,18 @@ async function getUsdToPenMid(config: FxConfig): Promise<MidRate> {
     }
 
     // G5 — frescura del DATO (no del HTTP): un 200 reciente con un JSON congelado no es "en vivo".
-    if (ageOf(parsed.dataAsOf) > config.maxAgeMs) {
-      rejectSource(source.id, "fx_mid_stale_data");
+    // Mira en las DOS direcciones: un dato viejo no sirve, y uno fechado en el futuro tampoco —
+    // ese desactivaría el guard de forma permanente para esa fuente (edad negativa < máximo).
+    const freshness = checkFreshness(parsed.dataAsOf, config.maxAgeMs);
+    if (freshness !== "ok") {
+      rejectSource(
+        source.id,
+        freshness === "stale"
+          ? "fx_mid_stale_data"
+          : freshness === "future"
+            ? "fx_mid_future_data"
+            : "fx_mid_bad_date",
+      );
       continue;
     }
 

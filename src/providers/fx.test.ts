@@ -3,6 +3,7 @@ import {
   LiveMidFxProvider,
   TransFiFxProvider,
   assertValidQuote,
+  checkFreshness,
   getFxQuoteProvider,
 } from "./fx";
 import { resolveTransFiBaseUrl, type TransFiBaseUrl } from "./transfi-env";
@@ -580,6 +581,52 @@ describe("FX mid — cascada, guards y fail-closed", () => {
     expect(q.rate).toBeGreaterThan(0);
     expect(q.netDeliveredLocal).toBeGreaterThan(0);
     expect(q.quoteId).toMatch(/^fxmid-/);
+  });
+
+  // ── El guard de frescura mira en las DOS direcciones ───────────────────────────────────────
+  // Una edad negativa nunca supera el máximo, así que una fuente que sella hacia ADELANTE tendría
+  // el guard de frescura desactivado de forma permanente — justo el escenario que el guard existe
+  // para atajar (un JSON congelado servido con 200 reciente). Y esa fecha futura viajaba al usuario
+  // en `rateAsOf`, que es el campo con el que se audita la cotización.
+  it("un feed fechado en el FUTURO se rechaza (fx_mid_future_data) y no cotiza", async () => {
+    const mod = await freshFx();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.stubEnv("FX_MID_SOURCES", "er-api");
+    stubFetchOk(erBody(3.4, -10 * 365 * 24 * 3600_000)); // ~2036
+    await expect(quoteWith(mod)).rejects.toThrow(/fx_mid_unavailable/);
+    expect(warn).toHaveBeenCalledWith("[remit-fx] fx_mid_source_rejected", {
+      sourceId: "er-api",
+      code: "fx_mid_future_data",
+    });
+  });
+
+  it("un skew de reloj chico (fecha 30 s adelantada) SÍ se tolera: no es una fuente que sella al futuro", async () => {
+    const mod = await freshFx();
+    vi.stubEnv("FX_MID_SOURCES", "er-api");
+    stubFetchOk(erBody(3.4, -30_000));
+    const q = await quoteWith(mod);
+    expect(q.provenance).toBe("fx-mid-live");
+  });
+
+  // La rama de la fecha impresentable NO es alcanzable desde afuera (los parsers de las fuentes
+  // validan la fecha antes, y la caché sólo se puebla con datos que ya pasaron G5), así que se
+  // testea el criterio DIRECTO. Es la rama que importa: con `NaN`, la misma expresión movía los dos
+  // controles en direcciones OPUESTAS — el guard de frescura ACEPTABA (`NaN > max` es false) y la
+  // caché RECHAZABA (`NaN <= max` es false). El que fallaba abierto era el que emite la tasa.
+  it("checkFreshness: una fecha impresentable NO es 'ok' (antes hacía que el guard aceptara)", () => {
+    const maxAge = 48 * 3600_000;
+    expect(checkFreshness("no-es-una-fecha", maxAge)).toBe("unparseable");
+    expect(checkFreshness("", maxAge)).toBe("unparseable");
+    // y las otras tres decisiones del mismo criterio, para que se lean juntas
+    expect(checkFreshness(new Date(Date.now() - 3600_000).toISOString(), maxAge)).toBe("ok");
+    expect(checkFreshness(new Date(Date.now() - 5 * 24 * 3600_000).toISOString(), maxAge)).toBe(
+      "stale",
+    );
+    expect(checkFreshness(new Date(Date.now() + 365 * 24 * 3600_000).toISOString(), maxAge)).toBe(
+      "future",
+    );
+    // el skew chico sigue siendo aceptable
+    expect(checkFreshness(new Date(Date.now() + 30_000).toISOString(), maxAge)).toBe("ok");
   });
 
   // ── El spread: la otra puerta por la que salía el MISMO error que la HU vino a cerrar ──────
