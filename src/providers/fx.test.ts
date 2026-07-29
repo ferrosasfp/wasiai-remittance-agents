@@ -97,6 +97,21 @@ describe("LiveMidFxProvider (FX mid real + spread en contra del cliente)", () =>
     expect(Number.isFinite(q.netDeliveredLocal)).toBe(true);
     expect(q.netDeliveredLocal).toBeGreaterThan(0);
   });
+
+  // CD-5: `MARKET_FX_PROVENANCES` es la ÚNICA fuente de "¿esta tasa es de mercado?". Todo lo demás
+  // la consulta con `.has(...)`, que prueba el CABLEADO pero no el CONTENIDO: agregando
+  // "local-fallback" al set, el tipo se amplía, compila limpio y la suite entera queda verde — la
+  // etiqueta que esta HU existe para retirar vuelve a la lista sin que nada se entere. Este assert
+  // fija el contenido exacto, que es la parte que ningún `.has()` puede defender.
+  it("CD-5: el contenido de MARKET_FX_PROVENANCES es exactamente el declarado (no sólo 'algo tiene')", () => {
+    expect([...MARKET_FX_PROVENANCES].sort()).toEqual([
+      "fx-mid-cached",
+      "fx-mid-live",
+      "transfi",
+    ]);
+    // La etiqueta retirada NO puede volver por acá: era la constante 3.75, +10.2% sobre el mercado.
+    expect([...MARKET_FX_PROVENANCES]).not.toContain("local-fallback");
+  });
 });
 
 describe("getFxQuoteProvider factory (MNR-2: readiness fail-loud)", () => {
