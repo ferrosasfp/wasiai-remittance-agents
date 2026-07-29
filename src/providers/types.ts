@@ -71,6 +71,30 @@ export interface KycProvider {
 }
 
 // ── FX / Corridor quote ──────────────────────────────────────────────────────
+
+/**
+ * Taxonomía CERRADA de procedencia de una cotización FX. Cada valor mapea 1:1 a un método
+ * auditable de obtención de la tasa:
+ *  · `transfi`       — tasa efectiva del corredor, del partner licenciado
+ *  · `fx-mid-live`   — mid de mercado traído EN VIVO de una fuente registrada
+ *  · `fx-mid-cached` — el mismo mid, servido de la caché en memoria dentro de su ventana de frescura
+ *
+ * `"local-fallback"` se RETIRÓ del agente FX (era la constante `STATIC_USD_PEN`, +10.2% sobre el
+ * mercado real): una constante del código y una tasa de mercado no pueden compartir etiqueta.
+ * Sigue vivo en `KycResult`/`PayoutResult`, que están fuera de este eje.
+ */
+export type FxProvenance = "transfi" | "fx-mid-live" | "fx-mid-cached";
+
+/**
+ * Única fuente de "¿esta tasa es de mercado?". Mismo patrón que `REAL_KYC_PROVENANCES`
+ * (`src/providers/kyc.ts:13`): allowlist exportada, prohibido duplicar el criterio en un call site.
+ */
+export const MARKET_FX_PROVENANCES: ReadonlySet<FxProvenance> = new Set<FxProvenance>([
+  "transfi",
+  "fx-mid-live",
+  "fx-mid-cached",
+]);
+
 export interface FxQuoteInput {
   amountUsd: number; // principal en USDC
   sourceAsset: "USDC";
@@ -87,7 +111,9 @@ export interface FxQuote {
   etaMinutes: number;
   quoteId: string; // referencia para ejecutar el payout con esta tasa
   expiresAt: string; // ISO — la tasa vence
-  provenance: Provenance;
+  provenance: FxProvenance;
+  rateSource: string; // id de la fuente registrada: "er-api" | "currency-api" | "transfi"
+  rateAsOf: string; // ISO — fecha del dato SEGÚN LA FUENTE, jamás el momento de servir
 }
 
 export interface FxQuoteProvider {
