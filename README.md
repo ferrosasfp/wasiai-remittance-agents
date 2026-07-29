@@ -65,14 +65,74 @@ El agente `remit-corridor-fx` ya es invocable vía Next.js App Router:
 POST /api/agents/remit-corridor-fx/invoke
 body: { "amountUsd": 100, "destCountry": "PE", "payoutMethod": "yape" }  # solo amountUsd es requerido
 → 200 { "result": { "slug", "rate", "feeUsd", "netDeliveredLocal", "localCurrency": "PEN",
-                     "etaMinutes", "quoteId", "expiresAt", "provenance" } }
+                     "etaMinutes", "quoteId", "expiresAt", "provenance",
+                     "rateSource", "rateAsOf" } }
 → 400 { "error": "invalid_input", "details": {...} }   # body inválido (ej. amountUsd <= 0)
-→ 502 { "error": "quote_unavailable" }                 # falla del provider / misconfig
+→ 502 { "error": "quote_unavailable" }                 # ninguna fuente de tasa usable / misconfig
 ```
 
-Etapa 1 corre 100% en **fallback FX** (`provenance: "local-fallback"`): FX mid real de
-`open.er-api.com` + spread declarado. **Sin** receipt EIP-712 y **sin** lógica de pago/x402 del lado
-del agente (eso lo hace el gateway a2a). TransFi queda para etapa 2.
+### Procedencia de la tasa (cambio de contrato HTTP)
+
+El agente cotiza **sólo** con una tasa de mercado que puede respaldar. `provenance` ya no es una
+etiqueta genérica: cada valor mapea 1:1 a un método auditable de obtención de la tasa.
+
+| `provenance` | Qué significa |
+|---|---|
+| `fx-mid-live` | mid traído EN VIVO de una fuente registrada, en esta cotización |
+| `fx-mid-cached` | el mismo mid, servido de la caché en memoria dentro de su ventana de frescura |
+| `transfi` | tasa efectiva del corredor, del partner licenciado (etapa 2) |
+
+Dos campos **aditivos** acompañan a toda cotización:
+
+- **`rateSource`** — id de la fuente registrada (`"er-api"`, `"currency-api"`, `"transfi"`).
+- **`rateAsOf`** — ISO, fecha del dato **según la fuente**, nunca el momento de servir. Una respuesta
+  cacheada conserva la fecha ORIGINAL del dato: si mostrara el momento de servir, mentiría sobre su
+  frescura.
+
+> ⚠️ **`"local-fallback"` se RETIRÓ del agente FX.** Antes, cuando el feed fallaba, se cotizaba con la
+> constante `STATIC_USD_PEN` (default **3.75**) y se etiquetaba `"local-fallback"`, **igual** que una
+> tasa de mercado. Medido el 2026-07-29 contra tres fuentes independientes (`open.er-api.com` 3.4033,
+> `currency-api` 3.3956, **BCRP oficial** 3.404), el mercado estaba en **~3.40**: la constante estaba
+> **+10.2% por encima**. Cuando ese respaldo entraba, la cotización **prometía más soles de los que el
+> mercado da** — en una remesa de $400, **~140 PEN** que alguien tiene que poner. No era un problema de
+> etiquetas: era plata. El valor sigue vivo en KYC y payout, que son otro eje.
+
+### Fail-closed: sin tasa verificable NO se cotiza
+
+Si ninguna fuente registrada devuelve una tasa usable **y** no hay caché fresca, el endpoint responde
+**`502 quote_unavailable`**. No existe ninguna rama que devuelva "algo igual":
+
+- **La caché vencida NO se sirve.** Al vencer se re-fetchea; si el fetch falla, se falla. Una caché
+  vencida es la constante estática con mejor pedigrí: un número que nadie puede respaldar en el
+  momento de usarlo.
+- **No hay constante de respaldo.** Se eliminó del código.
+- Una cotización que nadie puede respaldar es peor que no cotizar: alguien la ata a un desembolso real.
+
+Cada fuente descartada emite un `console.warn` **value-free** (`{ sourceId, code }`, nunca el body de
+la fuente ni la URL completa) con uno de estos códigos: `fx_mid_http_<status>`, `fx_mid_fetch_failed`,
+`fx_mid_bad_shape`, `fx_mid_no_usable_pen_rate`, `fx_mid_out_of_band`, `fx_mid_stale_data`.
+
+### Fuentes registradas (no URLs libres)
+
+`FX_MID_SOURCES` nombra **ids de un registro en código**, no URLs. Cada fuente trae **su propio
+parser**, así que una env que aceptara cualquier URL *parecería* un punto de extensión y no lo sería:
+apuntarla a otra fuente daría "shape inválido" para siempre (el patrón del **control muerto**). Sólo
+el **host** es sobrescribible. Un id no registrado ⇒ `fx_mid_config_invalid:FX_MID_SOURCES`.
+
+| id | URL canónica | Campo tasa | Campo fecha |
+|---|---|---|---|
+| `er-api` | `https://open.er-api.com/v6/latest/USD` | `rates.PEN` | `time_last_update_unix` (s) |
+| `currency-api` | `https://latest.currency-api.pages.dev/v1/currencies/usd.json` | `usd.pen` | `date` (`YYYY-MM-DD`) |
+
+Toda fuente registrada **debe declarar la fecha de su dato**: sin fecha se trata como shape inválido.
+No se puede afirmar frescura de un dato que no dice cuándo se produjo, y "no sé de cuándo es" no puede
+colapsar a "es de ahora" (es el caso real de un CDN que sirve un JSON congelado con un 200 reciente).
+
+El **BCRP** (tasa oficial) **no** se usa como fuente de runtime: publica con ~7 días de lag y no
+publica fines de semana ni feriados. Sirve como ancla documentada de la banda y verificación de runbook.
+
+Etapa 1 corre 100% con la tasa mid real + spread declarado. **Sin** receipt EIP-712 y **sin** lógica de
+pago/x402 del lado del agente (eso lo hace el gateway a2a). TransFi queda para etapa 2.
 
 > El patrón `zod input → provider → receipt EIP-712 → { result }` descrito arriba aplica a los
 > agentes que tienen `agent-signer` (ej. `cobraya-credit-scorer`). `remit-corridor-fx` etapa 1
@@ -89,9 +149,33 @@ Env vars relevantes de etapa 1:
 ```
 FALLBACK_FX_SPREAD_BPS=250        # spread declarado (bps). Si se omite, el código usa 250.
 FALLBACK_FX_FLAT_FEE_USD=0.5      # fee flat USD. Si se omite, el código usa 0.5.
-STATIC_USD_PEN=3.75               # (opcional) fallback si open.er-api.com falla
 # NO setear en etapa 1: TRANSFI_API_KEY, TRANSFI_ADAPTER_READY (TransFi es etapa 2).
 ```
+
+⚠️ **`STATIC_USD_PEN` es OBSOLETA y NO TIENE EFECTO.** Ya no se lee en ningún lado del código. Era la
+constante de respaldo (3.75) que cotizaba +10.2% sobre el mercado real; setearla hoy no mueve ninguna
+cotización. **Borrala del deploy** para que nadie crea que sigue controlando algo.
+
+Config del FX mid (todas **opcionales**; se leen en **cada cotización**, así que rotarlas surte efecto
+sin redeploy). Config inválida **lanza** `fx_mid_config_invalid:<campo>` en vez de cotizar con un guard
+desactivado: `Number("abc")` es `NaN`, y comparar contra `NaN` da `false` siempre — un máximo no
+numérico **desactivaría la banda en silencio**.
+
+```
+FX_MID_SOURCES=er-api,currency-api   # ids REGISTRADOS, en orden de cascada (no URLs)
+FX_MID_ER_API_URL=<url>              # override del host de er-api (mock de CI / mirror)
+FX_MID_CURRENCY_API_URL=<url>        # override del host de currency-api
+FX_RATE_CACHE_TTL_MS=300000          # 5 min de caché en memoria (0 la deshabilita)
+FX_MID_MAX_AGE_MS=172800000          # 48 h: edad máxima del DATO según la fuente
+FX_MID_MIN_USD_PEN=2.50              # banda de plausibilidad, piso
+FX_MID_MAX_USD_PEN=5.00              # banda de plausibilidad, techo
+```
+
+Cada default **afirma algo sobre el mundo externo** (evidencia medida el 2026-07-29): las dos fuentes
+están vivas y publican USD/PEN con fecha; el feed promete ciclo de ~24 h, así que 48 h tolera **un**
+ciclo perdido, no dos; y con el mercado en ~3.40 la banda `[2.50, 5.00]` deja pasar movimiento
+cambiario real pero ataja un cero, un negativo, un orden de magnitud, o la tasa de **otra** moneda
+(si el feed cambiara y devolviera `PYG` ≈ 7300 o `EUR` ≈ 0.92).
 
 ## Endpoint HTTP + deploy (etapa 1 — `remit-kyc-validator`)
 

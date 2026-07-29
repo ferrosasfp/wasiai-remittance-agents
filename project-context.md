@@ -275,13 +275,24 @@ TRANSFI_ENV               — ambiente de TransFi: "sandbox" | "production". OBL
 TRANSFI_BASE_URL          — override opcional del host (mock CI / host dedicado). NO define el ambiente y no puede contradecir a TRANSFI_ENV (throw transfi_base_url_env_conflict). Ya NO tiene default
 PAYOUT_ALLOW_MOCK         — "true" permite el payout FALLBACK (mock) en NODE_ENV=production (etapa 1 del deploy; NUNCA abre payout real)
 ALLOW_FALLBACK_PAYOUT     — "true" habilita el payout fallback (mock) en dev/CI (fuera de producción)
-FALLBACK_FX_SPREAD_BPS    — spread declarado del fallback FX (bps, default 250)
-FALLBACK_FX_FLAT_FEE_USD  — fee flat USD del fallback FX (default 0.5)
-STATIC_USD_PEN            — fallback si open.er-api.com falla (FX)
+FALLBACK_FX_SPREAD_BPS    — spread declarado del quote FX (bps, default 250). Se lee a nivel de MÓDULO (TD-1: pendiente pasarla a call-time)
+FALLBACK_FX_FLAT_FEE_USD  — fee flat USD del quote FX (default 0.5). Idem, nivel de módulo
+STATIC_USD_PEN            — ⛔ OBSOLETA Y SIN EFECTO (WKH-301). Ya NO se lee en ningún lado del código. Era la constante de respaldo (default 3.75) que se usaba cuando el feed FX fallaba y se etiquetaba "local-fallback", IGUAL que una tasa de mercado. Medida contra 3 fuentes el 2026-07-29, estaba +10.2% sobre el mercado real (~3.40): la cotización prometía más soles de los que el mercado da (~140 PEN en una remesa de $400). Hoy sin tasa verificable se responde 502. BORRARLA del deploy: una env que se lee y no hace nada es un control muerto, y esta ni se lee
+FX_MID_SOURCES            — ids REGISTRADOS de fuentes de tasa, en orden de cascada (default "er-api,currency-api"). NO son URLs: cada fuente trae su propio parser (er-api lee rates.PEN, currency-api lee usd.pen), así que una env de URL libre sería un control muerto. Un id no registrado o una lista vacía ⇒ throw fx_mid_config_invalid:FX_MID_SOURCES (nunca quedarse sin fuentes en silencio)
+FX_MID_ER_API_URL         — override del host de er-api (mock de CI / mirror). Sólo el HOST es sobrescribible; el parser no
+FX_MID_CURRENCY_API_URL   — override del host de currency-api. Idem
+FX_RATE_CACHE_TTL_MS      — TTL de la caché en memoria del mid (default 300000 = 5 min; 0 la deshabilita). La caché VENCIDA no se sirve: se re-fetchea, y si el fetch falla se falla
+FX_MID_MAX_AGE_MS         — edad máxima del DATO según la fuente (default 172800000 = 48 h). El feed promete ciclo ~24 h: tolera UN ciclo perdido, no dos. Un 200 reciente con un JSON congelado NO es "en vivo"
+FX_MID_MIN_USD_PEN        — piso de la banda de plausibilidad (default 2.50)
+FX_MID_MAX_USD_PEN        — techo de la banda de plausibilidad (default 5.00). Ataja un cero, un negativo, un orden de magnitud o la tasa de OTRA moneda (PYG ≈ 7300, EUR ≈ 0.92)
 AGENT_SIGNER_PRIVATE_KEY  — (mencionada en README, NO usada hoy por estos 3 agentes — reservada para receipts EIP-712 futuros)
 ```
 
 No existe `.env.example` en el repo — inferido de README + código (`process.env.*` greppeado).
+
+> **Toda la config `FX_*` se lee en CADA cotización** (call-time), nunca al importar el módulo:
+> rotarla surte efecto sin redeploy. Config inválida (no numérica, `min >= max`, negativa) **lanza**
+> `fx_mid_config_invalid:<campo>` en vez de cotizar con un guard desactivado.
 
 ---
 
@@ -308,6 +319,8 @@ No existe `.env.example` en el repo — inferido de README + código (`process.e
 | 2026-07-15 | (WKH-204 F3) El SDD especificaba el guard de C8 con `String(v ?? "")` para colapsar un `vendor_data` no-string a `""` y bloquear. **Nace fail-OPEN**: `String(123)` es `"123"` (no `""`), así que un `vendor_data: 123` alcanza la comparación y un claim `"123"` **matchea → ALLOW** (ídem `{}` → `"[object Object]"`). Verificado ejecutando. | `typeof`-narrowing: `typeof vendorRaw === "string" ? vendorRaw : ""`. Test que lo mata: `vendor_data:123` + claim `"123"` → `identityMatches:false`. Regla asentada en PROHIBIDO. | Cualquier guard que "sanitice" un valor externo a `""` para bloquear. Misma clase que WKH-198 (`NaN`) y WKH-203 (`approved` no-booleano): *un valor ausente o de tipo inesperado se lee como señal positiva* |
 | 2026-07-15 | (WKH-204 F3) `z.string().min(1)` **NO trimea**: un claim `"   "` **atraviesa Zod** (verificado con zod 3.25.76). Sin una rama explícita, si el `vendor_data` también viniera vacío, `"" === ""` **matchearía = fail-open**. La rama parece redundante ("`min(1)` ya lo cubre") y es exactamente el tipo de código que se "limpia" sin entender. | Rama C4 explícita: `if (normalizeIdentity(claim) === "") return null` → blocked, y además evita gastar una llamada al partner. Defensa en profundidad junto a C5. | Cualquier validación que asuma que `min(1)` implica contenido no-vacío tras normalizar |
 | 2026-07-15 | (WKH-204 F3) Mutation testing del gate: el mutante `identityMatches !== true` → `!identityMatches` (truthiness) **sobrevivía** a la suite. Es alcanzable de verdad: `FallbackKycProvider.status()` devuelve un object literal que **no** pasa por `assertValidKycStatus()`, así que el guard C10 no lo cubre y el `!== true` del gate es la última línea de defensa. | Tests con `vi.spyOn(FallbackKycProvider.prototype,"status")` devolviendo `identityMatches: 1` (truthy no-booleano) y `approved: 1` → deben dar blocked. Resultado: **12/12 mutantes muertos** (WKH-203 estaba en 8/9). | Todo gate `!== true`: si ningún test inyecta un truthy-no-booleano, la estrictez **no está testeada** y el mutante sobrevive |
+| 2026-07-29 | (WKH-301) `Number(env)` sin `Number.isFinite` **desactiva un guard en silencio** — **5ª ocurrencia** de esta familia en el repo. `FX_MID_MAX_USD_PEN=abc` da `NaN`, y **toda** comparación contra `NaN` es `false` (`37.5 > NaN` → `false`), así que la banda de plausibilidad no rechazaría **nada**: una tasa 10× llegaría a cotizar con el guard puesto pero inerte. | `readNumericEnv()` en `fx-config.ts`: `Number.isFinite` sobre los 4 numéricos + `min > 0`, `max > min`, `ttl >= 0`, `maxAge > 0` ⇒ `throw fx_mid_config_invalid:<campo>`. Nunca cotizar con un guard apagado. Mutante M2 (borrar el `isFinite`) muere por T17. | Toda config numérica leída de env que después se use en una **comparación**. Misma familia que WKH-198 (`NaN`), WKH-203 (`approved` no-booleano) y WKH-204 (`String(v ?? "")`): *un valor inválido se lee como "no hay problema"* |
+| 2026-07-29 | (WKH-301 F3) Mutation testing: el mutante **M9** (`pen > 0` ⇒ `pen >= 0` en el guard de usabilidad) **sobrevivió**. Causa: para el valor `0` la **banda de plausibilidad enmascara** al guard de usabilidad — como la config obliga a `min > 0`, un `0` cae igual por `fx_mid_out_of_band`. El **efecto de dinero es idéntico** (no se cotiza), así que un test que sólo asevera `rejects` **no distingue** las dos versiones. | Determinado **empíricamente** antes de escribir nada (no era un mutante equivalente): original ⇒ código `fx_mid_no_usable_pen_rate`, mutante ⇒ `fx_mid_out_of_band`. T12c ahora asevera **el código**, no sólo el efecto. | Todo guard que comparta el resultado con otro guard posterior: si dos guards colapsan al mismo efecto, lo único que los distingue es el **código de diagnóstico** — y es lo que lee el operador para saber qué se rompió. Aseverar sólo el efecto deja el guard sin test |
 
 ---
 
