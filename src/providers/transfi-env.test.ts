@@ -5,7 +5,7 @@ import {
   resolveTransFiBaseUrl,
   resolveTransFiEnvironment,
 } from "./transfi-env";
-import { FallbackFxProvider, TransFiFxProvider, getFxQuoteProvider } from "./fx";
+import { LiveMidFxProvider, TransFiFxProvider, getFxQuoteProvider } from "./fx";
 import { FallbackPayoutProvider, TransFiPayoutProvider, getPayoutProvider } from "./payout";
 import { runCashoutPayout } from "../agents/cashout-payout";
 import type { FxQuoteInput, PayoutInput } from "./types";
@@ -321,14 +321,20 @@ describe("modo devnet actual (sin creds TransFi) sigue andando sin TRANSFI_ENV (
     setEnv("TRANSFI_USERNAME", undefined);
     setEnv("TRANSFI_PASSWORD", undefined);
     setEnv("TRANSFI_MID", undefined);
-    expect(getFxQuoteProvider()).toBeInstanceOf(FallbackFxProvider);
+    expect(getFxQuoteProvider()).toBeInstanceOf(LiveMidFxProvider);
     expect(getPayoutProvider()).toBeInstanceOf(FallbackPayoutProvider);
   });
 
-  it("G-18: el quote del fallback FX no toca TransFi (y no necesita TRANSFI_ENV)", async () => {
-    const { calls } = stubFetchCapturing({ rates: { PEN: 3.8 } });
-    const quote = await new FallbackFxProvider().quote(fxInput);
-    expect(quote.provenance).toBe("local-fallback");
+  it("G-18: el quote del mid real no toca TransFi (y no necesita TRANSFI_ENV)", async () => {
+    // El feed DEBE declarar la fecha de su dato: sin ella la fuente se descarta (shape inválido)
+    // y este test moriría por el motivo equivocado.
+    const { calls } = stubFetchCapturing({
+      rates: { PEN: 3.8 },
+      time_last_update_unix: Math.floor(Date.now() / 1000),
+    });
+    const quote = await new LiveMidFxProvider().quote(fxInput);
+    expect(quote.provenance).toBe("fx-mid-live");
+    expect(quote.rateSource).toBe("er-api");
     for (const url of calls) expect(url).not.toContain("transfi.com");
   });
 

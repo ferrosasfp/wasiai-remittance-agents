@@ -20,12 +20,23 @@ function invoke(body: unknown) {
   );
 }
 
+/**
+ * Cuerpo del feed FX CON FECHA declarada. Sin fecha, la fuente se descarta por shape inválido.
+ */
+function feedBody(pen: number): unknown {
+  return { rates: { PEN: pen }, time_last_update_unix: Math.floor(Date.now() / 1000) };
+}
+
 describe("POST /api/agents/remit-corridor-fx/invoke", () => {
   beforeEach(() => {
-    vi.stubEnv("TRANSFI_API_KEY", ""); // fallback (FX mid real mockeado)
+    vi.stubEnv("TRANSFI_API_KEY", ""); // mid real (mockeado)
+    // La caché del mid es estado de MÓDULO y sobrevive entre tests de este archivo: sin esto, un
+    // caso que simula "todas las fuentes caídas" serviría la tasa que cacheó un test anterior y
+    // pasaría por el motivo equivocado. TTL 0 ⇒ cada test ejerce la cascada de verdad.
+    vi.stubEnv("FX_RATE_CACHE_TTL_MS", "0");
     vi.stubGlobal(
       "fetch",
-      vi.fn(async () => ({ ok: true, json: async () => ({ rates: { PEN: 3.8 } }) })),
+      vi.fn(async () => ({ ok: true, json: async () => feedBody(3.8) })),
     );
   });
   afterEach(() => {
@@ -55,11 +66,43 @@ describe("POST /api/agents/remit-corridor-fx/invoke", () => {
     expect(result.rate).toBeGreaterThan(3.6);
   });
 
-  // AC-4: TransFi OFF → provenance local-fallback
-  it("TransFi OFF → provenance local-fallback", async () => {
+  // T3 — AC-1: TransFi OFF → la cotización sale del mid REAL y lo declara
+  it("TransFi OFF → provenance fx-mid-live, con fuente y fecha del dato", async () => {
     const res = await invoke({ amountUsd: 100 });
     const { result } = await res.json();
-    expect(result.provenance).toBe("local-fallback");
+    expect(result.provenance).toBe("fx-mid-live");
+    expect(result.rateSource).toBe("er-api");
+    expect(Date.parse(result.rateAsOf)).not.toBeNaN();
+    // la etiqueta vieja (que compartía nombre con la constante 3.75) ya no se emite
+    expect(result.provenance).not.toBe("local-fallback");
+  });
+
+  // T4 — AC-2: el fail-closed aterriza en 502, sin cotización a medias
+  it("T4: todas las fuentes caídas → 502 quote_unavailable, y el body NO trae result", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new Error("network_down");
+      }),
+    );
+    const res = await invoke({ amountUsd: 100 });
+    expect(res.status).toBe(502);
+    const data = await res.json();
+    expect(data.error).toBe("quote_unavailable");
+    expect("result" in data).toBe(false);
+  });
+
+  it("T4b: fuente con tasa fuera de banda → 502, jamás un 200 con esa tasa", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        json: async () => feedBody(37.5),
+      })),
+    );
+    const res = await invoke({ amountUsd: 100 });
+    expect(res.status).toBe(502);
+    expect((await res.json()).error).toBe("quote_unavailable");
   });
 
   // AC-7: amountUsd<=0 → 400 estructurado (no 500)

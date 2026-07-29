@@ -43,10 +43,19 @@ describe("contract INPUTs — parse() contra el schema real", () => {
 
 describe("contract OUTPUT — remit-corridor-fx (runCorridorFx)", () => {
   beforeEach(() => {
-    vi.stubEnv("TRANSFI_API_KEY", ""); // fallback FX (mid real mockeado)
+    vi.stubEnv("TRANSFI_API_KEY", ""); // mid real (mockeado)
+    // La caché del mid es estado de módulo: TTL 0 mantiene cada caso independiente.
+    vi.stubEnv("FX_RATE_CACHE_TTL_MS", "0");
     vi.stubGlobal(
       "fetch",
-      vi.fn(async () => ({ ok: true, json: async () => ({ rates: { PEN: 3.8 } }) })),
+      // El feed DEBE declarar la fecha de su dato: sin ella la fuente se descarta (shape inválido).
+      vi.fn(async () => ({
+        ok: true,
+        json: async () => ({
+          rates: { PEN: 3.8 },
+          time_last_update_unix: Math.floor(Date.now() / 1000),
+        }),
+      })),
     );
   });
   afterEach(() => {

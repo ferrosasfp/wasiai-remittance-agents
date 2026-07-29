@@ -1,11 +1,24 @@
-// FX / Corridor quote provider — TransFi adapter + fallback con FX mid REAL.
-// A diferencia del KYC, el fallback acá NO es inventado: toma el mid-rate real de
-// open.er-api.com (como hacía la demo) y le aplica un spread documentado → cotización
-// genuina. TransFi da la tasa efectiva real del corredor cuando su key está seteada.
+// FX / Corridor quote provider — TransFi adapter + tasa mid REAL de fuentes registradas.
+//
+// ⚠️ QUÉ CAMBIÓ Y POR QUÉ (incidente de dinero):
+// hasta esta HU, cuando el feed fallaba se cotizaba con una CONSTANTE del código
+// (`STATIC_USD_PEN`, default 3.75) y se etiquetaba `"local-fallback"`, IGUAL que una tasa de
+// mercado. Medido el 2026-07-29 contra tres fuentes, el mercado estaba en ~3.40: la constante
+// estaba +10.2% por encima, así que la cotización PROMETÍA más soles de los que el mercado da
+// (~140 PEN en una remesa de $400 que alguien tiene que poner). Peor: de los 3 caminos que
+// devolvían la constante, uno era completamente silencioso (un `catch {}`).
+//
+// Ahora: cascada de fuentes registradas con 5 guards y FAIL-CLOSED. Si ninguna fuente sirve y no
+// hay caché fresca, se LANZA (el route lo mapea a 502 `quote_unavailable`). No existe una rama que
+// devuelva "algo igual": una cotización que nadie puede respaldar es peor que no cotizar.
+//
+// 🔴 PROHIBIDO reintroducir cualquier constante de tasa acá. La banda de plausibilidad NO es una
+// tasa: es un límite, y vive en `fx-config.ts`.
 
 import { z } from "zod";
+import { type FxConfig, resolveFxConfig } from "./fx-config";
 import { resolveTransFiBaseUrl, type TransFiBaseUrl } from "./transfi-env";
-import type { FxQuote, FxQuoteInput, FxQuoteProvider } from "./types";
+import type { FxProvenance, FxQuote, FxQuoteInput, FxQuoteProvider } from "./types";
 
 // 🔴 NO existe acá ninguna constante de host de TransFi, y este archivo NO lee `TRANSFI_BASE_URL`.
 // Antes había un `process.env.TRANSFI_BASE_URL ?? "https://api.transfi.com"` (¡PRODUCCIÓN del
@@ -13,9 +26,13 @@ import type { FxQuote, FxQuoteInput, FxQuoteProvider } from "./types";
 // El host llega ahora inyectado como `TransFiBaseUrl` (branded) desde `transfi-env.ts`, que es la
 // única fuente de verdad. Volver a poner un default local acá no compila como argumento del
 // adapter y además pone en rojo `transfi-env.test.ts` (test estructural).
-// spread del fallback (bps) — conservador, declarado. TransFi reemplaza esto con su tasa real.
-const FALLBACK_SPREAD_BPS = Number(process.env.FALLBACK_FX_SPREAD_BPS ?? 250); // 2.5%
-const FALLBACK_FLAT_FEE_USD = Number(process.env.FALLBACK_FX_FLAT_FEE_USD ?? 0.5);
+// 🔴 ACÁ VIVÍAN `FALLBACK_SPREAD_BPS` y `FALLBACK_FLAT_FEE_USD`, leídos AL IMPORTAR y SIN validar.
+// Se mudaron a `resolveFxConfig()` (call-time + rango), que es donde ya viven los otros cinco guards.
+// Por qué importaba: la tasa que se emite es `mid * (1 - spread/10000)`, y la banda de plausibilidad
+// valida el MID, no la tasa emitida. Un spread finito pero absurdo se colaba entero: −1000 bps sobre
+// un mid de 3.40 emitía 3.74 (+10.0%), que es NUMÉRICAMENTE EL MISMO ERROR que la constante 3.75 que
+// esta HU vino a matar — con etiqueta `fx-mid-live` y HTTP 200. Además, leerlas al importar hacía que
+// rotarlas no surtiera efecto hasta redeployar, justo lo que AC-9/DT-8 prohíben.
 
 // ── Shape de las respuestas EXTERNAS ─────────────────────────────────────────
 // Reemplazan al cast crudo sin validar que había sobre `res.json()`. Dos reglas:
@@ -49,12 +66,9 @@ const TransFiQuoteResponseSchema = z
   })
   .passthrough();
 
-/** Respuesta de open.er-api.com — de este JSON se lee SOLO `rates.PEN`. */
-const FxMidResponseSchema = z
-  .object({
-    rates: z.object({ PEN: NumericLike.nullish() }).passthrough().nullish(),
-  })
-  .passthrough();
+// Los schemas del feed FX se mudaron a `fx-config.ts`: cada fuente registrada trae SU parser
+// (`er-api` lee `rates.PEN`, `currency-api` lee `usd.pen`). Tener el parser acá fijo a un solo
+// shape es lo que convertía a una URL configurable en un control muerto.
 
 /** Adapter TransFi — activo con TRANSFI_API_KEY. Devuelve la tasa efectiva real del corredor. */
 export class TransFiFxProvider implements FxQuoteProvider {
@@ -95,6 +109,11 @@ export class TransFiFxProvider implements FxQuoteProvider {
       quoteId: String(d.quoteId ?? d.id ?? ""),
       expiresAt: String(d.expiresAt ?? ""),
       provenance: "transfi",
+      rateSource: "transfi",
+      // El partner cotiza POR REQUEST: la tasa se genera en el momento de responder, así que acá el
+      // momento de la respuesta SÍ es la fecha del dato. (Distinto del mid cacheado, donde el dato
+      // es más viejo que el momento de servir y por eso conserva su fecha original.)
+      rateAsOf: new Date().toISOString(),
     };
     // BLQ-MED-2: si el mapeo (aún sandbox-unverified) produce NaN/invalidos, LANZAR —
     // nunca emitir una cotización con basura numérica que el payout ataría a un monto real.
@@ -102,60 +121,220 @@ export class TransFiFxProvider implements FxQuoteProvider {
   }
 }
 
-/** Fallback con FX mid REAL (open.er-api.com) + spread declarado. Corre sin keys. */
-export class FallbackFxProvider implements FxQuoteProvider {
+/**
+ * Proveedor de tasa mid REAL (fuentes registradas) + spread declarado. Corre sin keys.
+ *
+ * Ya no se llama `FallbackFxProvider`: no es un fallback, es el proveedor de tasa de mercado. La
+ * palabra "fallback" es justamente la que hizo que nadie mirara que abajo había una constante.
+ */
+export class LiveMidFxProvider implements FxQuoteProvider {
   async quote(input: FxQuoteInput): Promise<FxQuote> {
-    const mid = await getUsdToPenMid(); // tasa real USD→PEN
-    const effRate = mid * (1 - FALLBACK_SPREAD_BPS / 10000); // spread en contra del cliente
-    const netUsd = Math.max(0, input.amountUsd - FALLBACK_FLAT_FEE_USD);
+    // UNA sola lectura de config por cotización (AC-9): el mid y el precio tienen que salir de la
+    // MISMA config. Dos lecturas podrían leer una env a medio rotar y mezclar dos configuraciones.
+    const config = resolveFxConfig();
+    const mid = await getUsdToPenMid(config); // tasa real USD→PEN, o LANZA (fail-closed)
+    const effRate = mid.rate * (1 - config.spreadBps / 10000); // spread en contra del cliente
+    const netUsd = Math.max(0, input.amountUsd - config.flatFeeUsd);
     const netDeliveredLocal = Number((netUsd * effRate).toFixed(2));
+    // La tasa EMITIDA pasa por la misma banda que el mid. El mid ya está en banda y el spread está
+    // acotado a [0, 10000), así que esto sólo puede dispararse con un spread grande-pero-válido
+    // (p.ej. 3000 bps sobre 3.40 ⇒ 2.38, por debajo del piso): lo que sale al usuario se verifica,
+    // no sólo lo que entró. La banda es un límite, NUNCA una tasa de reemplazo (no hay clamp acá).
+    if (effRate < config.minRate || effRate > config.maxRate) {
+      throw new Error(`fx_rate_out_of_band:${effRate.toFixed(6)}`);
+    }
     // MNR-1 (re-AR): el fallback también pasa por el guard — un env misconfig
-    // (FALLBACK_FX_* no numérico) NO debe emitir una cotización con NaN.
+    // NO debe emitir una cotización con NaN.
     return assertValidQuote({
       rate: Number(effRate.toFixed(6)),
-      feeUsd: FALLBACK_FLAT_FEE_USD,
+      feeUsd: config.flatFeeUsd,
       netDeliveredLocal,
       localCurrency: "PEN",
       etaMinutes: 30,
-      quoteId: `fallback-${Date.now()}`,
+      quoteId: `fxmid-${Date.now()}`,
       // quote "vence" en 10 min (consistente con un quote real atable a un payout)
       expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
-      provenance: "local-fallback",
+      // La procedencia la decide de dónde salió el mid: en vivo o de la caché fresca. Nunca colapsan.
+      provenance: mid.provenance,
+      rateSource: mid.sourceId,
+      // La fecha del DATO según la fuente — no el momento de servir (ver getUsdToPenMid).
+      rateAsOf: mid.dataAsOf,
     });
   }
 }
 
-// ── FX mid real (open.er-api.com) con cache en memoria + fallback estático ──────
-let cache: { rate: number; at: number } | null = null;
-const CACHE_MS = 5 * 60_000;
-const STATIC_USD_PEN = Number(process.env.STATIC_USD_PEN ?? 3.75); // fallback si la API falla
+// ── FX mid real: cascada de fuentes registradas + caché con metadata ─────────────
 
-async function getUsdToPenMid(): Promise<number> {
-  if (cache && Date.now() - cache.at < CACHE_MS) return cache.rate;
-  try {
-    const res = await fetch("https://open.er-api.com/v6/latest/USD", {
-      signal: AbortSignal.timeout(4000),
-    });
-    if (res.ok) {
-      const parsed = FxMidResponseSchema.safeParse(await res.json());
-      if (!parsed.success) {
-        // Degradación IGUAL que antes (cae al estático), pero EXPLÍCITA: antes un cambio de shape
-        // del feed FX era 100% silencioso. Value-free: solo la etiqueta, nunca el body del tercero.
-        console.warn("[remit-fx] fx_mid_bad_shape → fallback estático USD/PEN");
-      } else {
-        const pen = Number(parsed.data.rates?.PEN);
-        if (pen > 0) {
-          cache = { rate: pen, at: Date.now() };
-          return pen;
-        }
-        // 2xx con shape OK pero sin una tasa PEN usable (ausente/0/negativa/no numérica).
-        console.warn("[remit-fx] fx_mid_no_usable_pen_rate → fallback estático USD/PEN");
-      }
-    }
-  } catch {
-    // cae al estático
+/** Tasa mid con su procedencia auditable. `dataAsOf` es la fecha del dato SEGÚN LA FUENTE. */
+interface MidRate {
+  rate: number;
+  sourceId: string;
+  dataAsOf: string;
+  provenance: FxProvenance;
+}
+
+/**
+ * Caché en memoria. Guarda la METADATA además de la tasa: sin `sourceId`/`dataAsOf` una respuesta
+ * cacheada no podría declarar de dónde salió ni de cuándo es el dato.
+ */
+let cache: { rate: number; sourceId: string; dataAsOf: string; fetchedAt: number } | null = null;
+
+/**
+ * Edad del dato en ms, según la fecha que declara la fuente. `null` si la fecha no es parseable.
+ *
+ * Devolver `NaN` era peor que devolver un error: `NaN > maxAgeMs` es `false` (el guard de frescura
+ * ACEPTABA) y `NaN <= maxAgeMs` también es `false` (la caché RECHAZABA). El mismo dato roto movía
+ * los dos controles en direcciones opuestas, y el que fallaba abierto era el que emite la tasa.
+ * Con `null` el caller está OBLIGADO a decidir explícitamente, y las dos decisiones son rechazar.
+ */
+function ageOf(dataAsOf: string): number | null {
+  const parsed = Date.parse(dataAsOf);
+  if (!Number.isFinite(parsed)) return null;
+  return Date.now() - parsed;
+}
+
+/**
+ * Tolerancia de desfasaje de reloj entre nuestro server y la fuente. Una fecha levemente futura es
+ * skew normal; una fecha MUY futura desactiva el guard de frescura para siempre (edad negativa nunca
+ * supera el máximo), que es justo lo que el guard existe para atajar.
+ */
+const MAX_CLOCK_SKEW_MS = 120_000; // 2 min
+
+/**
+ * Veredicto de frescura del dato. Existe para que la caché y el guard G5 usen EXACTAMENTE el mismo
+ * criterio: antes cada uno escribía su propia comparación y con una fecha rota se movían en
+ * direcciones opuestas (la caché rechazaba, el guard aceptaba).
+ */
+export type FreshnessVerdict = "ok" | "unparseable" | "stale" | "future";
+
+/**
+ * Exportada para poder testearla DIRECTO, igual que `assertValidQuote` (mismo criterio en este
+ * archivo: los guards de dinero se testean como unidad, no sólo por su efecto). La rama
+ * `unparseable` es hoy inalcanzable desde afuera —los parsers de las fuentes validan la fecha antes
+ * de llegar acá— y precisamente por eso necesita un test directo: es la que fallaba ABIERTA.
+ */
+export function checkFreshness(dataAsOf: string, maxAgeMs: number): FreshnessVerdict {
+  const age = ageOf(dataAsOf);
+  if (age === null) return "unparseable";
+  if (age > maxAgeMs) return "stale";
+  // Fecha por delante de nuestro reloj más allá del skew tolerable: una fuente que sella hacia
+  // adelante tendría edad negativa PARA SIEMPRE, y una edad negativa nunca supera el máximo — el
+  // guard de frescura quedaría permanentemente desactivado para ella.
+  if (age < -MAX_CLOCK_SKEW_MS) return "future";
+  return "ok";
+}
+
+/** Warn value-free: SÓLO id de fuente + código. Nunca el body, la URL completa, ni datos del caller. */
+function rejectSource(sourceId: string, code: string): void {
+  console.warn("[remit-fx] fx_mid_source_rejected", { sourceId, code });
+}
+
+/**
+ * Devuelve la tasa mid USD→PEN, o **LANZA**.
+ *
+ * 🔴 NO EXISTE UNA RAMA 4. No hay caché vencida servida, no hay constante estática, no hay
+ * "devolver algo igual". Una caché vencida es la constante estática con mejor pedigrí: un número
+ * que nadie puede respaldar en el momento de usarlo. Al vencer se re-fetchea; si el fetch falla,
+ * se falla.
+ */
+async function getUsdToPenMid(config: FxConfig): Promise<MidRate> {
+  // La config llega YA resuelta por el caller (call-time, AC-9): rotar una env surte efecto en la
+  // próxima cotización, sin redeploy. Si es inválida, `resolveFxConfig()` ya lanzó antes de llegar
+  // acá — nunca se cotiza con un guard desactivado.
+
+  // (1) Caché servible en los TRES ejes vigentes AHORA: TTL de la caché, edad del dato y BANDA.
+  // El TTL no revive un dato viejo: una tasa traída hace 1 minuto pero con fecha de hace 5 días
+  // sigue siendo vieja. Y la banda se re-evalúa contra la config ACTUAL, no contra la que regía
+  // cuando se cacheó: estrechar la banda es la única maniobra de tiempo real que tiene un operador
+  // frente a un incidente de tasa (AC-9, sin redeploy), y si la caché la ignorara seguiría sirviendo
+  // hasta 5 minutos una tasa que el operador acaba de declarar inaceptable. Simétrico con la edad,
+  // donde esto ya se hacía (T16).
+  if (
+    cache !== null &&
+    cache.fetchedAt + config.cacheTtlMs > Date.now() &&
+    checkFreshness(cache.dataAsOf, config.maxAgeMs) === "ok" &&
+    cache.rate >= config.minRate &&
+    cache.rate <= config.maxRate
+  ) {
+    return {
+      rate: cache.rate,
+      sourceId: cache.sourceId,
+      // La fecha ORIGINAL del dato. Poner acá el momento de servir sería mentir sobre la frescura:
+      // el mismo pecado que esta HU viene a matar, un nivel más abajo.
+      dataAsOf: cache.dataAsOf,
+      provenance: "fx-mid-cached",
+    };
   }
-  return STATIC_USD_PEN;
+
+  // (2) Cascada: cada fuente en el orden configurado. Ninguna tiene camino privilegiado.
+  for (const source of config.sources) {
+    let json: unknown;
+    try {
+      const res = await fetch(source.url, { signal: AbortSignal.timeout(4000) });
+      // G1 — no-2xx
+      if (!res.ok) {
+        rejectSource(source.id, `fx_mid_http_${res.status}`);
+        continue;
+      }
+      json = await res.json();
+    } catch {
+      // G1 — el fetch tiró (red caída, timeout, JSON ilegible). Antes esto era un `catch {}` mudo
+      // que devolvía la constante: el camino más caro del bug, y el único sin ninguna traza.
+      rejectSource(source.id, "fx_mid_fetch_failed");
+      continue;
+    }
+
+    // G2 — shape inválido. Incluye el caso SIN FECHA declarada (DT-6).
+    const parsed = source.parse(json);
+    if (parsed === null) {
+      rejectSource(source.id, "fx_mid_bad_shape");
+      continue;
+    }
+
+    // G3 — tasa usable
+    if (!(Number.isFinite(parsed.rate) && parsed.rate > 0)) {
+      rejectSource(source.id, "fx_mid_no_usable_pen_rate");
+      continue;
+    }
+
+    // G4 — banda de plausibilidad. Ataja un cero, un orden de magnitud, o la tasa de OTRA moneda.
+    if (parsed.rate < config.minRate || parsed.rate > config.maxRate) {
+      rejectSource(source.id, "fx_mid_out_of_band");
+      continue;
+    }
+
+    // G5 — frescura del DATO (no del HTTP): un 200 reciente con un JSON congelado no es "en vivo".
+    // Mira en las DOS direcciones: un dato viejo no sirve, y uno fechado en el futuro tampoco —
+    // ese desactivaría el guard de forma permanente para esa fuente (edad negativa < máximo).
+    const freshness = checkFreshness(parsed.dataAsOf, config.maxAgeMs);
+    if (freshness !== "ok") {
+      rejectSource(
+        source.id,
+        freshness === "stale"
+          ? "fx_mid_stale_data"
+          : freshness === "future"
+            ? "fx_mid_future_data"
+            : "fx_mid_bad_date",
+      );
+      continue;
+    }
+
+    cache = {
+      rate: parsed.rate,
+      sourceId: source.id,
+      dataAsOf: parsed.dataAsOf,
+      fetchedAt: Date.now(),
+    };
+    return {
+      rate: parsed.rate,
+      sourceId: source.id,
+      dataAsOf: parsed.dataAsOf,
+      provenance: "fx-mid-live",
+    };
+  }
+
+  // (3) Fail-closed. El route mapea cualquier throw a 502 `quote_unavailable`.
+  throw new Error(`fx_mid_unavailable:${config.sources.length}`);
 }
 
 // BLQ-MED-2: guard de salida — un quote solo es válido si los montos de dinero son finitos y
@@ -177,7 +356,7 @@ export function assertValidQuote(q: FxQuote): FxQuote {
  */
 export function getFxQuoteProvider(): FxQuoteProvider {
   const key = process.env.TRANSFI_API_KEY;
-  if (!key) return new FallbackFxProvider();
+  if (!key) return new LiveMidFxProvider();
   if (process.env.TRANSFI_ADAPTER_READY !== "true") {
     throw new Error(
       "transfi_adapter_not_ready: TRANSFI_API_KEY seteada pero TRANSFI_ADAPTER_READY!=true — " +
