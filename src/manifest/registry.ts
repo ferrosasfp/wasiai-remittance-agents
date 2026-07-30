@@ -11,6 +11,11 @@
 //
 // `PRICE_USDC` se IMPORTA de cada agente (lectura pura, sin I/O al importarse): evita una segunda
 // verdad del precio. No redeclarar el número acá.
+//
+// LOS 3 AGENTES COBRAN EN `solana-devnet`: el pipeline de remesas no toca ninguna chain EVM. Cada
+// agente tiene su PROPIA env de payTo (`payToEnv`) aunque hoy las 3 apunten a la misma billetera:
+// separarlas mañana es cambiar una variable de entorno, no este archivo. NINGUNA dirección vive acá
+// (ni como default ni como fallback). Ver el bloque de las 3 envs en `.env.example`.
 
 import { PRICE_USDC as KYC_PRICE_USDC } from "@/agents/kyc-validator";
 import { PRICE_USDC as FX_PRICE_USDC } from "@/agents/corridor-fx";
@@ -29,8 +34,8 @@ export const MANIFEST_ENTRIES: readonly ManifestEntry[] = Object.freeze([
       "travel-rule",
       "remittance-compliance",
     ]),
-    chain: "avalanche-fuji",
-    family: "evm",
+    chain: "solana-devnet",
+    family: "solana",
     asset: "USDC",
     payToEnv: "REMIT_KYC_VALIDATOR_PAYTO",
     priceUsdc: KYC_PRICE_USDC,

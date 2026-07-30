@@ -4,6 +4,8 @@
 // NO EXISTE una rama que produzca `ok:true` sin un `payment.contract` que el settle aceptaría.
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { buildManifest } from "./build";
+import { resolvePayTo } from "./paytos";
+import type { ManifestEntry } from "./types";
 
 // Fixtures de FORMATO (no son wallets reales — no usar en ningún runbook).
 const EVM_OK = "0x1111111111111111111111111111111111111111";
@@ -29,14 +31,14 @@ afterEach(() => {
 
 describe("buildManifest — happy path (el único camino a ok:true)", () => {
   it("con un payTo válido de su familia arma el manifiesto completo", () => {
-    vi.stubEnv(KYC_ENV, EVM_OK);
+    vi.stubEnv(KYC_ENV, SOL_OK);
     const result = buildManifest("remit-kyc-validator");
     expect(result.ok).toBe(true);
     if (!result.ok) throw new Error("unreachable");
     expect(result.manifest.payment).toEqual({
       method: "x402",
-      chain: "avalanche-fuji",
-      contract: EVM_OK,
+      chain: "solana-devnet",
+      contract: SOL_OK,
       asset: "USDC",
     });
     expect(result.manifest.slug).toBe("remit-kyc-validator");
@@ -123,7 +125,9 @@ describe("buildManifest — payTo ausente: nadie puede registrar un agente que c
 });
 
 // T10 — AC-6
-describe("buildManifest — formato EVM inválido: el settle lo rechazaría, el manifiesto también", () => {
+// El slot del KYC es Solana (los 3 agentes cobran en `solana-devnet`), así que todos estos valores
+// —los que un operador pegaría desde un entorno EVM— fallan el decode base58 a 32 bytes.
+describe("buildManifest — payTo con pinta de EVM en el slot Solana del KYC: el settle lo rechazaría, el manifiesto también", () => {
   const badEvm: ReadonlyArray<readonly [string, string]> = [
     ["39 hex (una corta)", EVM_SHORT],
     ["sin prefijo 0x", "1111111111111111111111111111111111111111"],
@@ -152,15 +156,48 @@ describe("buildManifest — formato EVM inválido: el settle lo rechazaría, el 
 });
 
 // T11a — AC-6
-describe("buildManifest — zero-address", () => {
+// Ningún agente declara ya una chain EVM (los 3 cobran en `solana-devnet`), así que estas guardas de
+// `resolvePayTo` —zero-address y base58 en un slot EVM— dejaron de ser alcanzables DESDE EL REGISTRO.
+// No se borran: `ManifestChain` sigue admitiendo `avalanche-fuji` y la primera entrada EVM que
+// alguien agregue las necesita vivas. Se ejercitan con una entrada sintética, que es la única forma
+// honesta de cubrirlas sin inventar un agente en el registro real.
+const SYNTHETIC_EVM_ENV = "SYNTHETIC_EVM_PAYTO";
+const SYNTHETIC_EVM_ENTRY: ManifestEntry = {
+  pathSlug: "synthetic-evm",
+  slug: "synthetic-evm",
+  name: "synthetic-evm",
+  description: "Entrada de TEST: no está en el registro y no se publica en ningún manifiesto.",
+  capabilities: [],
+  chain: "avalanche-fuji",
+  family: "evm",
+  asset: "USDC",
+  payToEnv: SYNTHETIC_EVM_ENV,
+  priceUsdc: 0,
+};
+
+describe("resolvePayTo — las guardas EVM siguen vivas aunque hoy ningún agente declare chain EVM", () => {
   it("la zero-address no se publica: cobraría $0 (ZERO_PAY_TO) para siempre", () => {
-    vi.stubEnv(KYC_ENV, EVM_ZERO);
-    const result = buildManifest("remit-kyc-validator");
-    expect(result.ok).toBe(false);
-    if (result.ok) throw new Error("unreachable");
-    expect(result.reason).toBe("zero_address");
-    expect(result.invalid).toEqual(["payment.contract"]);
-    expect(result.missing).toEqual([]);
+    vi.stubEnv(SYNTHETIC_EVM_ENV, EVM_ZERO);
+    const resolved = resolvePayTo(SYNTHETIC_EVM_ENTRY);
+    expect(resolved.ok).toBe(false);
+    if (resolved.ok) throw new Error("unreachable");
+    expect(resolved.reason).toBe("zero_address");
+  });
+
+  it("una base58 en un slot EVM se rechaza (el sentido del cruce de familias que el registro ya no alcanza)", () => {
+    vi.stubEnv(SYNTHETIC_EVM_ENV, SOL_OK);
+    const resolved = resolvePayTo(SYNTHETIC_EVM_ENTRY);
+    expect(resolved.ok).toBe(false);
+    if (resolved.ok) throw new Error("unreachable");
+    expect(resolved.reason).toBe("invalid_format");
+  });
+
+  it("una EVM bien formada sí resuelve: la rama EVM no está rota, sólo sin usar", () => {
+    vi.stubEnv(SYNTHETIC_EVM_ENV, EVM_OK);
+    const resolved = resolvePayTo(SYNTHETIC_EVM_ENTRY);
+    expect(resolved.ok).toBe(true);
+    if (!resolved.ok) throw new Error("unreachable");
+    expect(resolved.payTo).toBe(EVM_OK);
   });
 });
 
@@ -176,33 +213,29 @@ describe("buildManifest — base58 de 44 chars que decodifica a 33 bytes", () =>
   });
 });
 
-// T13 — AC-6, los DOS sentidos
-describe("buildManifest — cruce de familias", () => {
-  it("payTo de la familia equivocada: el agente cobraría $0 (INVALID_PAY_TO_FORMAT) — se rechaza en origen [EVM en slot solana]", () => {
-    vi.stubEnv(FX_ENV, EVM_OK); // slot solana-devnet
-    const result = buildManifest("remit-corridor-fx");
-    expect(result.ok).toBe(false);
-    if (result.ok) throw new Error("unreachable");
-    expect(result.reason).toBe("invalid_format");
-    expect(result.invalid).toEqual(["payment.contract"]);
-  });
+// T13 — AC-6
+// Los 3 slots son Solana, así que el cruce de familias que un operador puede provocar HOY es uno
+// solo: pegar una address EVM (la que sobró del entorno Fuji) en cualquiera de las 3 envs. El
+// sentido inverso (base58 en un slot EVM) ya no es alcanzable desde el registro y vive arriba,
+// contra la entrada sintética.
+describe("buildManifest — cruce de familias: una EVM en el slot Solana de CADA agente", () => {
+  const solanaSlots: ReadonlyArray<readonly [string, string]> = [
+    ["remit-kyc-validator", KYC_ENV],
+    ["remit-corridor-fx", FX_ENV],
+    ["remit-cashout-payout", PAYOUT_ENV],
+  ];
 
-  it("payTo de la familia equivocada: el agente cobraría $0 (INVALID_PAY_TO_FORMAT) — se rechaza en origen [base58 en slot evm]", () => {
-    vi.stubEnv(KYC_ENV, SOL_OK); // slot avalanche-fuji
-    const result = buildManifest("remit-kyc-validator");
-    expect(result.ok).toBe(false);
-    if (result.ok) throw new Error("unreachable");
-    expect(result.reason).toBe("invalid_format");
-    expect(result.invalid).toEqual(["payment.contract"]);
-  });
-
-  it("el payout Solana tampoco acepta una EVM", () => {
-    vi.stubEnv(PAYOUT_ENV, EVM_OK);
-    const result = buildManifest("remit-cashout-payout");
-    expect(result.ok).toBe(false);
-    if (result.ok) throw new Error("unreachable");
-    expect(result.reason).toBe("invalid_format");
-  });
+  for (const [pathSlug, env] of solanaSlots) {
+    it(`${pathSlug}: payTo de la familia equivocada: el agente cobraría $0 (INVALID_PAY_TO_FORMAT) — se rechaza en origen [EVM en slot solana]`, () => {
+      vi.stubEnv(env, EVM_OK);
+      const result = buildManifest(pathSlug);
+      expect(result.ok).toBe(false);
+      if (result.ok) throw new Error("unreachable");
+      expect(result.reason).toBe("invalid_format");
+      expect(result.invalid).toEqual(["payment.contract"]);
+      expect(result.missing).toEqual([]);
+    });
+  }
 });
 
 // T19 — fail-closed total

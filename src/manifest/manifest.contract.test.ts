@@ -39,7 +39,7 @@ afterEach(() => {
 // T18 — AC-1..AC-3
 describe("ancla del wire — 7 claves de primer nivel, ni una más", () => {
   beforeEach(() => {
-    vi.stubEnv(KYC_ENV, EVM_OK);
+    vi.stubEnv(KYC_ENV, SOL_OK); // los 3 slots son Solana: el KYC también cobra en solana-devnet
     vi.stubEnv(FX_ENV, SOL_OK);
     vi.stubEnv(PAYOUT_ENV, SOL_OK);
   });
