@@ -3,7 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Agentes reales del pipeline de remesas de Chaski (v2, en paralelo al demo). Providers Didit/TransFi con fallback determinístico.",
+  "description": "Tres agentes A2A de remesas USDC→PEN que cobran en USDC sobre Solana devnet vía x402: KYC/AML, cotización FX con fuentes verificables y cash-out a Perú.",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "dev": "next dev -p 3030",
     "build": "next build",

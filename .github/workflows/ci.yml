@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    name: typecheck + tests + build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Alineado con `.nvmrc` y con `engines.node` de package.json.
+          node-version-file: '.nvmrc'
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      # tsc --noEmit sobre todo el repo (tsconfig.json).
+      #
+      # NO hay paso de lint: este repo no tiene linter instalado ni script `lint`
+      # (ver `scripts` en package.json). Poner un `npx <linter>` acá resolvería el
+      # paquete desde la red y daría verde sin configuración: un control muerto.
+      # Cuando se agregue el linter, se agrega el paso.
+      - name: Typecheck
+        run: npm run typecheck
+
+      # vitest run: agentes, providers, manifiestos, rutas HTTP y contract tests.
+      # Los tests NO tocan la red ni requieren envs: el fail-closed de los manifiestos
+      # se ejercita seteando/borrando las envs dentro de cada test.
+      - name: Tests
+        run: npm test
+
+      - name: Build
+        run: npm run build
