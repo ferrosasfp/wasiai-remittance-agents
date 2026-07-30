@@ -47,13 +47,13 @@ function emittedPayment(pathSlug: string): AgentPaymentSpec {
 // `SOLANA_ADAPTER_ENABLED` apagado (BLQ-1 del AR).
 describe("¿cobra cada agente? — el payment emitido pasado por las guardas reales del gateway", () => {
   beforeEach(() => {
-    vi.stubEnv(KYC_ENV, EVM_OK);
+    vi.stubEnv(KYC_ENV, SOL_OK); // los 3 agentes cobran en solana-devnet
     vi.stubEnv(FX_ENV, SOL_OK);
     vi.stubEnv(PAYOUT_ENV, SOL_OK);
   });
 
-  it("remit-kyc-validator COBRARÍA (WOULD_SETTLE) con su payTo Fuji y avalanche-fuji inicializada", () => {
-    expect(evaluateSettle(emittedPayment("remit-kyc-validator"), ["avalanche-fuji"])).toBe(
+  it("remit-kyc-validator COBRARÍA (WOULD_SETTLE) SÓLO si el gateway tiene solana-devnet inicializada", () => {
+    expect(evaluateSettle(emittedPayment("remit-kyc-validator"), ["solana-devnet"])).toBe(
       "WOULD_SETTLE",
     );
   });
@@ -91,21 +91,29 @@ describe("¿cobra cada agente? — el payment emitido pasado por las guardas rea
 // "el manifiesto está bien" y "el agente cobra" son afirmaciones DISTINTAS.
 describe("el rail tiene que estar PRENDIDO: chain no inicializada ⇒ el agente no cobra", () => {
   beforeEach(() => {
-    vi.stubEnv(KYC_ENV, EVM_OK);
+    vi.stubEnv(KYC_ENV, SOL_OK); // los 3 agentes cobran en solana-devnet
     vi.stubEnv(FX_ENV, SOL_OK);
     vi.stubEnv(PAYOUT_ENV, SOL_OK);
   });
 
-  it("gateway SIN solana-devnet inicializada: los 2 agentes Solana cobran $0 (CHAIN_NOT_SUPPORTED)", () => {
+  // Ahora que los 3 agentes cobran en Solana, este escenario ya no deja "uno en pie": es el
+  // pipeline ENTERO cobrando $0. Es el costo real de haber sacado a Avalanche del camino, y por eso
+  // el rail Solana prendido en el gateway pasó de ser una condición de dos patas a una de tres.
+  it("gateway SIN solana-devnet inicializada: los 3 agentes cobran $0 (CHAIN_NOT_SUPPORTED)", () => {
     const sinSolana = ["avalanche-fuji"]; // entorno con SOLANA_ADAPTER_ENABLED != 'true'
-    expect(evaluateSettle(emittedPayment("remit-corridor-fx"), sinSolana)).toBe(
-      "CHAIN_NOT_SUPPORTED",
+    const verdicts = ["remit-kyc-validator", "remit-corridor-fx", "remit-cashout-payout"].map(
+      (pathSlug) => evaluateSettle(emittedPayment(pathSlug), sinSolana),
     );
-    expect(evaluateSettle(emittedPayment("remit-cashout-payout"), sinSolana)).toBe(
+    expect(verdicts).toEqual([
       "CHAIN_NOT_SUPPORTED",
-    );
-    // …y el corte es POR CHAIN, no un apagón global: el de Fuji sigue cobrando.
-    expect(evaluateSettle(emittedPayment("remit-kyc-validator"), sinSolana)).toBe("WOULD_SETTLE");
+      "CHAIN_NOT_SUPPORTED",
+      "CHAIN_NOT_SUPPORTED",
+    ]);
+    // …y el corte sigue siendo POR CHAIN, no un apagón global: un payment de Fuji cobraría en ese
+    // mismo gateway. Lo prueba un payment sintético porque ya no hay ningún agente EVM.
+    expect(
+      evaluateSettle({ method: "x402", chain: "avalanche-fuji", contract: EVM_OK, asset: "USDC" }, sinSolana),
+    ).toBe("WOULD_SETTLE");
   });
 
   it("el manifiesto se emite igual: un 200 NO prueba que el rail de cobro esté prendido", () => {
@@ -196,10 +204,14 @@ describe("los valores que el manifiesto se niega a publicar son EXACTAMENTE los 
         AMBAS_PRENDIDAS,
       ),
     ).toBe("ZERO_PAY_TO");
-    // (b) …por eso el manifiesto no la emite.
+    // (b) …por eso el manifiesto no la emite. Ojo con el POR QUÉ: en el slot Solana del KYC la
+    //     zero-address EVM ni siquiera llega a la guarda de zero-address, se cae antes por formato.
+    //     El efecto sobre la plata es el mismo (no se publica); el diagnóstico, no.
     vi.stubEnv(KYC_ENV, EVM_ZERO);
     const result = buildManifest("remit-kyc-validator");
     expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("unreachable");
+    expect(result.reason).toBe("invalid_format");
   });
 
   it("payTo de la familia equivocada: el agente cobraría $0 (INVALID_PAY_TO_FORMAT) — se rechaza en origen", () => {
@@ -213,15 +225,19 @@ describe("los valores que el manifiesto se niega a publicar son EXACTAMENTE los 
     vi.stubEnv(FX_ENV, EVM_OK);
     expect(buildManifest("remit-corridor-fx").ok).toBe(false);
 
-    // base58 en un slot EVM
+    // …y lo mismo para el KYC, que ahora también cobra en solana-devnet: la address EVM que le
+    // servía cuando cobraba en Fuji es hoy exactamente el valor que lo dejaría cobrando $0.
+    vi.stubEnv(KYC_ENV, EVM_OK);
+    expect(buildManifest("remit-kyc-validator").ok).toBe(false);
+
+    // El sentido inverso (base58 en un slot EVM) sigue siendo un skip real del gateway, pero ya no
+    // hay ningún agente EVM que pueda caer en él: se afirma sólo contra el oráculo.
     expect(
       evaluateSettle(
         { method: "x402", chain: "avalanche-fuji", contract: SOL_OK, asset: "USDC" },
         AMBAS_PRENDIDAS,
       ),
     ).toBe("INVALID_PAY_TO_FORMAT");
-    vi.stubEnv(KYC_ENV, SOL_OK);
-    expect(buildManifest("remit-kyc-validator").ok).toBe(false);
   });
 
   it("sin payTo no hay manifiesto, y un registro sin payment nunca paga (NO_PAYMENT_FIELD)", () => {

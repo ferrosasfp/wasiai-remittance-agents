@@ -65,8 +65,18 @@ describe("registry — invariantes de la tabla (T16)", () => {
     ]);
   });
 
+  // El pedido del mentor de la incubadora: el pipeline de Chaski cobra en Solana y "no debe
+  // intervenir Avalanche". Es una afirmación sobre LOS 3, no sobre dos: si alguien devuelve
+  // cualquier entrada a una chain EVM, este test se pone rojo con ese nombre.
+  it("ningún agente cobra en una chain EVM: los 3 declaran solana-devnet / family solana", () => {
+    for (const entry of MANIFEST_ENTRIES) {
+      expect(entry.chain).toBe("solana-devnet");
+      expect(entry.family).toBe("solana");
+    }
+  });
+
   it("chain y slug por agente son los canónicos de cobro", () => {
-    expect(findEntry("remit-kyc-validator")?.chain).toBe("avalanche-fuji");
+    expect(findEntry("remit-kyc-validator")?.chain).toBe("solana-devnet");
     expect(findEntry("remit-corridor-fx")?.chain).toBe("solana-devnet");
     expect(findEntry("remit-cashout-payout")?.chain).toBe("solana-devnet");
     expect(findEntry("remit-corridor-fx")?.slug).toBe("remit-corridor-fx-solana");

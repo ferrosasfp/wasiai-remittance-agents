@@ -1,5 +1,6 @@
 // src/app/api/agents/remit-kyc-validator/manifest/route.test.ts
-// Superficie HTTP del manifiesto de remit-kyc-validator (chain avalanche-fuji, familia EVM).
+// Superficie HTTP del manifiesto de remit-kyc-validator (chain solana-devnet, familia solana: el
+// pipeline de remesas cobra entero en Solana, ninguna pata toca Avalanche).
 // Los únicos códigos permitidos son 200 y 503: un 200 con ficha a medias es exactamente el bug que
 // esta HU viene a matar (alguien lo copia al registro y el agente cobra $0 en silencio).
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
@@ -11,9 +12,9 @@ const ENDPOINT = "http://localhost/api/agents/remit-kyc-validator/manifest";
 const KYC_ENV = "REMIT_KYC_VALIDATOR_PAYTO";
 
 // Fixtures de FORMATO (no son wallets reales — no usar en ningún runbook).
-const EVM_OK = "0x1111111111111111111111111111111111111111";
-const EVM_OK_2 = "0x2222222222222222222222222222222222222222";
 const SOL_OK = "Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr";
+const SOL_OK_2 = "So11111111111111111111111111111111111111112";
+const EVM_OK = "0x1111111111111111111111111111111111111111";
 
 function get(url: string = ENDPOINT, headers?: Record<string, string>) {
   return GET(new NextRequest(url, headers ? { headers } : undefined));
@@ -28,10 +29,10 @@ afterEach(() => {
 // T1 — AC-1
 describe("GET /api/agents/remit-kyc-validator/manifest — publicable", () => {
   beforeEach(() => {
-    vi.stubEnv(KYC_ENV, EVM_OK);
+    vi.stubEnv(KYC_ENV, SOL_OK);
   });
 
-  it("200 con las capabilities exactas y el payment completo de Fuji", async () => {
+  it("200 con las capabilities exactas y el payment completo de solana-devnet", async () => {
     const res = await get();
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -43,8 +44,8 @@ describe("GET /api/agents/remit-kyc-validator/manifest — publicable", () => {
     ]);
     expect(body.payment).toEqual({
       method: "x402",
-      chain: "avalanche-fuji",
-      contract: EVM_OK,
+      chain: "solana-devnet",
+      contract: SOL_OK,
       asset: "USDC",
     });
     expect(body.slug).toBe("remit-kyc-validator");
@@ -70,7 +71,7 @@ describe("GET /api/agents/remit-kyc-validator/manifest — publicable", () => {
     });
     const res = await get();
     expect(res.status).toBe(200);
-    expect((await res.json()).payment.contract).toBe(EVM_OK);
+    expect((await res.json()).payment.contract).toBe(SOL_OK);
   });
 
   // T15 — AC-8
@@ -92,12 +93,12 @@ describe("GET /api/agents/remit-kyc-validator/manifest — publicable", () => {
 // T14c — AC-7
 describe("GET manifest — la env se lee en cada request (no hay caché ni lectura congelada)", () => {
   it("dos GET con envs distintas devuelven contracts distintos", async () => {
-    vi.stubEnv(KYC_ENV, EVM_OK);
+    vi.stubEnv(KYC_ENV, SOL_OK);
     const first = await (await get()).json();
-    vi.stubEnv(KYC_ENV, EVM_OK_2);
+    vi.stubEnv(KYC_ENV, SOL_OK_2);
     const second = await (await get()).json();
-    expect(first.payment.contract).toBe(EVM_OK);
-    expect(second.payment.contract).toBe(EVM_OK_2);
+    expect(first.payment.contract).toBe(SOL_OK);
+    expect(second.payment.contract).toBe(SOL_OK_2);
     expect(second.payment.contract).not.toBe(first.payment.contract);
   });
 });
@@ -133,7 +134,7 @@ describe("GET manifest — fail-closed: nadie puede copiar una ficha a medias", 
   });
 
   it("payTo con formato inválido ⇒ 503 invalid, sin payment", async () => {
-    vi.stubEnv(KYC_ENV, "0x111111111111111111111111111111111111111"); // 39 hex
+    vi.stubEnv(KYC_ENV, "z".repeat(44)); // base58 de 44 chars que decodifica a 33 bytes
     const res = await get();
     expect(res.status).toBe(503);
     const body = await res.json();
@@ -142,8 +143,11 @@ describe("GET manifest — fail-closed: nadie puede copiar una ficha a medias", 
     expect(body.missing).toEqual([]);
   });
 
-  it("payTo de la familia equivocada (base58 en slot avalanche-fuji) ⇒ 503", async () => {
-    vi.stubEnv(KYC_ENV, SOL_OK);
+  // El error más probable del operador después del pase a Solana: dejar en la env la address EVM
+  // que servía cuando este agente cobraba en Fuji. El settle la rechazaría (INVALID_PAY_TO_FORMAT)
+  // y el agente cobraría $0 con un manifiesto diciendo que todo está bien.
+  it("payTo de la familia equivocada (EVM en slot solana-devnet) ⇒ 503", async () => {
+    vi.stubEnv(KYC_ENV, EVM_OK);
     const res = await get();
     expect(res.status).toBe(503);
     const body = await res.json();
@@ -164,7 +168,7 @@ describe("GET manifest — fail-closed: nadie puede copiar una ficha a medias", 
   // ahí un 200 con ficha a medias (el bug que esta HU vino a matar) y la suite quedaba verde.
   it("si buildManifest LANZA: 503 sin payment (no un 200 a medias, no un 500)", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    vi.stubEnv(KYC_ENV, EVM_OK); // env PERFECTA: el 503 sale del catch, no del fail-closed
+    vi.stubEnv(KYC_ENV, SOL_OK); // env PERFECTA: el 503 sale del catch, no del fail-closed
     vi.resetModules();
     vi.doMock("@/manifest/build", () => ({
       buildManifest: () => {
@@ -184,7 +188,7 @@ describe("GET manifest — fail-closed: nadie puede copiar una ficha a medias", 
       // el log del catch tampoco ecoa el mensaje del error ni el valor de la env
       const logged = JSON.stringify(warn.mock.calls);
       expect(logged).not.toContain("boom-interno-del-manifiesto");
-      expect(logged).not.toContain(EVM_OK);
+      expect(logged).not.toContain(SOL_OK);
     } finally {
       vi.doUnmock("@/manifest/build");
       vi.resetModules();
