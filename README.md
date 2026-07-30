@@ -44,6 +44,11 @@ La factory (`getKycProvider()` etc.) elige adapter vs fallback según env. Así 
 en fallback, y el día que llega el sandbox del partner solo se setea la env key — cero cambio de wiring.
 
 ## Env vars (se setean en Fase A, cuando lleguen los sandboxes)
+
+> **¿A qué billetera cobra cada agente?** A la que diga su env de `payTo`, una por agente. Están
+> documentadas en [`.env.example`](.env.example) (qué agente, qué red, qué formato, y qué pasa si
+> falta) y se setean como variables de entorno del proyecto en Vercel, no en un archivo del repo.
+
 ```
 DIDIT_API_KEY=            # KYC/AML (Didit)
 TRANSFI_API_KEY=          # quote + payout (TransFi)
@@ -342,8 +347,8 @@ body ni en los logs (ni truncado, ni hasheado). Ambas claves están siempre pres
 
 Por eso: sin `payTo` configurado, o con un `payTo` mal formado, el manifiesto **no se emite** (`503`). No
 existe ninguna rama de código que devuelva `200` sin un `payment.contract` válido. En particular se
-rechaza el **cruce de familias** (una address EVM `0x…` en un slot `solana-devnet`, o una base58 en el
-slot `avalanche-fuji`), que es el error más probable del operador al copiar y pegar entre entornos: el
+rechaza el **cruce de familias**: una address EVM `0x…` en un slot `solana-devnet` — y los 3 slots son
+`solana-devnet`. Es el error más probable del operador al copiar y pegar entre entornos: el
 settle la rechazaría con `INVALID_PAY_TO_FORMAT` y el agente cobraría cero igual, pero con un manifiesto
 diciendo que todo está bien.
 
@@ -354,9 +359,14 @@ zero-address; Solana: base58 que decodifica a **exactamente 32 bytes**, no "entr
 
 | Agente | Env del `payTo` | Familia esperada |
 |---|---|---|
-| `remit-kyc-validator` | `REMIT_KYC_VALIDATOR_PAYTO` | EVM (`0x` + 40 hex) |
+| `remit-kyc-validator` | `REMIT_KYC_VALIDATOR_PAYTO` | Solana (base58, 32 bytes) |
 | `remit-corridor-fx` | `REMIT_CORRIDOR_FX_PAYTO` | Solana (base58, 32 bytes) |
 | `remit-cashout-payout` | `REMIT_CASHOUT_PAYOUT_PAYTO` | Solana (base58, 32 bytes) |
+
+Detalle completo de las 3 (qué agente, qué red, qué pasa si falta, dónde se setean de verdad):
+[`.env.example`](.env.example). **Hoy las 3 apuntan a propósito a la misma billetera** (decisión del
+founder); son variables separadas para que darle a cada agente la suya sea cambiar una variable de
+entorno en Vercel, sin tocar ni deployar código. Ninguna dirección vive en el código.
 
 **Ninguna tiene default.** Sin la env (ausente, vacía o sólo whitespace) el endpoint responde `503`: es el
 comportamiento deseado, no un bug. La `chain` **no** es configurable: vive como constante de código en
@@ -367,7 +377,7 @@ ninguna variable de entorno puede llevar un manifiesto a mainnet.
 
 | pathSlug (directorio de la ruta) | slug canónico (registro) | chain |
 |---|---|---|
-| `remit-kyc-validator` | `remit-kyc-validator` | `avalanche-fuji` |
+| `remit-kyc-validator` | `remit-kyc-validator` | `solana-devnet` |
 | `remit-corridor-fx` | `remit-corridor-fx-solana` | `solana-devnet` |
 | `remit-cashout-payout` | `remit-cashout-payout-solana` | `solana-devnet` |
 
@@ -380,21 +390,24 @@ ninguna variable de entorno puede llevar un manifiesto a mainnet.
 El registro y el deslistado **no los hace este repo**: son **ops `!` humano** en `wasiai-a2a`. Este repo
 sólo publica la ficha.
 
-1. **Setear las 3 envs** en Vercel (Production) y redeploy. Para las 2 de Solana: usar las **mismas**
-   addresses que ya declaran las filas `*-solana` en el registro (leerlas de `/discover` **antes** de
-   setear; no inventar una segunda verdad).
+1. **Setear las 3 envs** en Vercel (Production) y redeploy — las 3 son base58 de Solana. Para FX y
+   payout: usar las **mismas** addresses que ya declaran las filas `*-solana` en el registro (leerlas de
+   `/discover` **antes** de setear; no inventar una segunda verdad). Para el KYC: hoy, por decisión del
+   founder, **la misma billetera que las otras dos**; el día que se separe, es esta variable y nada más.
 2. **Verificar los 3 manifiestos por `curl`**: `200`, `payment.chain` correcto y `Cache-Control: no-store`.
    Con una env borrada a propósito, confirmar el `503` (prueba viva del fail-closed).
 3. **Drift check sin escribir**: comparar el `payment` del manifiesto contra el de `/discover` para los 2
    slugs `*-solana`. Si difieren, **no** se corrige a mano.
    > ⚠️ Este chequeo **no prueba nada sobre el cobro**: coinciden **por construcción**, porque el paso 1
    > manda copiar las addresses **desde esas mismas filas**. Es un chequeo de consistencia documental.
-4. **Registrar/actualizar `remit-kyc-validator`** con su `payment` (requiere la HU hermana del otro repo).
+4. **Registrar/actualizar `remit-kyc-validator`** con su `payment` — que ahora declara `solana-devnet`,
+   no `avalanche-fuji` (requiere la HU hermana del otro repo). Si la fila registrada quedó con el
+   `payment` viejo de Fuji, el manifiesto y el registro dicen cosas distintas y manda el registro.
 5. **Probar que el rail de cobro está PRENDIDO** (prueba positiva, no coincidencia de documentos):
    - **Mínimo obligatorio**: `GET /capabilities` del gateway y verificar que `chains[].key` incluye
      `solana-devnet`. Si no está, el adapter Solana está apagado (`SOLANA_ADAPTER_ENABLED`, **default
-     OFF**) y el leg downstream de los 2 agentes `*-solana` se saltea con `CHAIN_NOT_SUPPORTED`: cobran
-     **$0**, con manifiesto `200` y todo.
+     OFF**) y el leg downstream se saltea con `CHAIN_NOT_SUPPORTED` para **los 3** agentes (ya no queda
+     ninguno cobrando por una chain EVM): cobran **$0**, con manifiesto `200` y todo.
    - **Ideal**: una invocación real en devnet contra cada slug `*-solana` y confirmar en el resultado /
      los logs del gateway que el leg **settleó** (ninguno de los skip-codes `NO_PAYMENT_FIELD`,
      `METHOD_NOT_SUPPORTED`, `CHAIN_NOT_SUPPORTED`, `INVALID_PAY_TO_FORMAT`).
@@ -408,9 +421,9 @@ sólo publica la ficha.
 ### Correr local
 
 ```bash
-REMIT_KYC_VALIDATOR_PAYTO=0x… \
-REMIT_CORRIDOR_FX_PAYTO=… \
-REMIT_CASHOUT_PAYOUT_PAYTO=… \
+REMIT_KYC_VALIDATOR_PAYTO=<base58 de Solana, 32 bytes> \
+REMIT_CORRIDOR_FX_PAYTO=<base58 de Solana, 32 bytes> \
+REMIT_CASHOUT_PAYOUT_PAYTO=<base58 de Solana, 32 bytes> \
 npm run dev
 curl -sD- http://localhost:3030/api/agents/remit-kyc-validator/manifest
 ```
