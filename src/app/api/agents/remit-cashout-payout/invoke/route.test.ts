@@ -36,7 +36,9 @@ function invoke(body: unknown) {
 
 describe("POST /api/agents/remit-cashout-payout/invoke", () => {
   beforeEach(() => {
-    vi.stubEnv("TRANSFI_API_KEY", "");        // TransFi OFF → FallbackPayoutProvider (CD-4)
+    vi.stubEnv("TRANSFI_API_KEY", "");        // NO gatea el payout (la lee fx.ts): borrarla no elige
+    // el mock. Acá el FallbackPayoutProvider sale de que TRANSFI_USERNAME/PASSWORD/MID no están
+    // seteadas en el entorno de test; este stub sólo aísla del ambiente al FX (CD-4).
     vi.stubEnv("ALLOW_FALLBACK_PAYOUT", "true"); // en NODE_ENV=test corre el mock por la rama dev
     // WKH-203: el gate KYC server-side corre en cada invoke. En NODE_ENV="test" (≠ production)
     // el KYC fallback pasa por la rama B5 (opt-in explícito) → los tests del happy-path HTTP siguen

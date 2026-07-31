@@ -73,9 +73,16 @@ function assertPayoutProviderSafe(): void {
   if (process.env.NODE_ENV === "production") {
     // ⚠️ SEGURIDAD MONEY-PATH (WKH-172, etapa 1): PAYOUT_ALLOW_MOCK habilita SOLO el
     // FallbackPayoutProvider (mock, NUNCA mueve plata). NO abre ningún path a desembolso real:
-    // el path real sigue 100% gated por TRANSFI_API_KEY + TRANSFI_ADAPTER_READY (chequeado arriba
-    // vía hasReal, y de nuevo en getPayoutProvider()). Activar este flag en CUALQUIER deploy que
-    // no sea el de etapa 1 (mock) es un INCIDENTE DE SEGURIDAD money-path.
+    // el path real sigue gated por TRANSFI_USERNAME + TRANSFI_PASSWORD + TRANSFI_MID +
+    // TRANSFI_ADAPTER_READY==="true" (el `hasReal` de arriba, y de nuevo en getPayoutProvider()).
+    // NO lo gatea TRANSFI_API_KEY: esa la lee fx.ts y nadie de este path (ver el comentario de
+    // getPayoutProvider() en providers/payout.ts). Auditar el candado por esa variable es mirar
+    // la que no es: setearla o borrarla no mueve NADA del payout.
+    // Ojo que los dos modos de falla NO son el mismo: faltando cualquiera de las 3 credenciales
+    // se cae al mock en silencio, mientras que con las 3 puestas y TRANSFI_ADAPTER_READY!=="true"
+    // getPayoutProvider() LANZA transfi_adapter_not_ready en vez de degradar al mock.
+    // Activar este flag en CUALQUIER deploy que no sea el de etapa 1 (mock) es un
+    // INCIDENTE DE SEGURIDAD money-path.
     if (process.env.PAYOUT_ALLOW_MOCK !== "true") {
       throw new Error("payout_refused: se requiere provider de payout REAL en producción (no fallback)");
     }
