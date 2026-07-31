@@ -234,6 +234,7 @@ describe("FX y payout hablan SIEMPRE con el mismo ambiente (G-15)", () => {
     setEnv("TRANSFI_USERNAME", "u");
     setEnv("TRANSFI_PASSWORD", "p");
     setEnv("TRANSFI_MID", "m");
+    setEnv("TRANSFI_USDC_NETWORK", "solana"); // sin default: `execute()` exige la red declarada
 
     const fx = stubFetchCapturing({
       rate: 3.6,
@@ -266,6 +267,7 @@ describe("FX y payout hablan SIEMPRE con el mismo ambiente (G-15)", () => {
     setEnv("TRANSFI_USERNAME", "u");
     setEnv("TRANSFI_PASSWORD", "p");
     setEnv("TRANSFI_MID", "m");
+    setEnv("TRANSFI_USDC_NETWORK", "solana"); // sin default: `execute()` exige la red declarada
 
     const fx = stubFetchCapturing({
       rate: 3.6,

@@ -18,8 +18,30 @@ import type { PayoutInput, PayoutProvider, PayoutResult } from "./types";
 // productivo, así que el repo entero podía quedar "sandbox a medias". El ambiente ahora es explícito
 // y único (`transfi-env.ts`, fail-closed sin `TRANSFI_ENV`) y llega inyectado al adapter.
 
-// DT-2 (humano, 2026-07-17): la red del USDC es Base. Configurable por env, fail-loud si no soportada.
-const TRANSFI_DEFAULT_NETWORK = "base";
+// DT-2 (revertida 2026-07-30): la red del USDC YA NO tiene default. Hasta este fix esta constante
+// valía `"base"` y `execute()` la usaba cuando `TRANSFI_USDC_NETWORK` estaba ausente, mientras que
+// `resolveDevnetStubAddress()` (abajo) lee la MISMA env con el criterio opuesto: ausente ≠ "solana"
+// → stub apagado. Con la env sin setear el resultado medible era: stub devnet apagado y orden REAL
+// armada como `USDCBASE`. De los dos criterios, el permisivo era el del camino de la plata.
+// El repo ya había pagado este mismo bug con `TRANSFI_BASE_URL` (ver el bloque CD-1 de arriba).
+
+/**
+ * ÚNICA lectura de `TRANSFI_USDC_NETWORK` en el repo: devuelve el valor CRUDO (sin trim ni
+ * lowercase), o `undefined` si la env no está seteada. Tener un solo call site del `process.env`
+ * es lo que impide que un rename o un default nuevo vuelva a separar a los dos consumidores.
+ *
+ * Los dos consumidores tratan "env no declarada" igual (fail-closed), pero NO comparten
+ * normalización, a propósito:
+ *  · `resolveDevnetStubAddress()` exige la igualdad estricta `=== "solana"`: un escape-hatch de
+ *    devnet se activa solo con el valor exacto.
+ *  · `execute()` delega en `resolveSourceCurrency()`, que hace `trim().toLowerCase()` antes de
+ *    buscar en el allowlist y lanza si la red no está.
+ * Consecuencia verificable con un input concreto: con `TRANSFI_USDC_NETWORK="Solana"` (mayúscula)
+ * la orden real sale con `USDCSOL` y el stub devnet queda en `null`.
+ */
+function readUsdcNetworkEnv(): string | undefined {
+  return process.env.TRANSFI_USDC_NETWORK;
+}
 
 // Códigos `source.currency` publicados por TransFi (doc/transfi-offramp-api-spec.md L38).
 // ⚠️ Avalanche (`USDCAVAX`) NO está en la lista → cae en fail-loud (AC-6), a propósito.
@@ -60,7 +82,7 @@ const BASE58_ADDR_RE = /^[123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuv
 export function resolveDevnetStubAddress(): string | null {
   const raw = process.env.TRANSFI_DEVNET_SOLANA_DEPOSIT_ADDRESS;
   if (!raw) return null; // CD-4: unset/"" → byte-idéntico
-  if (process.env.TRANSFI_USDC_NETWORK !== "solana") return null; // CD-2 (b) / DT-3 guard de red
+  if (readUsdcNetworkEnv() !== "solana") return null; // CD-2 (b) / DT-3 guard de red
   const addr = raw.trim();
   if (!BASE58_ADDR_RE.test(addr)) {
     // CD-5 fail-closed
@@ -113,10 +135,16 @@ export class TransFiPayoutProvider implements PayoutProvider {
 
   async execute(input: PayoutInput): Promise<PayoutResult> {
     // AC-6: resolver la red PRIMERO (fail-loud antes de tocar la red). Una red no soportada
-    // NO debe llegar al fetch.
-    const sourceCurrency = resolveSourceCurrency(
-      process.env.TRANSFI_USDC_NETWORK ?? TRANSFI_DEFAULT_NETWORK,
-    );
+    // NO debe llegar al fetch. Una red NO DECLARADA tampoco: sin `TRANSFI_USDC_NETWORK` no se
+    // adivina ninguna (env ausente, `""` y sólo-espacios son el mismo caso que "no soportada").
+    const network = readUsdcNetworkEnv()?.trim();
+    if (!network) {
+      // Value-free (CD-8): solo el nombre de la variable, nunca su contenido.
+      throw new Error(
+        "transfi_usdc_network_unset: seteá TRANSFI_USDC_NETWORK antes de crear una orden off-ramp.",
+      );
+    }
+    const sourceCurrency = resolveSourceCurrency(network);
 
     const res = await fetch(`${this.baseUrl}/v3/orders`, {
       method: "POST",

@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach, vi } from "vitest";
+import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import {
   FallbackPayoutProvider,
   TransFiPayoutProvider,
@@ -98,6 +98,10 @@ describe("assertValidPayout", () => {
 
 // ── Adapter TransFi — contrato HTTP real (WKH-208) ────────────────────────────
 describe("TransFiPayoutProvider.execute — contrato HTTP", () => {
+  // La red se DECLARA, igual que en un deploy: desde el fix de 2026-07-30 `execute()` no tiene
+  // default. Los casos que prueban el guard de la red la re-stubean con su propio valor.
+  beforeEach(() => vi.stubEnv("TRANSFI_USDC_NETWORK", "solana"));
+
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.unstubAllEnvs();
@@ -179,7 +183,49 @@ describe("TransFiPayoutProvider.execute — contrato HTTP", () => {
     expect(body.source.currency).toBe("USDCPOLYGON");
   });
 
-  it("AC-6 feliz: base (default) → source.currency USDCBASE", async () => {
+  it("AC-6: red no soportada (marte) → throw transfi_unsupported_network_marte, SIN llamar fetch", async () => {
+    const fetchMock = stubFetch({ orderId: "ord-1" });
+    vi.stubEnv("TRANSFI_USDC_NETWORK", "marte");
+    await expect(new TransFiPayoutProvider(CREDS, SANDBOX_BASE).execute(input)).rejects.toThrow(
+      /^transfi_unsupported_network_marte$/,
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  // ── Red NO declarada → fail-loud (fix 2026-07-30: se borró el default "base") ──────────────
+  // El default silencioso armaba una orden REAL `USDCBASE` con la env ausente, mientras el guard
+  // del stub devnet leía esa misma ausencia como "no es solana". Ahora los dos fallan cerrados.
+  it.each([
+    ["ausente", undefined],
+    ["cadena vacía", ""],
+    ["sólo espacios", "   "],
+  ])(
+    "red no declarada (%s) → throw transfi_usdc_network_unset, SIN llamar fetch",
+    async (_label, value) => {
+      const fetchMock = stubFetch({ orderId: "ord-1" });
+      vi.stubEnv("TRANSFI_USDC_NETWORK", value);
+      await expect(new TransFiPayoutProvider(CREDS, SANDBOX_BASE).execute(input)).rejects.toThrow(
+        /^transfi_usdc_network_unset:/,
+      );
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("el error de red no declarada es value-free: nombra la variable, no su contenido", async () => {
+    stubFetch({ orderId: "ord-1" });
+    vi.stubEnv("TRANSFI_USDC_NETWORK", "   ");
+    const err = await new TransFiPayoutProvider(CREDS, SANDBOX_BASE)
+      .execute(input)
+      .then(() => null)
+      .catch((e: unknown) => e as Error);
+    expect(err).toBeInstanceOf(Error);
+    expect(err!.message).toContain("TRANSFI_USDC_NETWORK");
+    // no ecoa el valor recibido (ni el viejo default que ya no existe)
+    expect(err!.message).not.toContain("base");
+    expect(err!.message).not.toMatch(/"|'/);
+  });
+
+  it("AC-6 feliz: base sigue SOPORTADA (ya no es el default) → source.currency USDCBASE", async () => {
     const fetchMock = stubFetch({ orderId: "ord-1", walletAddress: "0xdep" });
     vi.stubEnv("TRANSFI_USDC_NETWORK", "base");
     await new TransFiPayoutProvider(CREDS, SANDBOX_BASE).execute(input);
@@ -362,6 +408,18 @@ describe("FallbackPayoutProvider — escape-hatch devnet (WKH-232 / HU-SOL-15)",
     expect(resolveDevnetStubAddress()).toBe("1".repeat(44));
     vi.stubEnv("TRANSFI_DEVNET_SOLANA_DEPOSIT_ADDRESS", "1".repeat(45));
     expect(resolveDevnetStubAddress()).toBeNull();
+  });
+
+  it("T-10 (regresión fix 2026-07-30): el guard de red del stub sigue siendo igualdad estricta", () => {
+    vi.stubEnv("TRANSFI_DEVNET_SOLANA_DEPOSIT_ADDRESS", VALID);
+    // ausente / vacía / espacios / distinta capitalización / con padding → null (byte-idéntico)
+    for (const net of [undefined, "", "   ", "Solana", " solana ", "SOLANA", "base"]) {
+      vi.stubEnv("TRANSFI_USDC_NETWORK", net);
+      expect(resolveDevnetStubAddress()).toBeNull();
+    }
+    // el único valor que activa el hatch sigue siendo el literal exacto
+    vi.stubEnv("TRANSFI_USDC_NETWORK", "solana");
+    expect(resolveDevnetStubAddress()).toBe(VALID);
   });
 
   it("T-9 (CD-10): charset — chars ambiguos 0/O/I/l → null", () => {
