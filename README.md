@@ -4,7 +4,11 @@
 
 Three autonomous agents of the **USDC → PEN** remittance corridor (United States → Peru) that **charge
 for their work in USDC on `solana-devnet`**, over x402. They are discoverable, invoked over HTTP, and
-paid per call. **None of the three touches an EVM chain.**
+paid per call. **No collection leg touches an EVM chain**: the three charge on `solana-devnet`, and the
+`chain` in the manifest is a code constant typed as a closed set of test networks, so no environment
+variable can move it. The **disbursement** leg is a separate axis: the TransFi off-ramp adapter is
+multi-network by configuration (`TRANSFI_USDC_NETWORK`), and among the networks it accepts there are
+EVM ones (`base`, `polygon`, `arbitrum`, …). This corridor declares `solana`.
 
 | agent (billing slug) | what it does | price | charges on |
 |---|---|---|---|
@@ -13,7 +17,7 @@ paid per call. **None of the three touches an EVM chain.**
 | `remit-cashout-payout-solana` | Cash-out to Peru (Yape/Plin/CCI): the value delivery to the beneficiary. | 0.03 USDC | `solana-devnet` |
 
 **Where this actually stands.** The three `/invoke` and the three `/manifest` endpoints are
-implemented and green (**463 tests across 21 files**, no network). What is real today: the **FX
+implemented and green (**469 tests across 21 files**, no network). What is real today: the **FX
 quote** — live market rate, cascade over two independent sources, and **fail-closed**: with no rate
 it can back, it does not quote — and the **billing manifests**, which are never published half-filled.
 What is **not** real yet: KYC (Didit) and disbursement (TransFi). Both run on a **deterministic
@@ -48,9 +52,16 @@ GET  /api/agents/<agent>/manifest                           →  200 { …, paym
 The operator copies that `payment` block into the gateway's registry, and from there the gateway pays
 the agent on every invocation. **Why this split:** an agent signing its own settlements would need a
 hot key per agent and would reimplement the rail once per agent. With this split, the entire surface
-of this repo facing money is **one base58 address read from an environment variable** — and the code
-that validates it (`src/manifest/wallet-format.ts`) applies **the same criterion as the consumer's
-settle**, not one of its own.
+of this repo facing **its own billing** is **one base58 address read from an environment variable** —
+and the code that validates it (`src/manifest/wallet-format.ts`) applies **the same criterion as the
+consumer's settle**, not one of its own.
+
+That is the billing surface, and it is not the only place in the repo where money is described. The
+payout adapter builds an off-ramp order with `source.currency`, `source.walletAddress`, `source.amount`
+and the beneficiary's destination (`src/providers/payout.ts:149-188`): that is money surface too. What
+this repo does not have is the ability to *move* the funds by itself — it has no signing key on either
+leg, and the payout adapter is off in stage 1. The variables that hold that lock are listed in the
+`remit-cashout-payout` section.
 
 That split is also the reason `src/manifest/settle-preconditions.ts` exists: a **test oracle** that
 ports the gateway's real sequence guard by guard and in the same order (`NO_PAYMENT_FIELD`,
@@ -74,7 +85,7 @@ nvm use            # optional: picks up the version in .nvmrc
 npm install
 
 npm run typecheck  # tsc --noEmit
-npm test           # vitest run  →  463 tests, 21 files
+npm test           # vitest run  →  469 tests, 21 files
 npm run build      # next build
 ```
 
@@ -295,13 +306,18 @@ body: { "quoteId": "q1", "amountUsd": 100, "kycVerificationId": "v1",
         "senderIdentity": "<the vendor_data bound to that verification: national ID or wallet address>",
         "beneficiary": { "name": "<PII>", "country": "PE", "method": "yape", "destination": "<Yape/CCI>" },
         "idempotencyKey": "idem-1" }
-→ 200 { "result": { "slug", "executed", "status", "payoutId",
-                    "deliveredLocal", "txRef", "reason", "provenance" } }  # NO beneficiary, NO travelRuleData
+→ 200 { "result": { "slug", "executed", "status", "payoutId", "deliveredLocal", "txRef",
+                    "reason", "provenance", "depositAddress" } }  # NO beneficiary, NO travelRuleData
 → 200 { "result": { "executed": false, "status": "blocked", "reason": "kyc_gate_not_passed" } }  # KYC hard gate (server-side, not the caller's) or identity mismatch
 → 200 { "result": { "executed": false, "status": "blocked", "reason": "kyc_identity_claim_missing" } }  # identity claim missing
 → 400 { "error": "invalid_input", "details": {...} }  # invalid body (Zod messages, no PII)
 → 502 { "error": "payout_unavailable" }               # fail-safe / provider misconfig
 ```
+
+The `result` of the happy path carries **9 keys**. The last one, **`depositAddress`**, is the address
+dedicated to the order that TransFi returns on create-order: the address the sender is supposed to send
+the USDC to on-chain. It is `null` in the mock and in every `blocked` response, so a non-null value is
+also the sign that a real order was created (`src/agents/cashout-payout.ts:59`).
 
 > **Note**: the `kycPayoutAllowed` field was **removed from the schema**. The KYC hard gate is
 > **re-derived server-side** against Didit: `KycProvider.status(verificationId, identityClaim)` →
@@ -340,13 +356,35 @@ bound to that verification. No match → **blocked**.
 > that victim already knows their address. Real proof of possession is a follow-up work item.
 
 Stage 1 runs 100% on the **MOCK payout** (`FallbackPayoutProvider`, `provenance:"local-fallback"`,
-`deliveredLocal:null`, `txRef:null`): it NEVER moves real money. **TransFi stays OFF** (stage 2):
-`TRANSFI_API_KEY` / `TRANSFI_ADAPTER_READY` **not set** in the deploy.
+`deliveredLocal:null`, `txRef:null`): it NEVER moves real money. **TransFi stays OFF** (stage 2).
+
+### Which variables actually hold the lock on the disbursement
+
+The real adapter is chosen by `getPayoutProvider()` (`src/providers/payout.ts:310-324`), and the same
+four are re-checked by the `assertPayoutProviderSafe()` fail-safe (`src/agents/cashout-payout.ts:67-71`):
+
+| variable | what happens if it is missing |
+|---|---|
+| `TRANSFI_USERNAME` | falls back to the mock — any one of the three credentials missing is enough |
+| `TRANSFI_PASSWORD` | idem |
+| `TRANSFI_MID` | idem |
+| `TRANSFI_ADAPTER_READY` (must be `"true"`) | with the 3 credentials set and this one not `"true"`, it **throws** `transfi_adapter_not_ready`; it does not quietly downgrade to the mock |
+
+> ⚠️ **`TRANSFI_API_KEY` does NOT gate the disbursement.** It is read by the **FX** adapter (`fx.ts`)
+> and by nothing on the payout path — the code states it out loud at `src/providers/payout.ts:308`.
+> Setting it or clearing it moves nothing in the payout. An earlier version of this README named it as
+> the lock; anyone auditing the money-path by that variable was watching the wrong one.
+
+A fifth variable is not part of the selection gate, but the real adapter cannot create a single order
+without it: **`TRANSFI_USDC_NETWORK`** decides which chain the USDC leaves through (`solana` ⇒
+`USDCSOL`). Unset, empty or whitespace-only, `execute()` throws `transfi_usdc_network_unset` **before
+touching the network** (`payout.ts:140-147`). There is no default and no guessing: turning the adapter
+on without this variable gets you an adapter that fails on its first order.
 
 **`PAYOUT_ALLOW_MOCK` flag:** the `assertPayoutProviderSafe()` fail-safe throws `payout_refused` under
 `NODE_ENV=production` with no real provider. Since Vercel pins `NODE_ENV=production`, the stage 1
 deploy sets `PAYOUT_ALLOW_MOCK=true` to allow ONLY the mock. **It enables no path to a real
-disbursement** (that one remains 100% gated by `TRANSFI_API_KEY`+`TRANSFI_ADAPTER_READY`). ⚠️ Turning
+disbursement** (that one remains gated by the four variables in the table above). ⚠️ Turning
 `PAYOUT_ALLOW_MOCK` on in any deploy other than the stage 1 (mock) one is a **money-path security
 incident**.
 
@@ -492,6 +530,12 @@ This repo only publishes the sheet.
    payment** (steps 2 and 3 are not enough: both go green without ever touching the rail). Doing it
    earlier leaves the agent **with no billing route at all**. Delisting is reversible; being left
    without a billing route is not free.
+7. **Stage 2 only (not today): turning the real disbursement on.** Steps 1-6 are about *charging*; this
+   one is about *paying out*, and it is the step that moves real money. Set the four variables of the
+   lock (`TRANSFI_USERNAME`, `TRANSFI_PASSWORD`, `TRANSFI_MID`, `TRANSFI_ADAPTER_READY=true`) **and**
+   `TRANSFI_USDC_NETWORK` — for this corridor, `solana`. Skipping that last one is the trap: the gate
+   lets the adapter through and then every order dies with `transfi_usdc_network_unset`. Once a real
+   provider is in place, remove `PAYOUT_ALLOW_MOCK` from that deploy.
 
 ---
 

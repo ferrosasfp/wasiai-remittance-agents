@@ -4,7 +4,11 @@
 
 Tres agentes autónomos del corredor de remesas **USDC → PEN** (Estados Unidos → Perú) que **cobran
 por su trabajo en USDC sobre `solana-devnet`**, vía x402. Se descubren, se invocan por HTTP y se les
-paga por llamada. **Ninguno de los tres toca una chain EVM.**
+paga por llamada. **Ninguna pata de cobro toca una chain EVM**: los tres cobran en `solana-devnet`, y la
+`chain` del manifiesto es una constante de código tipada como un conjunto cerrado de redes de test, así
+que ninguna variable de entorno la mueve. La pata de **desembolso** es otro eje: el adapter de off-ramp
+de TransFi es multired por configuración (`TRANSFI_USDC_NETWORK`), y entre las redes que acepta hay EVM
+(`base`, `polygon`, `arbitrum`, …). Este corredor declara `solana`.
 
 | agente (slug de cobro) | qué hace | precio | cobra en |
 |---|---|---|---|
@@ -13,7 +17,7 @@ paga por llamada. **Ninguno de los tres toca una chain EVM.**
 | `remit-cashout-payout-solana` | Cash-out a Perú (Yape/Plin/CCI): la entrega de valor al beneficiario. | 0.03 USDC | `solana-devnet` |
 
 **Estado real.** Los 3 endpoints `/invoke` y los 3 `/manifest` están implementados y en verde
-(**463 tests en 21 archivos**, sin red). Ya es real la **cotización FX** —tasa de mercado en vivo,
+(**469 tests en 21 archivos**, sin red). Ya es real la **cotización FX** —tasa de mercado en vivo,
 cascada de dos fuentes independientes, y **fail-closed**: sin tasa que se pueda respaldar, no se
 cotiza— y son reales los **manifiestos de cobro**, que no se publican a medias. Todavía **no** son
 reales el KYC (Didit) ni el desembolso (TransFi): corren en **fallback determinístico**, tageado como
@@ -48,9 +52,16 @@ GET  /api/agents/<agente>/manifest                               →  200 { …,
 El operador copia ese bloque `payment` al registro del gateway, y desde ahí el gateway le paga al
 agente en cada invocación. **Por qué así:** un agente que firmara sus propios cobros necesitaría una
 hot key por agente y reimplementaría el rail una vez por agente. Con este reparto, toda la superficie
-de este repo frente al dinero es **una address base58 leída de una variable de entorno** — y el
-código que la valida (`src/manifest/wallet-format.ts`) aplica **el mismo criterio que el settle del
-consumidor**, no uno propio.
+de este repo frente a **su propio cobro** es **una address base58 leída de una variable de entorno** —
+y el código que la valida (`src/manifest/wallet-format.ts`) aplica **el mismo criterio que el settle
+del consumidor**, no uno propio.
+
+Esa es la superficie de cobro, y no es el único lugar del repo donde se describe dinero. El adapter de
+payout arma una orden de off-ramp con `source.currency`, `source.walletAddress`, `source.amount` y el
+destino del beneficiario (`src/providers/payout.ts:149-188`): eso también es superficie de dinero. Lo
+que este repo no tiene es la capacidad de *mover* los fondos por sí mismo: no tiene clave de firma en
+ninguna de las dos patas, y el adapter de payout está apagado en la etapa 1. Las variables que sostienen
+ese candado están listadas en la sección de `remit-cashout-payout`.
 
 Ese reparto es también la razón de `src/manifest/settle-preconditions.ts`: un **oráculo de test** que
 porta, guarda por guarda y en el mismo orden, la secuencia real del gateway (`NO_PAYMENT_FIELD`,
@@ -74,7 +85,7 @@ nvm use            # opcional: toma la version de .nvmrc
 npm install
 
 npm run typecheck  # tsc --noEmit
-npm test           # vitest run  →  463 tests, 21 archivos
+npm test           # vitest run  →  469 tests, 21 archivos
 npm run build      # next build
 ```
 
@@ -290,13 +301,18 @@ body: { "quoteId": "q1", "amountUsd": 100, "kycVerificationId": "v1",
         "senderIdentity": "<el vendor_data ligado a esa verificación: DNI o wallet address>",
         "beneficiary": { "name": "<PII>", "country": "PE", "method": "yape", "destination": "<Yape/CCI>" },
         "idempotencyKey": "idem-1" }
-→ 200 { "result": { "slug", "executed", "status", "payoutId",
-                    "deliveredLocal", "txRef", "reason", "provenance" } }  # SIN beneficiary ni travelRuleData
+→ 200 { "result": { "slug", "executed", "status", "payoutId", "deliveredLocal", "txRef",
+                    "reason", "provenance", "depositAddress" } }  # SIN beneficiary ni travelRuleData
 → 200 { "result": { "executed": false, "status": "blocked", "reason": "kyc_gate_not_passed" } }  # hard-gate KYC (server-side, no del caller) o la identidad no coincide
 → 200 { "result": { "executed": false, "status": "blocked", "reason": "kyc_identity_claim_missing" } }  # falta la identity claim
 → 400 { "error": "invalid_input", "details": {...} }  # body inválido (mensajes Zod, sin PII)
 → 502 { "error": "payout_unavailable" }               # fail-safe / misconfig del provider
 ```
+
+El `result` del camino feliz lleva **9 claves**. La última, **`depositAddress`**, es la address dedicada
+de la orden que devuelve TransFi en el create-order: la address a la que el sender tiene que mandar el
+USDC on-chain. Es `null` en el mock y en toda respuesta `blocked`, así que un valor no nulo es también
+la señal de que se creó una orden real (`src/agents/cashout-payout.ts:59`).
 
 > **Nota**: el campo `kycPayoutAllowed` fue **removido del schema**. El hard-gate KYC se **re-deriva server-side** contra Didit: `KycProvider.status(verificationId, identityClaim)` → allowlist `REAL_KYC_PROVENANCES`. (El 2º parámetro es **requerido**: un opcional se puede olvidar en un call site nuevo y degradaría el binding en silencio; uno requerido **no compila**.) Si código legacy aún envía `kycPayoutAllowed: true`, **Zod lo strippea silenciosamente** (schema sin `.strict()`); el campo no tiene ningún efecto.
 
@@ -326,13 +342,35 @@ binding ata las dos cosas: el caller presenta `senderIdentity` y el agente lo co
 > suplantar a esa víctima ya conoce su address. La prueba de posesión real es una HU de seguimiento.
 
 Etapa 1 corre 100% en **payout MOCK** (`FallbackPayoutProvider`, `provenance:"local-fallback"`,
-`deliveredLocal:null`, `txRef:null`): NUNCA mueve plata real. **TransFi queda OFF** (etapa 2):
-`TRANSFI_API_KEY` / `TRANSFI_ADAPTER_READY` **sin setear** en el deploy.
+`deliveredLocal:null`, `txRef:null`): NUNCA mueve plata real. **TransFi queda OFF** (etapa 2).
+
+### Qué variables sostienen de verdad el candado del desembolso
+
+El adapter real lo elige `getPayoutProvider()` (`src/providers/payout.ts:310-324`), y las mismas cuatro
+las vuelve a chequear el fail-safe `assertPayoutProviderSafe()` (`src/agents/cashout-payout.ts:67-71`):
+
+| variable | qué pasa si falta |
+|---|---|
+| `TRANSFI_USERNAME` | cae al mock — alcanza con que falte cualquiera de las tres credenciales |
+| `TRANSFI_PASSWORD` | ídem |
+| `TRANSFI_MID` | ídem |
+| `TRANSFI_ADAPTER_READY` (tiene que ser `"true"`) | con las 3 credenciales seteadas y ésta distinta de `"true"`, **lanza** `transfi_adapter_not_ready`; no degrada al mock en silencio |
+
+> ⚠️ **`TRANSFI_API_KEY` NO gatea el desembolso.** La lee el adapter de **FX** (`fx.ts`) y nadie del
+> path de payout — el código lo dice explícito en `src/providers/payout.ts:308`. Setearla o borrarla no
+> mueve nada del payout. Una versión anterior de este README la nombraba como el candado: quien
+> auditara el money-path por esa variable estaba mirando la que no era.
+
+Hay una quinta variable que no forma parte del gate de selección, pero sin la cual el adapter real no
+puede crear ni una orden: **`TRANSFI_USDC_NETWORK`** decide por qué cadena sale el USDC (`solana` ⇒
+`USDCSOL`). Ausente, vacía o sólo whitespace, `execute()` lanza `transfi_usdc_network_unset` **antes de
+tocar la red** (`payout.ts:140-147`). No hay default ni se adivina: prender el adapter sin esta variable
+deja un adapter que falla en su primera orden.
 
 **Flag `PAYOUT_ALLOW_MOCK`:** el fail-safe `assertPayoutProviderSafe()` lanza `payout_refused` en
 `NODE_ENV=production` sin provider real. Como Vercel fija `NODE_ENV=production`, el deploy de etapa 1 setea
 `PAYOUT_ALLOW_MOCK=true` para permitir SOLO el mock. **NO habilita ningún path a desembolso real** (ese sigue
-100% gated por `TRANSFI_API_KEY`+`TRANSFI_ADAPTER_READY`). ⚠️ Activar `PAYOUT_ALLOW_MOCK` en cualquier deploy
+gated por las cuatro variables de la tabla de arriba). ⚠️ Activar `PAYOUT_ALLOW_MOCK` en cualquier deploy
 que no sea el de etapa 1 (mock) es un **incidente de seguridad money-path**.
 
 **Garantía dura NO-PII:** el output NUNCA expone `beneficiary.name`, `beneficiary.destination` (Yape/CCI) ni
@@ -472,6 +510,12 @@ sólo publica la ficha.
    prueba positiva de cobro** (los pasos 2 y 3 no alcanzan: los dos dan verde sin haber tocado nunca el
    rail). Hacerlo antes deja al agente **sin ninguna ruta de cobro**. El deslistado es reversible;
    quedarse sin ruta de cobro no es gratis.
+7. **Sólo etapa 2 (hoy no): prender el desembolso real.** Los pasos 1-6 son sobre *cobrar*; éste es
+   sobre *pagar*, y es el paso que mueve plata real. Setear las cuatro variables del candado
+   (`TRANSFI_USERNAME`, `TRANSFI_PASSWORD`, `TRANSFI_MID`, `TRANSFI_ADAPTER_READY=true`) **y**
+   `TRANSFI_USDC_NETWORK` — para este corredor, `solana`. Saltearse esta última es la trampa: el gate
+   deja pasar al adapter y después toda orden muere con `transfi_usdc_network_unset`. Una vez que hay
+   provider real, sacar `PAYOUT_ALLOW_MOCK` de ese deploy.
 
 ---
 
