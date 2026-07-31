@@ -11,12 +11,16 @@ vi.mock("@/agents/cashout-payout", async (importActual) => {
 });
 
 import { POST } from "./route";
+import { issueQuoteRef } from "@/providers/quote-ref";
 
 const ENDPOINT = "http://localhost/api/agents/remit-cashout-payout/invoke";
 
 // Input válido de referencia con PII real del beneficiario (name + destination Yape) para los asserts NO-PII.
 const validInput = {
-  quoteId: "q1",
+  // Referencia AUTENTICADA de remit-corridor-fx (lleva el monto cotizado firmado adentro). Con un
+  // `quoteId` crudo el core bloquea en `quote_unresolvable` y ningún test HTTP llega a su rama.
+  // Solo crece el ARRANGE — los asserts quedan intactos.
+  quoteId: issueQuoteRef("fxmid-test", 100),
   amountUsd: 100,
   kycVerificationId: "v1",
   kycPayoutAllowed: true,
