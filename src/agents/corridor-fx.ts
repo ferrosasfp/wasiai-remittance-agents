@@ -10,6 +10,7 @@ import {
   getFxQuoteProvider,
 } from "../providers/fx";
 import { resolveFxConfig } from "../providers/fx-config";
+import { issueQuoteRef } from "../providers/quote-ref";
 import type { FxQuote } from "../providers/types";
 
 export const SLUG = "remit-corridor-fx";
@@ -73,5 +74,17 @@ export async function runCorridorFx(raw: unknown): Promise<CorridorFxOutput> {
     destCountry: input.destCountry,
     payoutMethod: input.payoutMethod,
   });
-  return { slug: SLUG, ...quote };
+  // EL `quoteId` QUE SALE LLEVA EL MONTO FIRMADO ADENTRO, y por eso el techo de arriba alcanza
+  // también al desembolso. La cadena completa es: acá se rechaza todo lo que exceda `maxSendUsd`
+  // ANTES de emitir nada ⇒ no puede existir una referencia válida por encima del techo ⇒ el agente
+  // de payout, que exige igualdad exacta contra el monto de la referencia, no puede desembolsar por
+  // encima del techo. El desembolso no re-lee la política: hereda la decisión que se tomó acá.
+  //
+  // Va en el núcleo y NO dentro de los proveedores, por el mismo motivo que el piso y el techo:
+  // acá cubre a los dos caminos y no desaparece el día que se active el adapter del socio. Envolver
+  // al id del proveedor (en vez de reemplazarlo) conserva el id real del partner para auditoría.
+  //
+  // ⚠️ Lo que ata es el MONTO, y nada más. `expiresAt` sigue viajando informativo y sin enforcement:
+  // esta referencia NO es un quote-lock (ver el encabezado de `quote-ref.ts`).
+  return { slug: SLUG, ...quote, quoteId: issueQuoteRef(quote.quoteId, input.amountUsd) };
 }

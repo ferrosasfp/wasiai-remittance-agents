@@ -322,17 +322,31 @@ red real. **Didit queda OFF** (etapa 2): `DIDIT_API_KEY` / `DIDIT_ADAPTER_READY`
 
 ```
 POST /api/agents/remit-cashout-payout/invoke
-body: { "quoteId": "q1", "amountUsd": 100, "kycVerificationId": "v1",
+body: { "quoteId": "<el quoteId TAL CUAL lo devolvió remit-corridor-fx>", "amountUsd": 100,
+        "kycVerificationId": "v1",
         "senderIdentity": "<el vendor_data ligado a esa verificación: DNI o wallet address>",
         "beneficiary": { "name": "<PII>", "country": "PE", "method": "yape", "destination": "<Yape/CCI>" },
         "idempotencyKey": "idem-1" }
 → 200 { "result": { "slug", "executed", "status", "payoutId", "deliveredLocal", "txRef",
                     "reason", "provenance", "depositAddress" } }  # SIN beneficiary ni travelRuleData
+→ 200 { "result": { "executed": false, "status": "blocked", "reason": "quote_amount_mismatch" } }  # el amountUsd NO es el que se cotizó bajo ese quoteId
+→ 200 { "result": { "executed": false, "status": "blocked", "reason": "quote_unresolvable" } }     # ese quoteId no lo emitimos nosotros (o ya no se puede resolver)
 → 200 { "result": { "executed": false, "status": "blocked", "reason": "kyc_gate_not_passed" } }  # hard-gate KYC (server-side, no del caller) o la identidad no coincide
 → 200 { "result": { "executed": false, "status": "blocked", "reason": "kyc_identity_claim_missing" } }  # falta la identity claim
 → 400 { "error": "invalid_input", "details": {...} }  # body inválido (mensajes Zod, sin PII)
 → 502 { "error": "payout_unavailable" }               # fail-safe / misconfig del provider
 ```
+
+> **`quoteId` y `amountUsd` NO son dos campos independientes.** El `quoteId` que devuelve
+> `remit-corridor-fx` lleva firmado adentro el monto que se cotizó, y este agente lo verifica: el
+> `amountUsd` tiene que ser **exactamente** ese. Hasta el 2026-07-31 no era así, y una cotización de
+> 100 USD servía para pedir un desembolso por un millón. Consecuencias para quien integra:
+> reenviá el `quoteId` **tal cual**, sin normalizarlo ni truncarlo, y no lo inventes ni lo reuses de
+> otra remesa. Los dos rechazos son **distintos a propósito**: `quote_amount_mismatch` se arregla
+> mandando el monto correcto; `quote_unresolvable` se arregla pidiendo una cotización de verdad (o
+> avisando, porque también aparece si el secreto de firma del deploy se rotó o falta).
+> Efecto lateral buscado: como `FX_MAX_SEND_USD` se aplica **antes** de emitir el `quoteId`, el
+> techo de la cotización alcanza también al desembolso sin que éste re-lea la política.
 
 El `result` del camino feliz lleva **9 claves**. La última, **`depositAddress`**, es la address dedicada
 de la orden que devuelve TransFi en el create-order: la address a la que el sender tiene que mandar el

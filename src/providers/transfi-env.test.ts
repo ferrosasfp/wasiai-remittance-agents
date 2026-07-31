@@ -8,7 +8,11 @@ import {
 import { LiveMidFxProvider, TransFiFxProvider, getFxQuoteProvider } from "./fx";
 import { FallbackPayoutProvider, TransFiPayoutProvider, getPayoutProvider } from "./payout";
 import { runCashoutPayout } from "../agents/cashout-payout";
+import { issueQuoteRef } from "./quote-ref";
 import type { FxQuoteInput, PayoutInput } from "./types";
+
+/** Referencia AUTENTICADA de cotización por 100 USD — el core la exige desde el binding quote↔monto. */
+const QUOTE_REF_100 = issueQuoteRef("fxmid-test", 100);
 
 // ⚠️ CERO red real en este archivo: `fetch` SIEMPRE mockeado. Ninguna aserción puede tocar
 // api.transfi.com (que es precisamente el bug que este módulo cierra).
@@ -358,7 +362,7 @@ describe("modo devnet actual (sin creds TransFi) sigue andando sin TRANSFI_ENV (
       vendor_data: "12345678",
     });
     const out = await runCashoutPayout({
-      quoteId: "q1",
+      quoteId: QUOTE_REF_100, // el core exige la referencia autenticada (binding quote↔monto)
       amountUsd: 100,
       kycVerificationId: "v1",
       senderIdentity: "12345678",
@@ -380,7 +384,7 @@ describe("modo devnet actual (sin creds TransFi) sigue andando sin TRANSFI_ENV (
     vi.spyOn(console, "warn").mockImplementation(() => {});
     const { calls } = stubFetchCapturing({});
     const out = await runCashoutPayout({
-      quoteId: "q1",
+      quoteId: QUOTE_REF_100, // el core exige la referencia autenticada (binding quote↔monto)
       amountUsd: 100,
       kycVerificationId: "v1",
       senderIdentity: "12345678",

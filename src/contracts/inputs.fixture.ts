@@ -21,6 +21,14 @@ export const kycInput = {
 
 // origen payout: src/agents/cashout-payout.test.ts:8-18 (validInput, sin `kycPayoutAllowed`:
 // DT-4 lo strippea, no llega al core).
+//
+// 🔴 ESTE INPUT YA NO PRODUCE UN PAYOUT, Y ES A PROPÓSITO. Desde el binding quote↔monto, `quoteId`
+// tiene que ser la referencia AUTENTICADA que emitió `remit-corridor-fx` en ESA misma remesa (lleva
+// el monto cotizado firmado adentro). Un literal como `"q1"` no lo puede resolver nadie ⇒ el agente
+// responde `blocked` / `quote_unresolvable` (ver `cashout-payout.output.fixture.ts`).
+// No se reemplaza por una referencia real porque NO PUEDE SER UN LITERAL: depende del secreto de
+// firma del deploy. Que sea imposible fixturearlo estáticamente ES el contrato nuevo — el consumer
+// tiene que sacar el `quoteId` de una llamada viva a `remit-corridor-fx`, no de una constante.
 export const cashoutPayoutInput = {
   quoteId: "q1",
   amountUsd: 100,

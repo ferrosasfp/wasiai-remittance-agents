@@ -10,13 +10,22 @@
 import { z } from "zod";
 import { getPayoutProvider } from "../providers/payout";
 import { getKycProvider, normalizeIdentity, REAL_KYC_PROVENANCES } from "../providers/kyc";
+import { checkQuoteBinding } from "../providers/quote-ref";
 import type { KycStatusResult, PayoutResult } from "../providers/types";
 
 export const SLUG = "remit-cashout-payout";
 export const PRICE_USDC = 0.03;
 
 export const CashoutPayoutInputSchema = z.object({
-  quoteId: z.string().min(1), // del agente FX (tasa fijada)
+  // La referencia AUTENTICADA que emitió `remit-corridor-fx`. Lleva el monto cotizado firmado
+  // adentro: es lo que permite que este agente verifique la cotización que dice honrar, en vez de
+  // creerle al caller. Zod sólo exige que sea un string no vacío — la resolución real ocurre en el
+  // núcleo (`checkQuoteBinding`), donde un rechazo puede devolver 200 blocked con un motivo propio
+  // en vez de un 400 `invalid_input` que se confundiría con un error de schema.
+  quoteId: z.string().min(1),
+  // 🔴 NO ES UN CAMPO LIBRE, aunque lo parezca por el schema: tiene que ser EXACTAMENTE el monto que
+  // se cotizó bajo ese `quoteId`. Hasta 2026-07-31 sí era libre, y una cotización de 100 USD servía
+  // para pedir un desembolso de un millón (ver el encabezado de `quote-ref.ts`).
   amountUsd: z.number().positive(),
   kycVerificationId: z.string().min(1), // handle del KYC (el Travel Rule se recupera por acá, no PII inline)
   // WKH-203/DT-4: `kycPayoutAllowed` FUE ELIMINADO a propósito. El input NO decide compliance:
@@ -200,7 +209,9 @@ async function isKycGatePassed(verificationId: string, claim: IdentityClaim): Pr
 /**
  * Core del agente. Devuelve el objeto que va dentro de `{ result }`.
  * Lanza ZodError si el input es inválido; lanza `payout_refused` si el fail-safe bloquea;
- * lanza `kyc_gate_unavailable` si el gate KYC no se puede resolver (B6 → 502, fail-closed).
+ * lanza `kyc_gate_unavailable` si el gate KYC no se puede resolver (B6 → 502, fail-closed);
+ * lanza `quote_binding_secret_unset` en producción sin `QUOTE_BINDING_SECRET` (→ 502: es un defecto
+ * de NUESTRA config, no una cotización mala del caller — por eso NO es el `blocked` de abajo).
  */
 export async function runCashoutPayout(raw: unknown): Promise<CashoutPayoutOutput> {
   const input = CashoutPayoutInputSchema.parse(raw); // 1. (ya sin kycPayoutAllowed — DT-4)
@@ -208,7 +219,41 @@ export async function runCashoutPayout(raw: unknown): Promise<CashoutPayoutOutpu
   assertPayoutProviderSafe(); // 2. INTACTO (CD-1) — throws primero, como hoy
   const provider = getPayoutProvider(); // 3. INTACTO — throws adapter_not_ready, como hoy
 
-  // 4. WKH-204 / C1-C4: resolver la identity claim. DESPUÉS de 2 y 3 (CD-1: cuando hay dos
+  // 4. EL BINDING CON LA COTIZACIÓN. Hasta acá el agente aceptaba `quoteId` y `amountUsd` como dos
+  // campos INDEPENDIENTES del caller y no leía nunca la cotización que decía estar honrando: cotizar
+  // 100 y desembolsar un millón con ese mismo `quoteId` daba `executed:true` (medido). El techo
+  // `FX_MAX_SEND_USD` quedaba del lado de la cotización y no llegaba nunca hasta acá.
+  //
+  // Va DESPUÉS de 2 y 3 (CD-1: cuando hay dos problemas, gana el error de payout) y ANTES del gate
+  // KYC por el mismo motivo que C3/C4: es cero-I/O y ya determina el rechazo, así que no se gasta
+  // una llamada a Didit ni se le da esa señal a un caller cuya cotización ni siquiera resuelve.
+  //
+  // 🔴 SON TRES ESTADOS, NO DOS. "No coinciden los montos" y "no pude resolver la referencia" NO son
+  // el mismo hecho y no comparten motivo: el primero es una respuesta, el segundo es la ausencia de
+  // una respuesta. Los dos bloquean, pero quien integra necesita saber cuál le pasó — y ops necesita
+  // distinguir una avalancha pareja (referencias viejas / secreto mal configurado) de un intento
+  // puntual de falsificación. Un booleano acá habría borrado exactamente esa diferencia.
+  const quoteBinding = checkQuoteBinding(input.quoteId, input.amountUsd);
+  if (quoteBinding !== "bound") {
+    return {
+      slug: SLUG,
+      executed: false,
+      status: "blocked",
+      payoutId: null,
+      deliveredLocal: null,
+      txRef: null,
+      // Motivos PROPIOS, distintos de los del agente FX (`fx_amount_below_minimum` /
+      // `fx_amount_above_maximum`): aquéllos dicen "el monto está fuera de lo que cotizamos", éstos
+      // dicen "el monto no es el de TU cotización". Se corrigen de formas distintas.
+      // 🔴 Sin números: ni el monto pedido ni el cotizado. Ecoar el monto de la referencia
+      // convertiría al agente en un oráculo que revela, con una referencia ajena, cuánto cotizó otro.
+      reason: quoteBinding === "amount_mismatch" ? "quote_amount_mismatch" : "quote_unresolvable",
+      provenance: "n/a",
+      depositAddress: null,
+    };
+  }
+
+  // 5. WKH-204 / C1-C4: resolver la identity claim. DESPUÉS de 2 y 3 (CD-1: cuando hay dos
   // problemas, gana el error de payout). C3/C4 bloquean SIN llamar al provider: no se gasta una
   // llamada a Didit ni se le da señal al caller.
   const identityClaim = resolveIdentityClaim(input);
@@ -226,7 +271,7 @@ export async function runCashoutPayout(raw: unknown): Promise<CashoutPayoutOutpu
     };
   }
 
-  // 5. GATE (WKH-203): la decisión de compliance se re-deriva server-side contra la fuente
+  // 6. GATE (WKH-203): la decisión de compliance se re-deriva server-side contra la fuente
   // autoritativa, + binding de identidad (WKH-204, C11 adentro). Va DESPUÉS de 2 y 3 a propósito
   // (CD-1: preservar el error de payout cuando hay dos problemas a la vez). getPayoutProvider() es
   // cero-I/O y cero side-effects → inerte y seguro.

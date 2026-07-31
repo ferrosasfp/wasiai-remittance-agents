@@ -326,17 +326,31 @@ the deploy. **Hard NO-PII guarantee:** the output NEVER exposes `legalId` (natio
 
 ```
 POST /api/agents/remit-cashout-payout/invoke
-body: { "quoteId": "q1", "amountUsd": 100, "kycVerificationId": "v1",
+body: { "quoteId": "<the quoteId EXACTLY as remit-corridor-fx returned it>", "amountUsd": 100,
+        "kycVerificationId": "v1",
         "senderIdentity": "<the vendor_data bound to that verification: national ID or wallet address>",
         "beneficiary": { "name": "<PII>", "country": "PE", "method": "yape", "destination": "<Yape/CCI>" },
         "idempotencyKey": "idem-1" }
 → 200 { "result": { "slug", "executed", "status", "payoutId", "deliveredLocal", "txRef",
                     "reason", "provenance", "depositAddress" } }  # NO beneficiary, NO travelRuleData
+→ 200 { "result": { "executed": false, "status": "blocked", "reason": "quote_amount_mismatch" } }  # amountUsd is not the amount quoted under that quoteId
+→ 200 { "result": { "executed": false, "status": "blocked", "reason": "quote_unresolvable" } }     # we did not issue that quoteId (or it can no longer be resolved)
 → 200 { "result": { "executed": false, "status": "blocked", "reason": "kyc_gate_not_passed" } }  # KYC hard gate (server-side, not the caller's) or identity mismatch
 → 200 { "result": { "executed": false, "status": "blocked", "reason": "kyc_identity_claim_missing" } }  # identity claim missing
 → 400 { "error": "invalid_input", "details": {...} }  # invalid body (Zod messages, no PII)
 → 502 { "error": "payout_unavailable" }               # fail-safe / provider misconfig
 ```
+
+> **`quoteId` and `amountUsd` are NOT two independent fields.** The `quoteId` returned by
+> `remit-corridor-fx` carries the quoted amount signed inside it, and this agent verifies it:
+> `amountUsd` must be **exactly** that amount. That was not the case until 2026-07-31, when a 100 USD
+> quote could be used to request a one million payout. What this means if you integrate: forward the
+> `quoteId` **verbatim**, do not normalize or truncate it, and never invent it or reuse one from
+> another remittance. The two rejections are **deliberately distinct**: `quote_amount_mismatch` is
+> fixed by sending the right amount; `quote_unresolvable` is fixed by getting a real quote (it also
+> shows up if the deployment's signing secret was rotated or is missing, which is worth an alert).
+> Intended side effect: since `FX_MAX_SEND_USD` is enforced **before** the `quoteId` is issued, the
+> quote ceiling reaches the payout without the payout re-reading that policy.
 
 The `result` of the happy path carries **9 keys**. The last one, **`depositAddress`**, is the address
 dedicated to the order that TransFi returns on create-order: the address the sender is supposed to send
