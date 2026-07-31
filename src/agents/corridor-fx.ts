@@ -4,7 +4,11 @@
 // Honra el contrato HTTP del gateway a2a: POST /invoke → 200 { result: {...} }.
 
 import { z } from "zod";
-import { assertAmountAboveMinimum, getFxQuoteProvider } from "../providers/fx";
+import {
+  assertAmountAboveMinimum,
+  assertAmountBelowMaximum,
+  getFxQuoteProvider,
+} from "../providers/fx";
 import { resolveFxConfig } from "../providers/fx-config";
 import type { FxQuote } from "../providers/types";
 
@@ -53,7 +57,14 @@ export async function runCorridorFx(raw: unknown): Promise<CorridorFxOutput> {
   // independiente. Si una env rotara justo entre las dos lecturas, el peor caso es una
   // cotización validada contra un mínimo viejo — y desde el fix del guard de salida, ni siquiera
   // así puede entregar cero.
-  assertAmountAboveMinimum(input.amountUsd, resolveFxConfig());
+  //
+  // EL TECHO VA ACÁ MISMO, con el mismo config y en la misma línea de defensa. Son las dos
+  // puntas del MISMO campo: separarlos haría que quien busque "cuánto se puede enviar" encuentre
+  // media respuesta y crea que es toda. Una sola lectura de config alimenta a los dos, así que
+  // el piso y el techo que se comparan son siempre de la misma foto de la configuración.
+  const config = resolveFxConfig();
+  assertAmountAboveMinimum(input.amountUsd, config);
+  assertAmountBelowMaximum(input.amountUsd, config);
   const provider = getFxQuoteProvider();
   const quote = await provider.quote({
     amountUsd: input.amountUsd,

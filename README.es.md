@@ -178,15 +178,28 @@ body: { "amountUsd": 100, "destCountry": "PE", "payoutMethod": "yape" }  # solo 
                      "rateSource", "rateAsOf" } }
 → 400 { "error": "invalid_input", "details": {...} }   # body inválido (ej. amountUsd <= 0)
 → 400 { "error": "fx_amount_below_minimum", "minSendUsd": 5 }  # el envío no llega al mínimo
+→ 400 { "error": "fx_amount_above_maximum", "maxSendUsd": 10000 }  # el pedido supera el techo
 → 502 { "error": "quote_unavailable" }                 # ninguna fuente de tasa usable / misconfig
 ```
 
-> **Por qué el mínimo es un `400` propio y no el `502`.** "Mandaste muy poco" es un error del caller,
-> no una indisponibilidad del servicio: aplanarlo en el `502` le diría "volvé más tarde" a alguien
-> cuyo reintento no va a funcionar nunca hasta que cambie el monto. El valor vigente viaja en
-> `minSendUsd` para que el caller no tenga que descubrirlo por bisección. El guard corre en el
-> **núcleo del agente** (`runCorridorFx`), antes de elegir proveedor: así cubre a los dos y no
-> desaparece el día que se active el adapter del partner.
+> **Por qué el mínimo y el máximo son `400` propios y no el `502`.** "Mandaste muy poco" y "pediste
+> demasiado" son errores del caller, no una indisponibilidad del servicio: aplanarlos en el `502` le
+> diría "volvé más tarde" a alguien cuyo reintento no va a funcionar nunca hasta que cambie el monto.
+> El valor vigente viaja en `minSendUsd` / `maxSendUsd` para que el caller no tenga que descubrirlo
+> por bisección. Los dos guards corren en el **núcleo del agente** (`runCorridorFx`), antes de elegir
+> proveedor: así cubren a los dos y no desaparecen el día que se active el adapter del partner.
+>
+> **Son dos códigos distintos a propósito**: los errores se corrigen en direcciones opuestas, y un
+> código único dejaría a quien integra sin saber si tiene que subir o bajar el monto.
+
+> **El techo es del AGENTE, no por caller.** Así protege al operador de cualquier caller, incluidos
+> los que todavía no existen; un tope por caller es una excepción explícita que se agrega el día que
+> un cliente grande la pida, y no una puerta abierta por defecto. Los 10.000 cubren la remesa de una
+> persona con margen enorme y dejan un pedido por un millón del lado de lo obviamente erróneo o
+> malicioso. Antes del techo, un `amountUsd` de 1e6, de 1e15 y hasta de 1e300 devolvía `200` con una
+> cotización bien formada, en banda y fresca, que el agente se comprometía a honrar diez minutos; el
+> desbordamiento a `Infinity` recién corta en 1e308. No faltaba robustez numérica: faltaba la
+> política.
 
 ### Procedencia de la tasa (cambio de contrato HTTP)
 

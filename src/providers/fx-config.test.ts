@@ -13,6 +13,7 @@ const MANAGED_ENVS = [
   "FX_MID_MAX_USD_PEN",
   "FALLBACK_FX_SPREAD_BPS",
   "FALLBACK_FX_FLAT_FEE_USD",
+  "FX_MAX_SEND_USD",
 ] as const;
 
 let envSnapshot: Record<string, string | undefined> = {};
@@ -43,6 +44,11 @@ describe("resolveFxConfig — defaults (cada uno afirma algo sobre el mundo exte
     expect(config.maxRate).toBe(5.0);
     expect(config.spreadBps).toBe(250); // 2.5%
     expect(config.flatFeeUsd).toBe(0.5);
+    // El RANGO cotizable, sus dos puntas juntas: de 5 a 10.000 USD. Contra los literales y no
+    // contra las constantes que los producen, porque son decisiones del founder y moverlas tiene
+    // que costar poner este test en rojo a propósito.
+    expect(config.minSendUsd).toBe(5);
+    expect(config.maxSendUsd).toBe(10000);
     expect(config.sources.map((s) => s.id)).toEqual(["er-api", "currency-api"]);
     expect(config.sources.map((s) => s.url)).toEqual([
       "https://open.er-api.com/v6/latest/USD",
@@ -274,6 +280,38 @@ describe("resolveFxConfig — config inválida LANZA (nunca cotizar con un guard
   it("Infinity no pasa como numérico válido", () => {
     setEnv("FX_MID_MAX_USD_PEN", "Infinity");
     expect(() => resolveFxConfig()).toThrow(/fx_mid_config_invalid:FX_MID_MAX_USD_PEN/);
+  });
+
+  // El techo cotizable entra en la MISMA familia fail-loud, y por el mismo motivo: si
+  // `readNumericEnv` degradara al default ante basura, un `FX_MAX_SEND_USD` mal tipeado dejaría al
+  // operador creyendo que bajó el techo mientras el agente sigue cotizando hasta 10.000. Peor:
+  // `Infinity` es la escritura literal de "sin techo", y un techo que no existe no es un techo.
+  it("FX_MAX_SEND_USD no numérico o infinito lanza señalando SU campo (nunca un techo apagado)", () => {
+    for (const value of ["abc", "NaN", "", "Infinity"]) {
+      setEnv("FX_MAX_SEND_USD", value);
+      if (value === "") {
+        // Una env vacía es "no seteada" en este repo: resuelve el default, no un techo roto.
+        expect(resolveFxConfig().maxSendUsd, "vacía ⇒ default").toBe(10000);
+        continue;
+      }
+      expect(() => resolveFxConfig(), `FX_MAX_SEND_USD=${value}`).toThrow(
+        /fx_mid_config_invalid:FX_MAX_SEND_USD/,
+      );
+    }
+  });
+
+  it("un techo por debajo o igual al piso lanza señalando FX_MAX_SEND_USD (banda vacía)", () => {
+    // Mismo criterio que `FX_MID_MAX_USD_PEN` contra su piso: el error nombra al TECHO, que es la
+    // variable que el operador acaba de mover. Una banda vacía rechazaría todos los montos con el
+    // error del mínimo, mandando a corregir la variable equivocada.
+    setEnv("FX_MIN_SEND_USD", "5");
+    for (const value of ["5", "4.99", "0", "-1"]) {
+      setEnv("FX_MAX_SEND_USD", value);
+      expect(() => resolveFxConfig(), `FX_MAX_SEND_USD=${value}`).toThrow(
+        /fx_mid_config_invalid:FX_MAX_SEND_USD/,
+      );
+    }
+    setEnv("FX_MIN_SEND_USD", undefined);
   });
 });
 

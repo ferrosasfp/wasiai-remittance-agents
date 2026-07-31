@@ -163,6 +163,47 @@ describe("POST /api/agents/remit-corridor-fx/invoke", () => {
     expect(JSON.stringify(data)).not.toContain("null");
   });
 
+  // La otra punta del mismo campo. Sin este test, la traducción a HTTP del techo se podía
+  // aplanar en el 502 genérico sin que nada se enterara, que es exactamente lo que le pasó al
+  // mínimo hasta que se le escribió el suyo.
+  it("T-MAX-HTTP-a: un pedido por un millón → 400 con el código del techo y el techo, no 200", async () => {
+    const res = await invoke({ amountUsd: 1_000_000 });
+
+    expect(res.status).toBe(400);
+    const data = await res.json();
+    expect(data.error).toBe("fx_amount_above_maximum");
+    expect(data.maxSendUsd).toBe(10000);
+    // Y sobre todo: no se emitió la cotización por un millón que este endpoint devolvía antes.
+    expect("result" in data).toBe(false);
+  });
+
+  it("T-MAX-HTTP-b: los dos rechazos por monto NO colapsan en el mismo código ni en el mismo campo", async () => {
+    const chico = await (await invoke({ amountUsd: 0.4 })).json();
+    const grande = await (await invoke({ amountUsd: 1_000_000 })).json();
+
+    // "es muy chico" y "es muy grande" se corrigen en direcciones opuestas: un código único
+    // dejaría al que integra sin saber para dónde mover el monto.
+    expect(chico.error).toBe("fx_amount_below_minimum");
+    expect(grande.error).toBe("fx_amount_above_maximum");
+    // Cada uno trae SU límite y sólo el suyo: un body con los dos campos, o con el campo del
+    // otro, mandaría al caller al número equivocado.
+    expect(chico).toEqual({ error: "fx_amount_below_minimum", minSendUsd: 5 });
+    expect(grande).toEqual({ error: "fx_amount_above_maximum", maxSendUsd: 10000 });
+  });
+
+  it("T-MAX-HTTP-c: si el techo del error no es numérico, el body lo OMITE, nunca manda null", async () => {
+    runCorridorFxMock.mockImplementationOnce(async () => {
+      throw new Error("fx_amount_above_maximum:no-es-un-numero");
+    });
+    const res = await invoke({ amountUsd: 100 });
+
+    expect(res.status).toBe(400);
+    const data = await res.json();
+    expect(data.error).toBe("fx_amount_above_maximum");
+    expect("maxSendUsd" in data).toBe(false);
+    expect(JSON.stringify(data)).not.toContain("null");
+  });
+
   // Contra-ejemplo: el 400 nuevo no puede haberse comido al 502. Un mutante que mandara TODO
   // a 400 dejaría verde a los dos tests de arriba.
   it("T-314-FP2-c: un fallo del feed sigue siendo 502, no 400 (el rechazo por monto no se tragó al resto)", async () => {

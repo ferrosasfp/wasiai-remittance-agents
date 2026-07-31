@@ -55,6 +55,11 @@ export interface FxConfig {
    * `MAX_FEE_SHARE_AT_MINIMUM`: no puede existir un mínimo que la comisión anule.
    */
   readonly minSendUsd: number;
+  /**
+   * Monto máximo cotizable en USD. La otra punta del mismo campo que `minSendUsd`:
+   * las dos son política del monto, se leen acá y se aplican en el mismo lugar.
+   */
+  readonly maxSendUsd: number;
 }
 
 /** Monto que la fuente puede mandar como number o como string numérico. */
@@ -149,6 +154,23 @@ const DEFAULT_SPREAD_BPS = 250; // 2.5% — conservador y declarado
 const DEFAULT_FLAT_FEE_USD = 0.5;
 /** Monto mínimo enviable, en USD. Decisión del founder (WKH-314). */
 const DEFAULT_MIN_SEND_USD = 5;
+/**
+ * Monto máximo cotizable, en USD. Decisión del founder: 10.000, y **del AGENTE, no por caller**.
+ *
+ * Un tope del agente protege al operador de CUALQUIER caller, incluidos los que todavía no
+ * existen; un tope por caller es una excepción explícita que se agrega el día que haya un cliente
+ * grande que la pida, y así no queda la puerta abierta por defecto.
+ *
+ * Por qué 10.000 y no un número mayor: cubre la remesa de una persona con margen enorme, y deja
+ * a un pedido por un millón del lado de lo OBVIAMENTE erróneo o malicioso, en vez de que el
+ * sistema emita una cotización que promete cumplir durante diez minutos.
+ *
+ * Medido antes de existir este techo (2026-07-31, mid 3.40): `amountUsd: 1e6` devolvía 200 con
+ * S/ 3.314.998,34; `1e15` y hasta `1e300` también. El desbordamiento a `Infinity` recién corta
+ * en `1e308` (`invalid_quote_net`, → 502), así que lo que faltaba no era robustez numérica: era
+ * la POLÍTICA. Entre 10.000 y 1e308 no había nada.
+ */
+const DEFAULT_MAX_SEND_USD = 10000;
 
 /**
  * Techo de la comisión fija EXPRESADO COMO FRACCIÓN DEL MÍNIMO — la atadura que impide que
@@ -238,6 +260,14 @@ export function resolveFxConfig(): FxConfig {
   const minSendUsd = readNumericEnv("FX_MIN_SEND_USD", DEFAULT_MIN_SEND_USD);
   if (minSendUsd <= 0) throw invalid("FX_MIN_SEND_USD");
 
+  // El techo cotizable. Se valida CONTRA EL PISO y no contra cero, por la misma razón que
+  // `FX_MID_MAX_USD_PEN` se valida contra `FX_MID_MIN_USD_PEN`: un techo por debajo del piso es
+  // una banda vacía, y una banda vacía no rechaza montos raros, rechaza TODOS, con el error del
+  // mínimo, que apunta a la variable equivocada. Que no arranque es preferible a un agente que
+  // contesta 400 a todo y culpa al caller. (Un valor <= 0 queda cubierto: el piso ya es > 0.)
+  const maxSendUsd = readNumericEnv("FX_MAX_SEND_USD", DEFAULT_MAX_SEND_USD);
+  if (maxSendUsd <= minSendUsd) throw invalid("FX_MAX_SEND_USD");
+
   // WKH-314 — LA ATADURA. Las dos envs se validan por separado más arriba y cada una puede
   // ser perfectamente razonable por su cuenta; lo que no puede es la COMBINACIÓN. Una
   // comisión que se come una fracción excesiva del mínimo deja al mínimo escrito pero
@@ -265,5 +295,15 @@ export function resolveFxConfig(): FxConfig {
     return { id: source.id, url, parse: source.parse };
   });
 
-  return { sources, cacheTtlMs, maxAgeMs, minRate, maxRate, spreadBps, flatFeeUsd, minSendUsd };
+  return {
+    sources,
+    cacheTtlMs,
+    maxAgeMs,
+    minRate,
+    maxRate,
+    spreadBps,
+    flatFeeUsd,
+    minSendUsd,
+    maxSendUsd,
+  };
 }
