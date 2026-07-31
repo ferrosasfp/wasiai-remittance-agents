@@ -1008,4 +1008,177 @@ describe("FX mid — cascada, guards y fail-closed", () => {
     expect(() => assertAmountAboveMinimum(5, config)).not.toThrow();
     expect(() => assertAmountAboveMinimum(1000, config)).not.toThrow();
   });
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // LA OTRA PUNTA DEL MISMO CAMPO: EL TECHO COTIZABLE (10.000 USD, del AGENTE)
+  //
+  // Antes de esto, `amountUsd` sólo tenía piso. Medido el 2026-07-31 con el mid en 3.40 y
+  // TODOS los guards existentes en verde: 1e6 devolvía 200 con S/ 3.314.998,34; 1e15 y hasta
+  // 1e300 también. El desbordamiento a `Infinity` recién corta en 1e308 (`invalid_quote_net`,
+  // → 502), así que entre el caso legítimo y el punto donde la aritmética se rompe había un
+  // rango de 300 órdenes de magnitud donde el agente EMITÍA una cotización y se comprometía a
+  // honrarla diez minutos. Lo que faltaba no era robustez numérica: era la política.
+  //
+  // El tope es DEL AGENTE, no por caller: así protege al operador de cualquier caller,
+  // incluidos los que todavía no existen. Un tope por caller es una excepción explícita que se
+  // agrega el día que un cliente grande la pida, y no una puerta abierta por defecto.
+  // ════════════════════════════════════════════════════════════════════════════
+
+  it("T-MAX-1 (EL test): un pedido por un millón se rechaza, y el feed ni se consulta", async () => {
+    const core = await freshCore();
+    vi.stubEnv("TRANSFI_API_KEY", "");
+    const fetchMock = stubFetchOk(erBody(3.4)); // feed sano: en banda y fresco
+
+    const error = await quoteViaCore(core, 1_000_000).then(
+      (q) => q,
+      (e: unknown) => e,
+    );
+
+    // ── EL EFECTO PRIMERO ────────────────────────────────────────────────────
+    // Lo que importa no es cómo se llama el error: es que NO salió una cotización por un millón
+    // de dólares con fecha de vencimiento. Si esta aserción fuera después de la del mensaje, un
+    // mutante que sólo cambiara el texto mataría el test sin llegar a mirar si se emitió.
+    expect(error, "no puede emitirse una cotización por encima del techo").toBeInstanceOf(Error);
+    expect(
+      fetchMock,
+      "el monto se rechaza ANTES de salir a buscar la tasa, igual que el mínimo",
+    ).not.toHaveBeenCalled();
+
+    // ── y recién ahora, la forma del rechazo ─────────────────────────────────
+    expect((error as Error).message).toMatch(/^fx_amount_above_maximum:/);
+    // El techo VIAJA en el error: sin esto el caller lo descubre por bisección.
+    expect((error as Error).message).toBe("fx_amount_above_maximum:10000");
+  });
+
+  it("T-MAX-2: el borde exacto, 10.000 justo SÍ cotiza, un centavo más NO", async () => {
+    const core = await freshCore();
+    vi.stubEnv("TRANSFI_API_KEY", "");
+    stubFetchOk(erBody(3.4));
+
+    // Exactamente el techo: pasa. El guard es `<=`, no `<`. El borde va para adentro, igual
+    // que el del mínimo: los dos extremos del rango son montos cotizables.
+    const enElBorde = await quoteViaCore(core, 10000);
+    expect(enElBorde.netDeliveredLocal).toBeGreaterThan(0);
+
+    // Un centavo por encima: corta.
+    await expect(quoteViaCore(core, 10000.01)).rejects.toThrow(/fx_amount_above_maximum/);
+  });
+
+  it("T-MAX-3: el rango sano sigue cotizando y el mínimo sigue cortando (el techo no se comió nada)", async () => {
+    const core = await freshCore();
+    vi.stubEnv("TRANSFI_API_KEY", "");
+    stubFetchOk(erBody(3.4));
+
+    // Contra-ejemplo obligatorio: un guard que rechaza siempre pasaría todos los tests de
+    // arriba. Estos montos son los que el agente existe para cotizar.
+    for (const amount of [5, 100, 400, 9999.99]) {
+      expect((await quoteViaCore(core, amount)).netDeliveredLocal, `amountUsd=${amount}`)
+        .toBeGreaterThan(0);
+    }
+    // Y la punta de abajo sigue exactamente como estaba: agregar el techo no la tocó.
+    await expect(quoteViaCore(core, 4.99)).rejects.toThrow(/fx_amount_below_minimum:5/);
+  });
+
+  it("T-MAX-4: los dos rechazos son DISTINGUIBLES, quien integra sabe para dónde corregir", async () => {
+    const core = await freshCore();
+    vi.stubEnv("TRANSFI_API_KEY", "");
+    stubFetchOk(erBody(3.4));
+
+    const chico = await quoteViaCore(core, 1).catch((e: unknown) => (e as Error).message);
+    const grande = await quoteViaCore(core, 1_000_000).catch((e: unknown) => (e as Error).message);
+
+    expect(chico).toMatch(/^fx_amount_below_minimum:/);
+    expect(grande).toMatch(/^fx_amount_above_maximum:/);
+    // Y no se solapan: colapsar los dos en un código único dejaría al caller sin saber si tiene
+    // que subir o bajar el monto. Cada uno además trae SU límite, que son números distintos.
+    expect(chico).not.toBe(grande);
+    expect(chico).not.toContain("above_maximum");
+    expect(grande).not.toContain("below_minimum");
+  });
+
+  // Assert contra el LITERAL 10000, no contra la constante importada: un test que compara la
+  // config contra el mismo default que la produce verifica el cableado, no el valor. Es la
+  // decisión del founder, y cambiarla tiene que costar poner este test en rojo a propósito.
+  it("T-MAX-5: el techo por defecto es 10.000 USD (decisión del founder, no un detalle)", async () => {
+    const { resolveFxConfig } = await import("./fx-config");
+    const config = resolveFxConfig();
+
+    expect(config.maxSendUsd).toBe(10000);
+    // Y el rango por defecto es el que se decidió: de 5 a 10.000.
+    expect(config.minSendUsd).toBe(5);
+  });
+
+  it("T-MAX-6: el techo se rota por env sin reimportar el módulo (call-time, como el resto)", async () => {
+    const core = await freshCore();
+    vi.stubEnv("TRANSFI_API_KEY", "");
+    stubFetchOk(erBody(3.4));
+    vi.stubEnv("FX_RATE_CACHE_TTL_MS", "0");
+
+    vi.stubEnv("FX_MAX_SEND_USD", "100");
+    await expect(quoteViaCore(core, 500)).rejects.toThrow(/fx_amount_above_maximum:100/);
+
+    // MISMA instancia del módulo: si el techo se leyera al importar, esto seguiría cortando.
+    vi.stubEnv("FX_MAX_SEND_USD", "1000");
+    expect((await quoteViaCore(core, 500)).netDeliveredLocal).toBeGreaterThan(0);
+  });
+
+  it("T-MAX-7: un techo por debajo del piso es CONFIG INVÁLIDA, no un agente que rechaza todo", async () => {
+    // Sin esta validación, `FX_MAX_SEND_USD=1` con el piso en 5 deja una banda vacía: NINGÚN
+    // monto cotiza, y el error que ve el caller es el del MÍNIMO, que apunta a la variable
+    // equivocada. Preferimos que no arranque a que conteste 400 a todo y culpe al caller.
+    for (const value of ["1", "5", "0", "-1"]) {
+      const core = await freshCore();
+      vi.stubEnv("TRANSFI_API_KEY", "");
+      const fetchMock = stubFetchOk(erBody(3.4));
+      vi.stubEnv("FX_MIN_SEND_USD", "5");
+      vi.stubEnv("FX_MAX_SEND_USD", value);
+
+      await expect(quoteViaCore(core, 100), `FX_MAX_SEND_USD=${value}`).rejects.toThrow(
+        /fx_mid_config_invalid:FX_MAX_SEND_USD/,
+      );
+      expect(fetchMock, "config inválida ⇒ ni se consulta el feed").not.toHaveBeenCalled();
+      vi.unstubAllEnvs();
+    }
+  });
+
+  // El análogo de T-314-FP4, y es el test que compra que el guard viva en el NÚCLEO: con el
+  // adapter del socio activo, un techo escrito dentro de `LiveMidFxProvider` no existiría.
+  it("T-MAX-8: con el adapter del socio ACTIVO, el techo sigue cortando, y no se le pega al socio", async () => {
+    const core = await freshCore();
+    vi.stubEnv("TRANSFI_API_KEY", "clave-de-prueba"); // credencial ficticia, nunca una real
+    vi.stubEnv("TRANSFI_ADAPTER_READY", "true");
+    vi.stubEnv("TRANSFI_ENV", "sandbox");
+    const fetchMock = stubFetchOk(erBody(3.4));
+
+    const resultado = await quoteViaCore(core, 1_000_000).then(
+      (q) => q,
+      (e: unknown) => e,
+    );
+
+    expect(resultado).toBeInstanceOf(Error);
+    expect(
+      fetchMock,
+      "no se le pide una cotización por un millón a un socio por un envío que vamos a rechazar",
+    ).not.toHaveBeenCalled();
+    expect((resultado as Error).message).toMatch(/^fx_amount_above_maximum:/);
+  });
+
+  // El guard como UNIDAD, mismo criterio que `assertAmountAboveMinimum`. La rama del `NaN` no es
+  // alcanzable desde la ruta (Zod exige un número, y el mínimo corre antes), y por eso necesita
+  // este test: `amountUsd > max` ACEPTA un `NaN` y `!(amountUsd <= max)` lo RECHAZA. El guard
+  // tiene que ser correcto por sí solo, sin depender de quién corra antes.
+  it("T-MAX-9: assertAmountBelowMaximum rechaza NaN (la comparación ingenua lo aceptaría)", async () => {
+    const { assertAmountBelowMaximum } = await freshFx();
+    const { resolveFxConfig } = await import("./fx-config");
+    const config = resolveFxConfig();
+
+    expect(() => assertAmountBelowMaximum(Number.NaN, config)).toThrow(/fx_amount_above_maximum/);
+    expect(() => assertAmountBelowMaximum(10000.01, config)).toThrow(/fx_amount_above_maximum/);
+    expect(() => assertAmountBelowMaximum(Number.POSITIVE_INFINITY, config)).toThrow(
+      /fx_amount_above_maximum/,
+    );
+    // y el lado que debe pasar, para que el guard no sea "rechazar siempre"
+    expect(() => assertAmountBelowMaximum(10000, config)).not.toThrow();
+    expect(() => assertAmountBelowMaximum(100, config)).not.toThrow();
+  });
 });

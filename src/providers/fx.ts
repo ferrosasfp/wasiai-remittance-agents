@@ -383,6 +383,38 @@ export function assertAmountAboveMinimum(amountUsd: number, config: FxConfig): v
   }
 }
 
+/**
+ * Código del rechazo por monto POR ENCIMA del techo. Deliberadamente DISTINTO de
+ * `AMOUNT_BELOW_MINIMUM_CODE`: "mandaste muy poco" y "pediste demasiado" se corrigen en
+ * direcciones opuestas, y un código único dejaría al que integra sin saber para dónde mover el
+ * monto. Los dos son 4xx (error del caller, reintentar igual no sirve), pero no son el mismo error.
+ */
+export const AMOUNT_ABOVE_MAXIMUM_CODE = "fx_amount_above_maximum";
+
+/**
+ * Guard de POLÍTICA del techo cotizable. La otra punta de `assertAmountAboveMinimum`: mismo
+ * campo, misma fuente de config, mismo formato de error, y se aplican juntos en el núcleo del
+ * agente para que no exista un camino que valide una punta y no la otra.
+ *
+ * QUÉ CIERRA, y qué NO. No cierra un desbordamiento numérico: eso ya estaba cubierto aguas abajo
+ * por `assertValidQuote` (un `Infinity` corta fail-closed). Lo que cierra es el hueco ENTRE la
+ * política y el desbordamiento, que era enorme: medido el 2026-07-31, un pedido por 1e6, por 1e15
+ * y hasta por 1e300 devolvía 200 con una cotización perfectamente formada, en banda y fresca, que
+ * el agente se comprometía a honrar por diez minutos. El sistema no se rompía; prometía.
+ *
+ * Por eso el techo NO puede vivir dentro del proveedor, por el mismo motivo que el mínimo se mudó
+ * de `LiveMidFxProvider` al núcleo: ahí cubriría un solo camino y desaparecería el día que se
+ * active el adapter del socio.
+ */
+export function assertAmountBelowMaximum(amountUsd: number, config: FxConfig): void {
+  if (!(amountUsd <= config.maxSendUsd)) {
+    // `!(a <= b)` y no `a > b`, por la misma razón que el mínimo: con `NaN` la primera forma
+    // RECHAZA y la segunda ACEPTA. Acá el mínimo ya filtró el `NaN` en el núcleo, pero el guard
+    // no puede depender de en qué orden lo llamen: es correcto por sí solo o no lo es.
+    throw new Error(`${AMOUNT_ABOVE_MAXIMUM_CODE}:${config.maxSendUsd}`);
+  }
+}
+
 // BLQ-MED-2: guard de salida — un quote solo es válido si los montos de dinero son finitos y
 // coherentes. Lanza si no (mejor fallar que atar un NaN a un desembolso real).
 export function assertValidQuote(q: FxQuote): FxQuote {

@@ -178,15 +178,29 @@ body: { "amountUsd": 100, "destCountry": "PE", "payoutMethod": "yape" }  # only 
                      "rateSource", "rateAsOf" } }
 → 400 { "error": "invalid_input", "details": {...} }   # invalid body (e.g. amountUsd <= 0)
 → 400 { "error": "fx_amount_below_minimum", "minSendUsd": 5 }  # the send does not reach the minimum
+→ 400 { "error": "fx_amount_above_maximum", "maxSendUsd": 10000 }  # the request is over the cap
 → 502 { "error": "quote_unavailable" }                 # no usable rate source / misconfig
 ```
 
-> **Why the minimum is its own `400` and not the `502`.** "You sent too little" is a caller error, not
-> an outage on our side: flattening it into the `502` would tell someone to "come back later" when
-> their retry will never work until the amount changes. The value in force travels in `minSendUsd` so
-> the caller does not have to find it by bisection. The guard runs in the **agent core**
-> (`runCorridorFx`), before the provider is chosen: that way it covers both providers and does not
-> disappear the day the partner adapter is switched on.
+> **Why the minimum and the maximum are their own `400` and not the `502`.** "You sent too little" and
+> "you asked for too much" are caller errors, not an outage on our side: flattening them into the
+> `502` would tell someone to "come back later" when their retry will never work until the amount
+> changes. The value in force travels in `minSendUsd` / `maxSendUsd` so the caller does not have to
+> find it by bisection. Both guards run in the **agent core** (`runCorridorFx`), before the provider
+> is chosen: that way they cover both providers and do not disappear the day the partner adapter is
+> switched on.
+>
+> **They are two distinct codes on purpose**: the two errors are fixed in opposite directions, and a
+> single code would leave the integrator unsure whether to raise or lower the amount.
+
+> **The cap belongs to the AGENT, not to each caller.** That way it protects the operator from any
+> caller, including the ones that do not exist yet; a per-caller cap is an explicit exception to be
+> added the day a large client asks for it, not a door left open by default. The 10,000 covers a
+> person's remittance with plenty of headroom and leaves a request for a million on the obviously
+> wrong or malicious side. Before the cap, an `amountUsd` of 1e6, of 1e15 and even of 1e300 returned
+> `200` with a well formed quote, in band and fresh, that the agent committed to honour for ten
+> minutes; the overflow to `Infinity` only cuts in at 1e308. Numeric robustness was not what was
+> missing: the policy was.
 
 ### Rate provenance (HTTP contract change)
 
