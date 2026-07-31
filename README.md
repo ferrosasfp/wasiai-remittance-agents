@@ -18,8 +18,8 @@ EVM ones (`base`, `polygon`, `arbitrum`, …). This corridor declares `solana`.
 
 **Where this actually stands.** The three `/invoke` and the three `/manifest` endpoints are
 implemented and green (**469 tests across 21 files**, no network). What is real today: the **FX
-quote** — live market rate, cascade over two independent sources, and **fail-closed**: with no rate
-it can back, it does not quote — and the **billing manifests**, which are never published half-filled.
+quote** (live market rate, cascade over two independent sources, and **fail-closed**: with no rate
+it can back, it does not quote) and the **billing manifests**, which are never published half-filled.
 What is **not** real yet: KYC (Didit) and disbursement (TransFi). Both run on a **deterministic
 fallback**, tagged as such in every response. The payout **does not move money**, on purpose and with
 a fail-safe that prevents it in production.
@@ -52,14 +52,14 @@ GET  /api/agents/<agent>/manifest                           →  200 { …, paym
 The operator copies that `payment` block into the gateway's registry, and from there the gateway pays
 the agent on every invocation. **Why this split:** an agent signing its own settlements would need a
 hot key per agent and would reimplement the rail once per agent. With this split, the entire surface
-of this repo facing **its own billing** is **one base58 address read from an environment variable** —
-and the code that validates it (`src/manifest/wallet-format.ts`) applies **the same criterion as the
+of this repo facing **its own billing** is **one base58 address read from an environment variable**.
+The code that validates it (`src/manifest/wallet-format.ts`) applies **the same criterion as the
 consumer's settle**, not one of its own.
 
 That is the billing surface, and it is not the only place in the repo where money is described. The
 payout adapter builds an off-ramp order with `source.currency`, `source.walletAddress`, `source.amount`
 and the beneficiary's destination (`src/providers/payout.ts:149-188`): that is money surface too. What
-this repo does not have is the ability to *move* the funds by itself — it has no signing key on either
+this repo does not have is the ability to *move* the funds by itself: it has no signing key on either
 leg, and the payout adapter is off in stage 1. The variables that hold that lock are listed in the
 `remit-cashout-payout` section.
 
@@ -69,9 +69,8 @@ ports the gateway's real sequence guard by guard and in the same order (`NO_PAYM
 possible to assert *"this agent would / would not get paid"* **with no chain and no funds**, which is
 what makes the fail-closed behavior of billing demonstrable inside CI.
 
-> ⚠️ **A `200` from the manifest does NOT prove the agent gets paid.** The manifest declares *where*
-> it charges; whether the gateway *can* pay it there is gateway configuration (`SOLANA_ADAPTER_ENABLED`,
-> **default OFF**). The positive proof is step 5 of the runbook, at the end of this file.
+One consequence worth stating: a `200` from the manifest says *where* the agent charges, not that it
+already got paid. Executing the payment is the gateway's half of the split.
 
 ---
 
@@ -130,7 +129,7 @@ Preview), never in a file in the repo: rotating a wallet is editing a variable a
 Every external capability is an interface in `src/providers/types.ts` with **two** implementations:
 
 - the **partner adapter** (`DiditKycProvider`, `TransFiPayoutProvider`, …), active only with its
-  credential **and** its `*_ADAPTER_READY` flag — the credential alone is not enough, so nobody talks
+  credential **and** its `*_ADAPTER_READY` flag: the credential alone is not enough, so nobody talks
   to a half-configured partner;
 - the **deterministic fallback**, which runs with no credentials and stays **tagged in the output**
   (`provenance: "local-fallback"`), never disguised as real data.
@@ -138,26 +137,23 @@ Every external capability is an interface in `src/providers/types.ts` with **two
 The factory (`getKycProvider()`, `getPayoutProvider()`, …) picks based on the environment. The day
 the partner sandbox arrives, two variables get set: zero wiring changes.
 
-> The spots where the exact shape of the partner response still has to be confirmed are marked in the
-> code: **15 across the adapters in `src/providers/`** — `TODO(F3-sandbox)` (9, in `payout.ts`) and
-> `TODO(sandbox)` (6, in `kyc.ts` and `fx.ts`). This is **declared** debt, not an oversight: it gets
-> resolved against the real sandbox, and until then every uncertain field is read from env and fails
-> loudly if the partner requires it and it is not there.
+The exact shape of the partner responses is still to be confirmed against their sandbox: the adapters
+follow the documented shape, and every uncertain field is read from an environment variable and fails
+loudly if the partner requires it and it is not set.
 
 This repo **signs nothing**: it has no signing key and issues no signed receipts. The pattern of an
 agent here is `zod input → provider → { result }`: trust in the result rests on the `provenance`
-field — which method produced that datum — and not on a signature from the agent itself.
+field (which method produced that datum) and not on a signature from the agent itself.
 
 ### Pending (post-sandbox)
 
-- Map the exact fields of the Didit/TransFi responses (today the adapters use the documented shape +
-  the `TODO(F3-sandbox)` markers).
+- Map the exact fields of the Didit/TransFi responses (today the adapters use the documented shape).
 - Real value delivery: movement of the principal + settlement to the beneficiary's wallet, not a
   self-transfer. See `remit-cashout-payout`.
 
 ---
 
-## HTTP endpoint (stage 1 — `remit-corridor-fx`)
+## HTTP endpoint (stage 1: `remit-corridor-fx`)
 
 ```
 POST /api/agents/remit-corridor-fx/invoke
@@ -190,8 +186,8 @@ each value maps 1:1 to an auditable method of obtaining the rate.
 
 Two **additive** fields accompany every quote:
 
-- **`rateSource`** — id of the registered source (`"er-api"`, `"currency-api"`, `"transfi"`).
-- **`rateAsOf`** — ISO, the date of the datum **according to the source**, never the moment it was
+- **`rateSource`**: id of the registered source (`"er-api"`, `"currency-api"`, `"transfi"`).
+- **`rateAsOf`**: ISO, the date of the datum **according to the source**, never the moment it was
   served. A cached response keeps the ORIGINAL date of the datum: if it showed the moment of serving,
   it would be lying about its own freshness.
 
@@ -200,7 +196,7 @@ Two **additive** fields accompany every quote:
 > **just like** a market rate. Measured on 2026-07-29 against three independent sources
 > (`open.er-api.com` 3.4033, `currency-api` 3.3956, **official BCRP** 3.404), the market was at
 > **~3.40**: the constant sat **+10.2% above it**. Whenever that fallback kicked in, the quote
-> **promised more soles than the market gives** — on a $400 remittance, **~140 PEN** that somebody has
+> **promised more soles than the market gives**: on a $400 remittance, **~140 PEN** that somebody has
 > to cover. This was not a labeling problem: it was money. The value is still alive in KYC and payout,
 > which are a different axis.
 
@@ -249,7 +245,7 @@ The variables live in [`.env.example`](.env.example) with their valid ranges. Wh
 
 They are all read on **every quote**, so rotating them takes effect without a redeploy. Invalid config
 **throws** `fx_mid_config_invalid:<field>` instead of quoting with a disabled guard: `Number("abc")`
-is `NaN`, and comparing against `NaN` is always `false` — a non-numeric maximum would **silently
+is `NaN`, and comparing against `NaN` is always `false`: a non-numeric maximum would **silently
 disable the band**.
 
 ⚠️ **`STATIC_USD_PEN` is OBSOLETE and HAS NO EFFECT.** It is no longer read anywhere in the code. It
@@ -260,16 +256,15 @@ quote at all. **Delete it from the deploy** so nobody believes it still controls
 **20%** of the minimum. If it does, `resolveFxConfig()` **throws** and the agent quotes nothing. The
 reason is that a loose minimum switches itself off: with the fee at 6 and the minimum at 5, the
 smallest accepted send would deliver **zero soles** again, with the minimum sitting right there
-protecting nothing. To charge a higher fee you have to raise the minimum — which is exactly the
+protecting nothing. To charge a higher fee you have to raise the minimum, which is exactly the
 decision somebody should be making consciously. With the defaults (minimum 5, fee 0.50) the fee is
 **10%** at the floor, half of the ceiling.
 
 ⚠️ The **spread** and the **fee** are money guards too, not preferences: the rate the user receives is
 `mid * (1 - spread/10000)`, and the band validates the **mid**, not the emitted rate. A negative
-spread quotes **above the market** — measured against a mid of 3.40, `-1000` bps emitted 3.74
-(+10.0%), which is the very same error as the 3.75 constant this work item came to kill, through
-another door. That is why they are now range-validated and the **emitted rate** also goes through the
-band (`fx_rate_out_of_band`).
+spread quotes **above the market**: measured against a mid of 3.40, `-1000` bps emitted 3.74
+(+10.0%), the very same error as the 3.75 constant, through another door. That is why they are now
+range-validated and the **emitted rate** also goes through the band (`fx_rate_out_of_band`).
 
 Every default **asserts something about the outside world** (evidence measured on 2026-07-29): both
 sources are alive and publish USD/PEN with a date; the feed promises a ~24 h cycle, so 48 h tolerates
@@ -279,7 +274,7 @@ currency (if the feed changed and returned `PYG` ≈ 7300 or `EUR` ≈ 0.92).
 
 ---
 
-## HTTP endpoint (stage 1 — `remit-kyc-validator`)
+## HTTP endpoint (stage 1: `remit-kyc-validator`)
 
 ```
 POST /api/agents/remit-kyc-validator/invoke
@@ -298,7 +293,7 @@ the deploy. **Hard NO-PII guarantee:** the output NEVER exposes `legalId` (natio
 
 ---
 
-## HTTP endpoint (stage 1 — `remit-cashout-payout`)
+## HTTP endpoint (stage 1: `remit-cashout-payout`)
 
 ```
 POST /api/agents/remit-cashout-payout/invoke
@@ -326,7 +321,7 @@ also the sign that a real order was created (`src/agents/cashout-payout.ts:59`).
 > compile**.) If legacy code still sends `kycPayoutAllowed: true`, **Zod strips it silently** (schema
 > without `.strict()`); the field has no effect whatsoever.
 
-### Identity binding — `senderIdentity`
+### Identity binding: `senderIdentity`
 
 The hard gate confirms that the verification is **approved**, not that it belongs to **whoever is
 requesting the payout**. The binding ties the two together: the caller presents `senderIdentity` and
@@ -334,11 +329,11 @@ the agent compares it against the **real** `vendor_data` that the authoritative 
 bound to that verification. No match → **blocked**.
 
 - **`senderIdentity`** (`string`, optional in the schema): the value that was bound as `vendor_data`
-  to that verification **at creation time** — the **national ID** if `remit-kyc-validator` created it,
-  the **wallet address** if the consuming app did. The comparison normalizes with `trim()` +
+  to that verification **at creation time** (the **national ID** if `remit-kyc-validator` created it,
+  the **wallet address** if the consuming app did). The comparison normalizes with `trim()` +
   `toLowerCase()`: it leaves a national ID untouched and absorbs the case differences of an address.
   The value is **never** echoed in a response and never logged.
-- **`address`** (`string`, optional): **DEPRECATED** — compatibility bridge for the consuming app,
+- **`address`** (`string`, optional): **DEPRECATED**. Compatibility bridge for the consuming app,
   which today sends `address` and not `senderIdentity`. It is used **only** if `senderIdentity` is
   absent (precedence: the explicit one wins). Do not build new features on top of it.
 - **Fail-closed**: no claim (or an empty/whitespace claim) → `kyc_identity_claim_missing` **without
@@ -353,7 +348,7 @@ bound to that verification. No match → **blocked**.
 > caller-controlled just like `kycVerificationId`. An attacker who obtains **both** values gets
 > through. On top of that, when the KYC session was created with a **public** `vendor_data` (e.g. a
 > wallet address), the protection of **that** flow is **≈nil**: the attacker who wants to impersonate
-> that victim already knows their address. Real proof of possession is a follow-up work item.
+> that victim already knows their address. Real proof of possession is still pending.
 
 Stage 1 runs 100% on the **MOCK payout** (`FallbackPayoutProvider`, `provenance:"local-fallback"`,
 `deliveredLocal:null`, `txRef:null`): it NEVER moves real money. **TransFi stays OFF** (stage 2).
@@ -365,15 +360,15 @@ four are re-checked by the `assertPayoutProviderSafe()` fail-safe (`src/agents/c
 
 | variable | what happens if it is missing |
 |---|---|
-| `TRANSFI_USERNAME` | falls back to the mock — any one of the three credentials missing is enough |
+| `TRANSFI_USERNAME` | falls back to the mock; any one of the three credentials missing is enough |
 | `TRANSFI_PASSWORD` | idem |
 | `TRANSFI_MID` | idem |
 | `TRANSFI_ADAPTER_READY` (must be `"true"`) | with the 3 credentials set and this one not `"true"`, it **throws** `transfi_adapter_not_ready`; it does not quietly downgrade to the mock |
 
 > ⚠️ **`TRANSFI_API_KEY` does NOT gate the disbursement.** It is read by the **FX** adapter (`fx.ts`)
-> and by nothing on the payout path — the code states it out loud at `src/providers/payout.ts:308`.
-> Setting it or clearing it moves nothing in the payout. An earlier version of this README named it as
-> the lock; anyone auditing the money-path by that variable was watching the wrong one.
+> and by nothing on the payout path: the code states it out loud at `src/providers/payout.ts:308`.
+> Setting it or clearing it moves nothing in the payout. Auditing the disbursement through that
+> variable is watching the wrong one.
 
 A fifth variable is not part of the selection gate, but the real adapter cannot create a single order
 without it: **`TRANSFI_USDC_NETWORK`** decides which chain the USDC leaves through (`solana` ⇒
@@ -415,11 +410,11 @@ Derivation from the already-registered `agentUrl`:
 **The `GET` answers `200` or `503`, nothing else** (there is no third code for the supported method).
 Both responses carry `Cache-Control: no-store`. Other methods and other paths are not part of the
 contract and are handled by the framework: a `POST` to the same path returns `405`, and a nonexistent
-path returns `404` — in particular the **canonical slug**
+path returns `404`. In particular, the **canonical slug**
 (`/api/agents/remit-corridor-fx-solana/manifest`) **is not a URL**: the 3 valid URLs are the ones in
 the table above, which use the `pathSlug`.
 
-### `200 OK` — exactly 7 top-level keys
+### `200 OK`: exactly 7 top-level keys
 
 ```json
 {
@@ -436,7 +431,7 @@ the table above, which use the `pathSlug`.
 `payment` has exactly 4 keys (`method`, `chain`, `contract`, `asset`) and is **copied verbatim** into
 the registry: there is no transformation or normalization pending on the consumer side.
 
-### `503 Service Unavailable` — sheet not publishable (fail-closed)
+### `503 Service Unavailable`: sheet not publishable (fail-closed)
 
 ```json
 { "error": "manifest_unavailable", "missing": ["payment.contract"], "invalid": [] }
@@ -455,13 +450,13 @@ Hence: with no `payTo` configured, or with a malformed `payTo`, the manifest **i
 (`503`). There is no code branch that returns `200` without a valid `payment.contract`.
 
 The 3 slots are `solana-devnet`, and the validator is there precisely to **reject anything that is
-not** — including a `0x…` address from another chain family pasted by mistake, which is the operator's
+not**, including a `0x…` address from another chain family pasted by mistake, which is the operator's
 most likely slip when copying between environments. Without that rejection, the consumer's settle
 would discard it with `INVALID_PAY_TO_FORMAT`, the agent would charge zero anyway, and the manifest
 would keep saying everything was fine.
 
 The format criterion is the **same** one the consumer applies, and for these 3 agents it reduces to a
-single rule: base58 that decodes to **exactly 32 bytes**, not "between 32 and 44 characters" — a
+single rule: base58 that decodes to **exactly 32 bytes**, not "between 32 and 44 characters". A
 base58 string of valid length that decodes to 33 bytes passes the loose regex and the settle rejects
 it all the same.
 
@@ -501,7 +496,7 @@ mainnet: it is impossible by construction, not by discipline.
 Registration and delisting are **not done by this repo**: they are **human `!` ops** in `wasiai-a2a`.
 This repo only publishes the sheet.
 
-1. **Set the 3 envs** in Vercel (Production) and redeploy — all 3 are Solana base58. For FX and
+1. **Set the 3 envs** in Vercel (Production) and redeploy. All 3 are Solana base58. For FX and
    payout: use the **same** addresses already declared by the `*-solana` rows in the registry (read
    them from `/discover` **before** setting them; do not invent a second truth). For KYC: today, by
    founder's decision, **the same wallet as the other two**; the day it gets separated, it is this
@@ -518,14 +513,12 @@ This repo only publishes the sheet.
    **the registry wins**: the payment comes from there, not from this repo.
 5. **Prove that the billing rail is ON** (positive proof, not agreement between documents):
    - **Mandatory minimum**: `GET /capabilities` on the gateway and check that `chains[].key` includes
-     `solana-devnet`. If it is not there, the Solana adapter is off (`SOLANA_ADAPTER_ENABLED`,
-     **default OFF**) and the downstream leg is skipped with `CHAIN_NOT_SUPPORTED` for **all three**
-     agents: they charge **$0**, manifest `200` and all.
+     `solana-devnet`. If it is not there, the gateway cannot pay on that chain and the downstream leg
+     is skipped with `CHAIN_NOT_SUPPORTED` for **all three** agents: they charge **$0**, manifest
+     `200` and all.
    - **Ideal**: a real devnet invocation against each `*-solana` slug, confirming in the result / the
      gateway logs that the leg **settled** (none of the skip codes `NO_PAYMENT_FIELD`,
      `METHOD_NOT_SUPPORTED`, `CHAIN_NOT_SUPPORTED`, `INVALID_PAY_TO_FORMAT`).
-   > **A `200` from the manifest does NOT imply the rail is on.** The manifest declares *where* the
-   > agent charges; whether the gateway *can* pay it there is gateway configuration, not this repo's.
 6. ⚠️ **Delist any previous row for these agents ONLY AFTER step 5 has given positive proof of
    payment** (steps 2 and 3 are not enough: both go green without ever touching the rail). Doing it
    earlier leaves the agent **with no billing route at all**. Delisting is reversible; being left
@@ -533,7 +526,7 @@ This repo only publishes the sheet.
 7. **Stage 2 only (not today): turning the real disbursement on.** Steps 1-6 are about *charging*; this
    one is about *paying out*, and it is the step that moves real money. Set the four variables of the
    lock (`TRANSFI_USERNAME`, `TRANSFI_PASSWORD`, `TRANSFI_MID`, `TRANSFI_ADAPTER_READY=true`) **and**
-   `TRANSFI_USDC_NETWORK` — for this corridor, `solana`. Skipping that last one is the trap: the gate
+   `TRANSFI_USDC_NETWORK` (for this corridor, `solana`). Skipping that last one is the trap: the gate
    lets the adapter through and then every order dies with `transfi_usdc_network_unset`. Once a real
    provider is in place, remove `PAYOUT_ALLOW_MOCK` from that deploy.
 
@@ -541,4 +534,4 @@ This repo only publishes the sheet.
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE).
+MIT. See [`LICENSE`](LICENSE).
