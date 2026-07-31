@@ -129,9 +129,9 @@ sandbox del partner se setean dos variables: cero cambio de wiring.
 > en `kyc.ts` y `fx.ts`). Es deuda **declarada**, no olvido: se resuelve contra el sandbox real, y
 > hasta entonces cada campo incierto se lee de env y falla ruidoso si el partner lo exige y no está.
 
-Este repo **no tiene `agent-signer` y no emite receipts EIP-712**. El patrón de un agente acá es
-`zod input → provider → { result }`: la confianza en el resultado se apoya en el campo `provenance`
-—qué método produjo ese dato— y no en una firma del propio agente.
+Este repo **no firma nada**: no tiene una clave de firma, ni emite recibos firmados. El patrón de un
+agente acá es `zod input → provider → { result }`: la confianza en el resultado se apoya en el campo
+`provenance` —qué método produjo ese dato— y no en una firma del propio agente.
 
 ### Pendiente (post-sandbox)
 
@@ -282,24 +282,24 @@ body: { "quoteId": "q1", "amountUsd": 100, "kycVerificationId": "v1",
         "idempotencyKey": "idem-1" }
 → 200 { "result": { "slug", "executed", "status", "payoutId",
                     "deliveredLocal", "txRef", "reason", "provenance" } }  # SIN beneficiary ni travelRuleData
-→ 200 { "result": { "executed": false, "status": "blocked", "reason": "kyc_gate_not_passed" } }  # hard-gate KYC (WKH-203: server-side, no del caller) o identidad no coincide (WKH-204)
-→ 200 { "result": { "executed": false, "status": "blocked", "reason": "kyc_identity_claim_missing" } }  # falta la identity claim (WKH-204)
+→ 200 { "result": { "executed": false, "status": "blocked", "reason": "kyc_gate_not_passed" } }  # hard-gate KYC (server-side, no del caller) o la identidad no coincide
+→ 200 { "result": { "executed": false, "status": "blocked", "reason": "kyc_identity_claim_missing" } }  # falta la identity claim
 → 400 { "error": "invalid_input", "details": {...} }  # body inválido (mensajes Zod, sin PII)
 → 502 { "error": "payout_unavailable" }               # fail-safe / misconfig del provider
 ```
 
-> **Nota**: el campo `kycPayoutAllowed` fue **removido del schema** (WKH-203). El hard-gate KYC ahora se **re-deriva server-side** contra Didit: `KycProvider.status(verificationId, identityClaim)` → allowlist `REAL_KYC_PROVENANCES`. (El 2º parámetro es **requerido** desde WKH-204: un opcional se puede olvidar en un call site nuevo y degradaría el binding en silencio; uno requerido **no compila**.) Si código legacy aún envía `kycPayoutAllowed: true`, **Zod lo strippea silenciosamente** (schema sin `.strict()`); el campo no tiene ningún efecto.
+> **Nota**: el campo `kycPayoutAllowed` fue **removido del schema**. El hard-gate KYC se **re-deriva server-side** contra Didit: `KycProvider.status(verificationId, identityClaim)` → allowlist `REAL_KYC_PROVENANCES`. (El 2º parámetro es **requerido**: un opcional se puede olvidar en un call site nuevo y degradaría el binding en silencio; uno requerido **no compila**.) Si código legacy aún envía `kycPayoutAllowed: true`, **Zod lo strippea silenciosamente** (schema sin `.strict()`); el campo no tiene ningún efecto.
 
-### Identity binding — `senderIdentity` (WKH-204)
+### Identity binding — `senderIdentity`
 
-El hard-gate de WKH-203 confirma que la verificación está **aprobada**, no que sea **del que pide el payout**.
-WKH-204 ata las dos cosas: el caller presenta `senderIdentity` y el agente lo compara contra el `vendor_data`
+El hard-gate confirma que la verificación está **aprobada**, no que sea **del que pide el payout**. El
+binding ata las dos cosas: el caller presenta `senderIdentity` y el agente lo compara contra el `vendor_data`
 **real** que la fuente autoritativa (Didit) tiene atado a esa verificación. Si no coincide → **blocked**.
 
 - **`senderIdentity`** (`string`, opcional en el schema): el valor que quedó ligado como `vendor_data` a esa
   verificación **en su creación** — el **DNI** si la creó `remit-kyc-validator`, la **wallet address** si la creó
-  la app consumidora. La comparación normaliza con `trim()` + `toLowerCase()` (deja el DNI intacto y vuelve el
-  address EVM case-insensitive). El valor **nunca** se ecoa en un response ni se loguea.
+  la app consumidora. La comparación normaliza con `trim()` + `toLowerCase()`: deja el DNI intacto y absorbe
+  las diferencias de mayúsculas de un address. El valor **nunca** se ecoa en un response ni se loguea.
 - **`address`** (`string`, opcional): **DEPRECADO** — puente de compatibilidad con la app consumidora, que hoy
   manda `address` y no `senderIdentity`. Se usa **solo** si `senderIdentity` está ausente (precedencia: gana el
   explícito). No construir features nuevas sobre él.
@@ -387,22 +387,25 @@ body ni en los logs (ni truncado, ni hasheado). Ambas claves están siempre pres
 > termina cobrando $0 en silencio.**
 
 Por eso: sin `payTo` configurado, o con un `payTo` mal formado, el manifiesto **no se emite** (`503`). No
-existe ninguna rama de código que devuelva `200` sin un `payment.contract` válido. En particular se
-rechaza el **cruce de familias**: una address EVM `0x…` en un slot `solana-devnet` — y los 3 slots son
-`solana-devnet`. Es el error más probable del operador al copiar y pegar entre entornos: el
-settle la rechazaría con `INVALID_PAY_TO_FORMAT` y el agente cobraría cero igual, pero con un manifiesto
-diciendo que todo está bien.
+existe ninguna rama de código que devuelva `200` sin un `payment.contract` válido.
 
-El criterio de formato es el **mismo** que aplica el consumidor (EVM: `0x` + 40 hex y distinta de la
-zero-address; Solana: base58 que decodifica a **exactamente 32 bytes**, no "entre 32 y 44 caracteres").
+Los 3 slots son `solana-devnet`, y el validador está justamente para **rechazar cualquier cosa que no lo
+sea** — incluida una address `0x…` de otra familia de cadenas pegada por error, que es la equivocación más
+probable del operador al copiar y pegar entre entornos. Sin ese rechazo, el settle del consumidor la
+descartaría con `INVALID_PAY_TO_FORMAT`, el agente cobraría cero igual, y el manifiesto seguiría diciendo
+que todo está bien.
+
+El criterio de formato es el **mismo** que aplica el consumidor, y para estos 3 agentes se reduce a uno
+solo: base58 que decodifica a **exactamente 32 bytes**, no "entre 32 y 44 caracteres" — una base58 de largo
+válido que decodifica a 33 bytes pasa la regex laxa y el settle la rechaza igual.
 
 ### Envs de `payTo` (sin default, a propósito)
 
-| Agente | Env del `payTo` | Familia esperada |
+| Agente | Env del `payTo` | Único formato aceptado |
 |---|---|---|
-| `remit-kyc-validator` | `REMIT_KYC_VALIDATOR_PAYTO` | Solana (base58, 32 bytes) |
-| `remit-corridor-fx` | `REMIT_CORRIDOR_FX_PAYTO` | Solana (base58, 32 bytes) |
-| `remit-cashout-payout` | `REMIT_CASHOUT_PAYOUT_PAYTO` | Solana (base58, 32 bytes) |
+| `remit-kyc-validator` | `REMIT_KYC_VALIDATOR_PAYTO` | base58 de Solana, 32 bytes |
+| `remit-corridor-fx` | `REMIT_CORRIDOR_FX_PAYTO` | base58 de Solana, 32 bytes |
+| `remit-cashout-payout` | `REMIT_CASHOUT_PAYOUT_PAYTO` | base58 de Solana, 32 bytes |
 
 Detalle completo de las 3 (qué agente, qué red, qué pasa si falta, dónde se setean de verdad):
 [`.env.example`](.env.example). **Hoy las 3 apuntan a propósito a la misma billetera** (decisión del
@@ -410,9 +413,10 @@ founder); son variables separadas para que darle a cada agente la suya sea cambi
 entorno, sin tocar ni deployar código. Ninguna dirección vive en el código.
 
 **Ninguna tiene default.** Sin la env (ausente, vacía o sólo whitespace) el endpoint responde `503`: es el
-comportamiento deseado, no un bug. La `chain` **no** es configurable: vive como constante de código en
-`src/manifest/registry.ts`, tipada como conjunto cerrado (`"avalanche-fuji" | "solana-devnet"`), así que
-ninguna variable de entorno puede llevar un manifiesto a mainnet.
+comportamiento deseado, no un bug. La `chain` **no** es configurable: los 3 agentes la declaran como
+constante de código en `src/manifest/registry.ts`, y su tipo es un **conjunto cerrado de redes de test**
+donde mainnet no es representable. Ninguna variable de entorno puede llevar un manifiesto a mainnet: es
+imposible por construcción, no por disciplina.
 
 ### Tabla `pathSlug` → `slug` canónico → chain
 
@@ -441,23 +445,23 @@ sólo publica la ficha.
    slugs `*-solana`. Si difieren, **no** se corrige a mano.
    > ⚠️ Este chequeo **no prueba nada sobre el cobro**: coinciden **por construcción**, porque el paso 1
    > manda copiar las addresses **desde esas mismas filas**. Es un chequeo de consistencia documental.
-4. **Registrar/actualizar `remit-kyc-validator`** con su `payment` — que ahora declara `solana-devnet`,
-   no `avalanche-fuji` (requiere la HU hermana del otro repo). Si la fila registrada quedó con el
-   `payment` viejo de Fuji, el manifiesto y el registro dicen cosas distintas y manda el registro.
+4. **Registrar/actualizar los 3 agentes** con el `payment` que declara su manifiesto (`solana-devnet`).
+   Si una fila del registro quedó con un `payment` viejo, el manifiesto y el registro dicen cosas
+   distintas y **manda el registro**: el cobro sale de ahí, no de este repo.
 5. **Probar que el rail de cobro está PRENDIDO** (prueba positiva, no coincidencia de documentos):
    - **Mínimo obligatorio**: `GET /capabilities` del gateway y verificar que `chains[].key` incluye
      `solana-devnet`. Si no está, el adapter Solana está apagado (`SOLANA_ADAPTER_ENABLED`, **default
-     OFF**) y el leg downstream se saltea con `CHAIN_NOT_SUPPORTED` para **los 3** agentes (ya no queda
-     ninguno cobrando por una chain EVM): cobran **$0**, con manifiesto `200` y todo.
+     OFF**) y el leg downstream se saltea con `CHAIN_NOT_SUPPORTED` para **los 3** agentes: cobran
+     **$0**, con manifiesto `200` y todo.
    - **Ideal**: una invocación real en devnet contra cada slug `*-solana` y confirmar en el resultado /
      los logs del gateway que el leg **settleó** (ninguno de los skip-codes `NO_PAYMENT_FIELD`,
      `METHOD_NOT_SUPPORTED`, `CHAIN_NOT_SUPPORTED`, `INVALID_PAY_TO_FORMAT`).
    > **Un `200` del manifiesto NO implica que el rail esté prendido.** El manifiesto declara *dónde*
    > cobra el agente; que el gateway *pueda* pagarle ahí es configuración del gateway, no de este repo.
-6. ⚠️ **Deslistar los gemelos Fuji (`remit-corridor-fx`, `remit-cashout-payout`) SÓLO DESPUÉS de que el
-   paso 5 haya dado prueba positiva de cobro** (los pasos 2 y 3 no alcanzan: los dos dan verde sin haber
-   tocado nunca el rail). Hacerlo antes deja a FX y payout **sin ninguna ruta de cobro**. El deslistado
-   es reversible; quedarse sin ruta de cobro no es gratis.
+6. ⚠️ **Deslistar cualquier fila anterior de estos agentes SÓLO DESPUÉS de que el paso 5 haya dado
+   prueba positiva de cobro** (los pasos 2 y 3 no alcanzan: los dos dan verde sin haber tocado nunca el
+   rail). Hacerlo antes deja al agente **sin ninguna ruta de cobro**. El deslistado es reversible;
+   quedarse sin ruta de cobro no es gratis.
 
 ---
 

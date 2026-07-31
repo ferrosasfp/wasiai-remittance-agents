@@ -18,7 +18,7 @@ next-env.d.ts
 *.tsbuildinfo
 
 # Documentacion interna de trabajo (SDDs, work-items, backlog, contexto de proyecto):
-# se queda en el disco, fuera del repo. Mismo criterio que chaski-v3.
+# se queda en el disco, fuera del repo.
 # El rigor se demuestra donde se lee: en los comentarios de cabecera del codigo,
 # en .env.example y en el runbook del README.
 doc/*

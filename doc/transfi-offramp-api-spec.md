@@ -1,7 +1,8 @@
 # TransFi Off-ramp API — ficha técnica verificada (2026-07-17)
 
-Grounding para reescribir el adapter de payout (`src/providers/payout.ts`), hoy desactualizado en los 4 ejes.
-Todo VERIFICADO en docs.transfi.com salvo lo marcado NO CONFIRMADO.
+Ficha del contrato HTTP real del partner y grounding del adapter de payout (`src/providers/payout.ts`),
+que ya sigue los 4 ejes de la tabla del final. Todo VERIFICADO en docs.transfi.com salvo lo marcado
+NO CONFIRMADO.
 
 ## Base URL
 - **Sandbox**: `https://sandbox-api.transfi.com`
@@ -27,7 +28,7 @@ NO es `/v1/payouts`. Body:
   "purposeCode": "...",
   "sourceUrl": "https://...",
   "partnerId": "<idempotency-id>",   // idempotencia (ver abajo)
-  "source":      { "currency": "USDCPOLYGON", "walletAddress": "0x...", "amount": 100 },
+  "source":      { "currency": "USDCSOL", "walletAddress": "<base58>", "amount": 100 },
   "destination": { "currency": "PEN", "paymentType": "bank_transfer",
                    "paymentCode": "<de /v3/payment-methods>", "amount": 380,
                    "additionalPaymentDetails": { /* campos beneficiario PE — descubrir en runtime */ } }
@@ -35,8 +36,12 @@ NO es `/v1/payouts`. Body:
 ```
 - **Modelo NO fire-and-forget**: crear orden → TransFi devuelve **`walletAddress` dedicada por orden** → mandar USDC on-chain a esa address → webhook `asset_deposited`→`fund_settled`.
 - Status: `GET /v3/orders/{orderId}`.
-- Códigos USDC (source.currency): `USDC`(eth), `USDCPOLYGON`, `USDCBASE`, `USDCARB`, `USDCBSC`, `USDCSOL`, `USDCCELO`, `USDCLINEA`, `USDCALGO`, `USDCXLM`, `USDCFUSE`.
-  ⚠️ **`USDCAVAX` (Avalanche) NO está en la lista publicada** → verificar vía `list-tokens`. IMPACTA a Chaski (settlea en Avalanche).
+- Códigos USDC publicados para `source.currency` (catálogo del partner, no una lista de redes que este
+  corredor use): `USDC`, `USDCPOLYGON`, `USDCBASE`, `USDCARB`, `USDCBSC`, **`USDCSOL`**, `USDCCELO`,
+  `USDCLINEA`, `USDCALGO`, `USDCXLM`, `USDCFUSE`.
+  **Este corredor usa `USDCSOL`**, que está en la lista publicada. Cualquier red fuera del catálogo cae en
+  fail-loud en el adapter (`resolveSourceCurrency`) antes de armar el body: nunca se manda una orden con una
+  currency inventada.
 - Campos del beneficiario peruano (CCI/banco/doc): **NO CONFIRMADOS** en docs → descubrir vía `GET /v3/payment-methods` (PEN/withdraw) en sandbox.
 
 ## Webhooks — estados y firma
@@ -53,8 +58,8 @@ NO es `/v1/payouts`. Body:
 ## Env vars nuevas (reemplazan la sola TRANSFI_API_KEY)
 `TRANSFI_USERNAME`, `TRANSFI_PASSWORD`, `TRANSFI_MID`, `TRANSFI_WEBHOOK_SECRET`, `TRANSFI_BASE_URL` (sandbox por default en dev).
 
-## Qué hay que reescribir en el adapter (todos los ejes están mal hoy)
-| Aspecto | Scaffold hoy | Real |
+## Los 4 ejes del contrato (el adapter ya sigue la columna «Real»)
+| Aspecto | Scaffold original | Real |
 |---|---|---|
 | Endpoint | `POST /v1/payouts` | `POST /v3/orders` (orderType offramp) |
 | Auth | `Bearer TRANSFI_API_KEY` | `Basic base64(user:pass)` + `mid` |
@@ -64,6 +69,6 @@ NO es `/v1/payouts`. Body:
 
 ## Cabos sueltos (a resolver en sandbox durante la HU)
 1. Campos exactos del beneficiario PE (via /v3/payment-methods).
-2. ¿USDC en Avalanche soportado? (list-tokens) — si NO, Chaski debe settlear/bridgear a una red soportada (Base/Polygon) o el sender usa esa red. DECISIÓN DE ARQUITECTURA.
+2. Confirmar el flujo de depósito de `USDCSOL` end-to-end en sandbox: crear orden → address dedicada → depósito on-chain → webhook `fund_settled`.
 3. Flujo de creación del `userId` (UX-...) con KYC.
 4. `purposeCode` válido para remesas a Perú.
