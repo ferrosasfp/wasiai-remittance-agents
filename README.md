@@ -1,92 +1,95 @@
+[Español](README.es.md)
+
 # wasiai-remittance-agents
 
-Tres agentes autónomos del corredor de remesas **USDC → PEN** (Estados Unidos → Perú) que **cobran
-por su trabajo en USDC sobre `solana-devnet`**, vía x402. Se descubren, se invocan por HTTP y se les
-paga por llamada. **Ninguno de los tres toca una chain EVM.**
+Three autonomous agents of the **USDC → PEN** remittance corridor (United States → Peru) that **charge
+for their work in USDC on `solana-devnet`**, over x402. They are discoverable, invoked over HTTP, and
+paid per call. **None of the three touches an EVM chain.**
 
-| agente (slug de cobro) | qué hace | precio | cobra en |
+| agent (billing slug) | what it does | price | charges on |
 |---|---|---|---|
-| `remit-kyc-validator` | KYC/AML: identidad + screening OFAC/PEP/sanciones + datos Travel Rule. Hard-gate: si el KYC no pasa, no hay payout. | 0.02 USDC | `solana-devnet` |
-| `remit-corridor-fx-solana` | Cotiza el corredor USDC→PEN: tasa de mercado real + spread declarado + ETA. | 0.03 USDC | `solana-devnet` |
-| `remit-cashout-payout-solana` | Cash-out a Perú (Yape/Plin/CCI): la entrega de valor al beneficiario. | 0.03 USDC | `solana-devnet` |
+| `remit-kyc-validator` | KYC/AML: identity + OFAC/PEP/sanctions screening + Travel Rule data. Hard gate: if KYC does not pass, there is no payout. | 0.02 USDC | `solana-devnet` |
+| `remit-corridor-fx-solana` | Prices the USDC→PEN corridor: real market rate + declared spread + ETA. | 0.03 USDC | `solana-devnet` |
+| `remit-cashout-payout-solana` | Cash-out to Peru (Yape/Plin/CCI): the value delivery to the beneficiary. | 0.03 USDC | `solana-devnet` |
 
-**Estado real.** Los 3 endpoints `/invoke` y los 3 `/manifest` están implementados y en verde
-(**463 tests en 21 archivos**, sin red). Ya es real la **cotización FX** —tasa de mercado en vivo,
-cascada de dos fuentes independientes, y **fail-closed**: sin tasa que se pueda respaldar, no se
-cotiza— y son reales los **manifiestos de cobro**, que no se publican a medias. Todavía **no** son
-reales el KYC (Didit) ni el desembolso (TransFi): corren en **fallback determinístico**, tageado como
-tal en cada respuesta. El payout **no mueve plata**, a propósito y con un fail-safe que lo impide en
-producción.
+**Where this actually stands.** The three `/invoke` and the three `/manifest` endpoints are
+implemented and green (**463 tests across 21 files**, no network). What is real today: the **FX
+quote** — live market rate, cascade over two independent sources, and **fail-closed**: with no rate
+it can back, it does not quote — and the **billing manifests**, which are never published half-filled.
+What is **not** real yet: KYC (Didit) and disbursement (TransFi). Both run on a **deterministic
+fallback**, tagged as such in every response. The payout **does not move money**, on purpose and with
+a fail-safe that prevents it in production.
 
-- **Licencia**: MIT. **Runtime**: Node 22, Next.js App Router, TypeScript strict.
-- **Todas las variables de entorno**: [`.env.example`](.env.example) (fuente única).
+- **License**: MIT. **Runtime**: Node 22, Next.js App Router, TypeScript strict.
+- **Every environment variable**: [`.env.example`](.env.example) (single source of truth).
 
 ---
 
-## ¿Dónde está el código que mueve el USDC? (leer esto primero)
+## Where is the code that moves the USDC? (read this first)
 
-**No está en este repo, y es deliberado.** `package.json` no tiene ninguna dependencia de Solana: no
-hay `@solana/web3.js`, ni una keypair, ni una llamada a un RPC. Si la tesis es "agentes que cobran en
-Solana", vale explicar dónde vive el eslabón que efectivamente cobra.
+**It is not in this repo, and that is deliberate.** `package.json` has no Solana dependency: no
+`@solana/web3.js`, no keypair, no RPC call. If the thesis is "agents that get paid on Solana", it is
+worth spelling out where the link that actually collects the money lives.
 
-| | este repo (`wasiai-remittance-agents`) | el gateway (`wasiai-a2a`) |
+| | this repo (`wasiai-remittance-agents`) | the gateway (`wasiai-a2a`) |
 |---|---|---|
-| **rol** | hace el trabajo y **declara** dónde cobrarlo | **ejecuta** el cobro |
-| **artefacto** | `GET /api/agents/<agente>/manifest` → bloque `payment` | transferencia SPL de USDC en `solana-devnet` |
-| **dato** | `{ method:"x402", chain:"solana-devnet", contract:"<base58 32B>", asset:"USDC" }` | firma y envía la transacción hacia la address de `contract` |
-| **claves** | ninguna: la billetera es una variable de entorno, no un secreto | las claves del rail viven allá |
+| **role** | does the work and **declares** where to get paid | **executes** the payment |
+| **artifact** | `GET /api/agents/<agent>/manifest` → `payment` block | SPL USDC transfer on `solana-devnet` |
+| **data** | `{ method:"x402", chain:"solana-devnet", contract:"<base58 32B>", asset:"USDC" }` | signs and sends the transaction to the address in `contract` |
+| **keys** | none: the wallet is an environment variable, not a secret | the rail's keys live over there |
 
-Un agente que quiere cobrar sólo tiene que honrar dos endpoints:
+An agent that wants to get paid only has to honor two endpoints:
 
 ```
-POST /api/agents/<agente>/invoke   body = input del step (JSON)  →  200 { result: {...} }
-GET  /api/agents/<agente>/manifest                               →  200 { …, payment: {…} }  |  503
+POST /api/agents/<agent>/invoke   body = step input (JSON)  →  200 { result: {...} }
+GET  /api/agents/<agent>/manifest                           →  200 { …, payment: {…} }  |  503
 ```
 
-El operador copia ese bloque `payment` al registro del gateway, y desde ahí el gateway le paga al
-agente en cada invocación. **Por qué así:** un agente que firmara sus propios cobros necesitaría una
-hot key por agente y reimplementaría el rail una vez por agente. Con este reparto, toda la superficie
-de este repo frente al dinero es **una address base58 leída de una variable de entorno** — y el
-código que la valida (`src/manifest/wallet-format.ts`) aplica **el mismo criterio que el settle del
-consumidor**, no uno propio.
+The operator copies that `payment` block into the gateway's registry, and from there the gateway pays
+the agent on every invocation. **Why this split:** an agent signing its own settlements would need a
+hot key per agent and would reimplement the rail once per agent. With this split, the entire surface
+of this repo facing money is **one base58 address read from an environment variable** — and the code
+that validates it (`src/manifest/wallet-format.ts`) applies **the same criterion as the consumer's
+settle**, not one of its own.
 
-Ese reparto es también la razón de `src/manifest/settle-preconditions.ts`: un **oráculo de test** que
-porta, guarda por guarda y en el mismo orden, la secuencia real del gateway (`NO_PAYMENT_FIELD`,
-`METHOD_NOT_SUPPORTED`, `CHAIN_NOT_SUPPORTED`, `INVALID_PAY_TO_FORMAT`, `ZERO_PAY_TO`). Permite
-afirmar *"este agente cobraría / no cobraría"* **sin cadena y sin fondos**, que es lo que hace
-demostrable el fail-closed del cobro dentro de CI.
+That split is also the reason `src/manifest/settle-preconditions.ts` exists: a **test oracle** that
+ports the gateway's real sequence guard by guard and in the same order (`NO_PAYMENT_FIELD`,
+`METHOD_NOT_SUPPORTED`, `CHAIN_NOT_SUPPORTED`, `INVALID_PAY_TO_FORMAT`, `ZERO_PAY_TO`). It makes it
+possible to assert *"this agent would / would not get paid"* **with no chain and no funds**, which is
+what makes the fail-closed behavior of billing demonstrable inside CI.
 
-> ⚠️ **Un `200` del manifiesto NO prueba que el agente cobre.** El manifiesto declara *dónde* cobra;
-> que el gateway *pueda* pagarle ahí es configuración del gateway (`SOLANA_ADAPTER_ENABLED`, **default
-> OFF**). La prueba positiva está en el paso 5 del runbook, al final de este archivo.
+> ⚠️ **A `200` from the manifest does NOT prove the agent gets paid.** The manifest declares *where*
+> it charges; whether the gateway *can* pay it there is gateway configuration (`SOLANA_ADAPTER_ENABLED`,
+> **default OFF**). The positive proof is step 5 of the runbook, at the end of this file.
 
 ---
 
-## Cómo lo corro
+## How I run it
 
-Requiere **Node 22** (ver [`.nvmrc`](.nvmrc) y `engines` en `package.json`). No necesita base de
-datos, ni cadena, ni credenciales de nadie.
+Requires **Node 22** (see [`.nvmrc`](.nvmrc) and `engines` in `package.json`). No database, no chain,
+no third-party credentials.
 
 ```bash
-nvm use            # opcional: toma la version de .nvmrc
+nvm use            # optional: picks up the version in .nvmrc
 npm install
 
 npm run typecheck  # tsc --noEmit
-npm test           # vitest run  →  463 tests, 21 archivos
+npm test           # vitest run  →  463 tests, 21 files
 npm run build      # next build
 ```
 
-La suite **no toca la red**: las fuentes de FX y las APIs de partner se mockean, y el fail-closed de
-los manifiestos se ejercita seteando y borrando las envs dentro de cada test. Por eso corre en limpio,
-sin configurar nada. Es lo mismo que corre el CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
+The suite **does not touch the network**: FX sources and partner APIs are mocked, and the fail-closed
+behavior of the manifests is exercised by setting and clearing the envs inside each test. That is why
+it runs clean with nothing configured. It is the same thing CI runs
+([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
 
-### Levantar el servicio
+### Bringing the service up
 
-Los `/invoke` arrancan sin ninguna env. Los `/manifest` **necesitan** las 3 envs de `payTo`: sin
-ellas responden `503`, que es el comportamiento deseado y no un bug.
+The `/invoke` endpoints start with no envs at all. The `/manifest` endpoints **require** the 3 `payTo`
+envs: without them they answer `503`, which is the intended behavior and not a bug.
 
 ```bash
-cp .env.example .env.local      # y reemplazar los 3 *_PAYTO por addresses base58 de Solana
+cp .env.example .env.local      # then replace the 3 *_PAYTO with Solana base58 addresses
 npm run dev                     # http://localhost:3030
 
 curl -s -X POST http://localhost:3030/api/agents/remit-corridor-fx/invoke \
@@ -94,377 +97,404 @@ curl -s -X POST http://localhost:3030/api/agents/remit-corridor-fx/invoke \
 curl -sD- http://localhost:3030/api/agents/remit-kyc-validator/manifest
 ```
 
-### Variables de entorno
+### Environment variables
 
-**Están todas en [`.env.example`](.env.example), que es la fuente única.** Este README no repite la
-lista a propósito: dos listas se desincronizan y alguien termina copiando la mitad. Lo único que hay
-que retener acá es que las 3 `*_PAYTO` son **obligatorias hoy** y no tienen default; todo lo demás
-tiene un default razonable o pertenece a la etapa 2 (partners).
+**They are all in [`.env.example`](.env.example), which is the single source of truth.** This README
+does not repeat the list on purpose: two lists drift apart and someone ends up copying half of one.
+The only thing to retain here is that the 3 `*_PAYTO` are **mandatory today** and have no default;
+everything else has a sensible default or belongs to stage 2 (partners).
 
 ### Deploy
 
-Next.js App Router sobre Vercel, proyecto propio. Las envs se setean como variables del proyecto
-(Production / Preview), nunca en un archivo del repo: rotar una billetera es editar una variable y
-redeployar. El `agent_url` que se registra en el gateway es
-`https://<deploy>.vercel.app/api/agents/<agente>/invoke`, y el manifiesto se deriva de ahí:
+Next.js App Router on Vercel, its own project. Envs are set as project variables (Production /
+Preview), never in a file in the repo: rotating a wallet is editing a variable and redeploying. The
+`agent_url` registered in the gateway is
+`https://<deploy>.vercel.app/api/agents/<agent>/invoke`, and the manifest is derived from it:
 `manifestUrl = agentUrl.replace(/\/invoke\/?$/, '/manifest')`.
 
 ---
 
-## Arquitectura: cómo enchufa un partner
+## Architecture: how a partner plugs in
 
-Cada capacidad externa es una interface en `src/providers/types.ts` con **dos** implementaciones:
+Every external capability is an interface in `src/providers/types.ts` with **two** implementations:
 
-- el **adapter del partner** (`DiditKycProvider`, `TransFiPayoutProvider`, …), activo sólo con su
-  credencial **y** su flag `*_ADAPTER_READY` — la credencial sola no alcanza, para que nadie hable
-  con un partner a medio configurar;
-- el **fallback determinístico**, que corre sin credenciales y queda **tageado en la salida**
-  (`provenance: "local-fallback"`), nunca disfrazado de dato real.
+- the **partner adapter** (`DiditKycProvider`, `TransFiPayoutProvider`, …), active only with its
+  credential **and** its `*_ADAPTER_READY` flag — the credential alone is not enough, so nobody talks
+  to a half-configured partner;
+- the **deterministic fallback**, which runs with no credentials and stays **tagged in the output**
+  (`provenance: "local-fallback"`), never disguised as real data.
 
-La factory (`getKycProvider()`, `getPayoutProvider()`, …) elige según el entorno. El día que llega el
-sandbox del partner se setean dos variables: cero cambio de wiring.
+The factory (`getKycProvider()`, `getPayoutProvider()`, …) picks based on the environment. The day
+the partner sandbox arrives, two variables get set: zero wiring changes.
 
-> Los puntos donde falta confirmar la forma exacta de la respuesta del partner están marcados en el
-> código: **15 en `src/providers/`** — `TODO(F3-sandbox)` (9, en `payout.ts`) y `TODO(sandbox)` (6,
-> en `kyc.ts` y `fx.ts`). Es deuda **declarada**, no olvido: se resuelve contra el sandbox real, y
-> hasta entonces cada campo incierto se lee de env y falla ruidoso si el partner lo exige y no está.
+> The spots where the exact shape of the partner response still has to be confirmed are marked in the
+> code: **15 across the adapters in `src/providers/`** — `TODO(F3-sandbox)` (9, in `payout.ts`) and
+> `TODO(sandbox)` (6, in `kyc.ts` and `fx.ts`). This is **declared** debt, not an oversight: it gets
+> resolved against the real sandbox, and until then every uncertain field is read from env and fails
+> loudly if the partner requires it and it is not there.
 
-Este repo **no firma nada**: no tiene una clave de firma, ni emite recibos firmados. El patrón de un
-agente acá es `zod input → provider → { result }`: la confianza en el resultado se apoya en el campo
-`provenance` —qué método produjo ese dato— y no en una firma del propio agente.
+This repo **signs nothing**: it has no signing key and issues no signed receipts. The pattern of an
+agent here is `zod input → provider → { result }`: trust in the result rests on the `provenance`
+field — which method produced that datum — and not on a signature from the agent itself.
 
-### Pendiente (post-sandbox)
+### Pending (post-sandbox)
 
-- Mapear los campos exactos de las respuestas de Didit/TransFi (hoy los adapters usan la forma
-  documentada + los `TODO(F3-sandbox)`).
-- El value-delivery real: movimiento del principal + settle a la wallet del beneficiario, no un
-  self-transfer. Ver `remit-cashout-payout`.
+- Map the exact fields of the Didit/TransFi responses (today the adapters use the documented shape +
+  the `TODO(F3-sandbox)` markers).
+- Real value delivery: movement of the principal + settlement to the beneficiary's wallet, not a
+  self-transfer. See `remit-cashout-payout`.
 
 ---
 
-## Endpoint HTTP (etapa 1 — `remit-corridor-fx`)
+## HTTP endpoint (stage 1 — `remit-corridor-fx`)
 
 ```
 POST /api/agents/remit-corridor-fx/invoke
-body: { "amountUsd": 100, "destCountry": "PE", "payoutMethod": "yape" }  # solo amountUsd es requerido
+body: { "amountUsd": 100, "destCountry": "PE", "payoutMethod": "yape" }  # only amountUsd is required
 → 200 { "result": { "slug", "rate", "feeUsd", "netDeliveredLocal", "localCurrency": "PEN",
                      "etaMinutes", "quoteId", "expiresAt", "provenance",
                      "rateSource", "rateAsOf" } }
-→ 400 { "error": "invalid_input", "details": {...} }   # body inválido (ej. amountUsd <= 0)
-→ 502 { "error": "quote_unavailable" }                 # ninguna fuente de tasa usable / misconfig
+→ 400 { "error": "invalid_input", "details": {...} }   # invalid body (e.g. amountUsd <= 0)
+→ 400 { "error": "fx_amount_below_minimum", "minSendUsd": 5 }  # the send does not reach the minimum
+→ 502 { "error": "quote_unavailable" }                 # no usable rate source / misconfig
 ```
 
-### Procedencia de la tasa (cambio de contrato HTTP)
+> **Why the minimum is its own `400` and not the `502`.** "You sent too little" is a caller error, not
+> an outage on our side: flattening it into the `502` would tell someone to "come back later" when
+> their retry will never work until the amount changes. The value in force travels in `minSendUsd` so
+> the caller does not have to find it by bisection. The guard runs in the **agent core**
+> (`runCorridorFx`), before the provider is chosen: that way it covers both providers and does not
+> disappear the day the partner adapter is switched on.
 
-El agente cotiza **sólo** con una tasa de mercado que puede respaldar. `provenance` ya no es una
-etiqueta genérica: cada valor mapea 1:1 a un método auditable de obtención de la tasa.
+### Rate provenance (HTTP contract change)
 
-| `provenance` | Qué significa |
+The agent quotes **only** with a market rate it can back. `provenance` is no longer a generic label:
+each value maps 1:1 to an auditable method of obtaining the rate.
+
+| `provenance` | What it means |
 |---|---|
-| `fx-mid-live` | mid traído EN VIVO de una fuente registrada, en esta cotización |
-| `fx-mid-cached` | el mismo mid, servido de la caché en memoria dentro de su ventana de frescura |
-| `transfi` | tasa efectiva del corredor, del partner licenciado (etapa 2) |
+| `fx-mid-live` | mid fetched LIVE from a registered source, in this quote |
+| `fx-mid-cached` | the same mid, served from the in-memory cache within its freshness window |
+| `transfi` | effective corridor rate, from the licensed partner (stage 2) |
 
-Dos campos **aditivos** acompañan a toda cotización:
+Two **additive** fields accompany every quote:
 
-- **`rateSource`** — id de la fuente registrada (`"er-api"`, `"currency-api"`, `"transfi"`).
-- **`rateAsOf`** — ISO, fecha del dato **según la fuente**, nunca el momento de servir. Una respuesta
-  cacheada conserva la fecha ORIGINAL del dato: si mostrara el momento de servir, mentiría sobre su
-  frescura.
+- **`rateSource`** — id of the registered source (`"er-api"`, `"currency-api"`, `"transfi"`).
+- **`rateAsOf`** — ISO, the date of the datum **according to the source**, never the moment it was
+  served. A cached response keeps the ORIGINAL date of the datum: if it showed the moment of serving,
+  it would be lying about its own freshness.
 
-> ⚠️ **`"local-fallback"` se RETIRÓ del agente FX.** Antes, cuando el feed fallaba, se cotizaba con la
-> constante `STATIC_USD_PEN` (default **3.75**) y se etiquetaba `"local-fallback"`, **igual** que una
-> tasa de mercado. Medido el 2026-07-29 contra tres fuentes independientes (`open.er-api.com` 3.4033,
-> `currency-api` 3.3956, **BCRP oficial** 3.404), el mercado estaba en **~3.40**: la constante estaba
-> **+10.2% por encima**. Cuando ese respaldo entraba, la cotización **prometía más soles de los que el
-> mercado da** — en una remesa de $400, **~140 PEN** que alguien tiene que poner. No era un problema de
-> etiquetas: era plata. El valor sigue vivo en KYC y payout, que son otro eje.
+> ⚠️ **`"local-fallback"` was REMOVED from the FX agent.** Previously, when the feed failed, the quote
+> was computed from the `STATIC_USD_PEN` constant (default **3.75**) and labeled `"local-fallback"`,
+> **just like** a market rate. Measured on 2026-07-29 against three independent sources
+> (`open.er-api.com` 3.4033, `currency-api` 3.3956, **official BCRP** 3.404), the market was at
+> **~3.40**: the constant sat **+10.2% above it**. Whenever that fallback kicked in, the quote
+> **promised more soles than the market gives** — on a $400 remittance, **~140 PEN** that somebody has
+> to cover. This was not a labeling problem: it was money. The value is still alive in KYC and payout,
+> which are a different axis.
 
-### Fail-closed: sin tasa verificable NO se cotiza
+### Fail-closed: with no verifiable rate there is NO quote
 
-Si ninguna fuente registrada devuelve una tasa usable **y** no hay caché fresca, el endpoint responde
-**`502 quote_unavailable`**. No existe ninguna rama que devuelva "algo igual":
+If no registered source returns a usable rate **and** there is no fresh cache, the endpoint answers
+**`502 quote_unavailable`**. There is no branch that returns "something equivalent":
 
-- **La caché vencida NO se sirve.** Al vencer se re-fetchea; si el fetch falla, se falla. Una caché
-  vencida es la constante estática con mejor pedigrí: un número que nadie puede respaldar en el
-  momento de usarlo.
-- **No hay constante de respaldo.** Se eliminó del código.
-- Una cotización que nadie puede respaldar es peor que no cotizar: alguien la ata a un desembolso real.
+- **An expired cache is NOT served.** On expiry it re-fetches; if the fetch fails, it fails. An
+  expired cache is the static constant with a better pedigree: a number nobody can back at the moment
+  of using it.
+- **There is no fallback constant.** It was deleted from the code.
+- A quote nobody can back is worse than no quote: someone ties it to a real disbursement.
 
-Cada fuente descartada emite un `console.warn` **value-free** (`{ sourceId, code }`, nunca el body de
-la fuente ni la URL completa) con uno de estos códigos: `fx_mid_http_<status>`, `fx_mid_fetch_failed`,
+Every discarded source emits a **value-free** `console.warn` (`{ sourceId, code }`, never the source's
+body nor the full URL) with one of these codes: `fx_mid_http_<status>`, `fx_mid_fetch_failed`,
 `fx_mid_bad_shape`, `fx_mid_no_usable_pen_rate`, `fx_mid_out_of_band`, `fx_mid_stale_data`.
 
-### Fuentes registradas (no URLs libres)
+### Registered sources (not free-form URLs)
 
-`FX_MID_SOURCES` nombra **ids de un registro en código**, no URLs. Cada fuente trae **su propio
-parser**, así que una env que aceptara cualquier URL *parecería* un punto de extensión y no lo sería:
-apuntarla a otra fuente daría "shape inválido" para siempre (el patrón del **control muerto**). Sólo
-el **host** es sobrescribible. Un id no registrado ⇒ `fx_mid_config_invalid:FX_MID_SOURCES`.
+`FX_MID_SOURCES` names **ids from an in-code registry**, not URLs. Each source brings **its own
+parser**, so an env that accepted any URL *would look like* an extension point and would not be one:
+pointing it at another source would yield "invalid shape" forever (the **dead control** pattern). Only
+the **host** is overridable. An unregistered id ⇒ `fx_mid_config_invalid:FX_MID_SOURCES`.
 
-| id | URL canónica | Campo tasa | Campo fecha |
+| id | canonical URL | rate field | date field |
 |---|---|---|---|
 | `er-api` | `https://open.er-api.com/v6/latest/USD` | `rates.PEN` | `time_last_update_unix` (s) |
 | `currency-api` | `https://latest.currency-api.pages.dev/v1/currencies/usd.json` | `usd.pen` | `date` (`YYYY-MM-DD`) |
 
-Toda fuente registrada **debe declarar la fecha de su dato**: sin fecha se trata como shape inválido.
-No se puede afirmar frescura de un dato que no dice cuándo se produjo, y "no sé de cuándo es" no puede
-colapsar a "es de ahora" (es el caso real de un CDN que sirve un JSON congelado con un 200 reciente).
+Every registered source **must declare the date of its datum**: with no date it is treated as an
+invalid shape. You cannot claim freshness for a datum that does not say when it was produced, and
+"I don't know when this is from" must not collapse into "it is from now" (this is the real case of a
+CDN serving a frozen JSON with a recent 200).
 
-El **BCRP** (tasa oficial) **no** se usa como fuente de runtime: publica con ~7 días de lag y no
-publica fines de semana ni feriados. Sirve como ancla documentada de la banda y verificación de runbook.
+The **BCRP** (official rate) is **not** used as a runtime source: it publishes with ~7 days of lag and
+does not publish on weekends or holidays. It serves as a documented anchor for the band and as runbook
+verification.
 
-Etapa 1 corre 100% con la tasa mid real + spread declarado. TransFi queda para etapa 2.
+Stage 1 runs 100% on the real mid rate + declared spread. TransFi is left for stage 2.
 
-### Config del FX: por qué cada número es un guard de dinero
+### FX config: why every number is a money guard
 
-Las variables están en [`.env.example`](.env.example) con sus rangos válidos. Lo que importa acá es
-**por qué** están validadas.
+The variables live in [`.env.example`](.env.example) with their valid ranges. What matters here is
+**why** they are validated.
 
-Todas se leen en **cada cotización**, así que rotarlas surte efecto sin redeploy. Config inválida
-**lanza** `fx_mid_config_invalid:<campo>` en vez de cotizar con un guard desactivado: `Number("abc")`
-es `NaN`, y comparar contra `NaN` da `false` siempre — un máximo no numérico **desactivaría la banda
-en silencio**.
+They are all read on **every quote**, so rotating them takes effect without a redeploy. Invalid config
+**throws** `fx_mid_config_invalid:<field>` instead of quoting with a disabled guard: `Number("abc")`
+is `NaN`, and comparing against `NaN` is always `false` — a non-numeric maximum would **silently
+disable the band**.
 
-⚠️ **`STATIC_USD_PEN` es OBSOLETA y NO TIENE EFECTO.** Ya no se lee en ningún lado del código. Era la
-constante de respaldo (3.75) que cotizaba +10.2% sobre el mercado real; setearla hoy no mueve ninguna
-cotización. **Borrala del deploy** para que nadie crea que sigue controlando algo.
+⚠️ **`STATIC_USD_PEN` is OBSOLETE and HAS NO EFFECT.** It is no longer read anywhere in the code. It
+was the fallback constant (3.75) that quoted +10.2% over the real market; setting it today moves no
+quote at all. **Delete it from the deploy** so nobody believes it still controls anything.
 
-⚠️ **El mínimo y la comisión están ATADOS, y no es un detalle**: la comisión no puede superar el
-**20%** del mínimo. Si lo supera, `resolveFxConfig()` **lanza** y el agente no cotiza nada. El motivo
-es que un mínimo suelto se apaga solo: con la comisión en 6 y el mínimo en 5, el envío mínimo aceptado
-entregaría **cero soles** otra vez, con el mínimo ahí escrito sin proteger nada. Para cobrar más
-comisión hay que subir el mínimo — que es exactamente la decisión que alguien debería estar tomando a
-conciencia. Con los defaults (mínimo 5, comisión 0.50) la comisión es el **10%** en el piso, la mitad
-del techo.
+⚠️ **The minimum and the fee are TIED TOGETHER, and that is not a detail**: the fee cannot exceed
+**20%** of the minimum. If it does, `resolveFxConfig()` **throws** and the agent quotes nothing. The
+reason is that a loose minimum switches itself off: with the fee at 6 and the minimum at 5, the
+smallest accepted send would deliver **zero soles** again, with the minimum sitting right there
+protecting nothing. To charge a higher fee you have to raise the minimum — which is exactly the
+decision somebody should be making consciously. With the defaults (minimum 5, fee 0.50) the fee is
+**10%** at the floor, half of the ceiling.
 
-⚠️ El **spread** y el **fee** también son guards de dinero, no preferencias: la tasa que recibe el
-usuario es `mid * (1 - spread/10000)`, y la banda valida el **mid**, no la tasa emitida. Un spread
-negativo cotiza **por encima del mercado** — medido contra un mid de 3.40, `-1000` bps emitía 3.74
-(+10.0%), que es el mismo error de la constante 3.75 que esta HU vino a matar, por otra puerta. Por
-eso hoy están validados por rango y la **tasa emitida** pasa también por la banda
-(`fx_rate_out_of_band`).
+⚠️ The **spread** and the **fee** are money guards too, not preferences: the rate the user receives is
+`mid * (1 - spread/10000)`, and the band validates the **mid**, not the emitted rate. A negative
+spread quotes **above the market** — measured against a mid of 3.40, `-1000` bps emitted 3.74
+(+10.0%), which is the very same error as the 3.75 constant this work item came to kill, through
+another door. That is why they are now range-validated and the **emitted rate** also goes through the
+band (`fx_rate_out_of_band`).
 
-Cada default **afirma algo sobre el mundo externo** (evidencia medida el 2026-07-29): las dos fuentes
-están vivas y publican USD/PEN con fecha; el feed promete ciclo de ~24 h, así que 48 h tolera **un**
-ciclo perdido, no dos; y con el mercado en ~3.40 la banda `[2.50, 5.00]` deja pasar movimiento
-cambiario real pero ataja un cero, un negativo, un orden de magnitud, o la tasa de **otra** moneda
-(si el feed cambiara y devolviera `PYG` ≈ 7300 o `EUR` ≈ 0.92).
+Every default **asserts something about the outside world** (evidence measured on 2026-07-29): both
+sources are alive and publish USD/PEN with a date; the feed promises a ~24 h cycle, so 48 h tolerates
+**one** missed cycle, not two; and with the market at ~3.40 the `[2.50, 5.00]` band lets real currency
+movement through while catching a zero, a negative, an order of magnitude, or the rate of **another**
+currency (if the feed changed and returned `PYG` ≈ 7300 or `EUR` ≈ 0.92).
 
 ---
 
-## Endpoint HTTP (etapa 1 — `remit-kyc-validator`)
+## HTTP endpoint (stage 1 — `remit-kyc-validator`)
 
 ```
 POST /api/agents/remit-kyc-validator/invoke
 body: { "senderName": "Alice", "senderCountry": "US", "legalId": "<DNI>", "amountUsd": 100,
         "receiverName": "Bob", "receiverCountry": "PE", "purpose": "family support" }
 → 200 { "result": { "slug", "approved", "riskLevel", "reasons",
-                     "verificationId", "provenance", "payoutAllowed" } }   # SIN legalId ni travelRuleData
-→ 400 { "error": "invalid_input", "details": {...} }   # body inválido (mensajes Zod, sin PII)
-→ 502 { "error": "verification_unavailable" }          # falla del provider / misconfig
+                     "verificationId", "provenance", "payoutAllowed" } }   # NO legalId, NO travelRuleData
+→ 400 { "error": "invalid_input", "details": {...} }   # invalid body (Zod messages, no PII)
+→ 502 { "error": "verification_unavailable" }          # provider failure / misconfig
 ```
 
-Etapa 1 corre 100% en **fallback KYC** (`provenance: "local-fallback"`): verificación determinística, sin
-red real. **Didit queda OFF** (etapa 2): `DIDIT_API_KEY` / `DIDIT_ADAPTER_READY` **sin setear** en el deploy.
-**Garantía dura NO-PII:** el output NUNCA expone `legalId` (DNI) ni `travelRuleData` en ninguna respuesta
-(200/400/502).
+Stage 1 runs 100% on the **KYC fallback** (`provenance: "local-fallback"`): deterministic verification,
+no real network. **Didit stays OFF** (stage 2): `DIDIT_API_KEY` / `DIDIT_ADAPTER_READY` **not set** in
+the deploy. **Hard NO-PII guarantee:** the output NEVER exposes `legalId` (national ID) or
+`travelRuleData` in any response (200/400/502).
 
 ---
 
-## Endpoint HTTP (etapa 1 — `remit-cashout-payout`)
+## HTTP endpoint (stage 1 — `remit-cashout-payout`)
 
 ```
 POST /api/agents/remit-cashout-payout/invoke
 body: { "quoteId": "q1", "amountUsd": 100, "kycVerificationId": "v1",
-        "senderIdentity": "<el vendor_data ligado a esa verificación: DNI o wallet address>",
+        "senderIdentity": "<the vendor_data bound to that verification: national ID or wallet address>",
         "beneficiary": { "name": "<PII>", "country": "PE", "method": "yape", "destination": "<Yape/CCI>" },
         "idempotencyKey": "idem-1" }
 → 200 { "result": { "slug", "executed", "status", "payoutId",
-                    "deliveredLocal", "txRef", "reason", "provenance" } }  # SIN beneficiary ni travelRuleData
-→ 200 { "result": { "executed": false, "status": "blocked", "reason": "kyc_gate_not_passed" } }  # hard-gate KYC (server-side, no del caller) o la identidad no coincide
-→ 200 { "result": { "executed": false, "status": "blocked", "reason": "kyc_identity_claim_missing" } }  # falta la identity claim
-→ 400 { "error": "invalid_input", "details": {...} }  # body inválido (mensajes Zod, sin PII)
-→ 502 { "error": "payout_unavailable" }               # fail-safe / misconfig del provider
+                    "deliveredLocal", "txRef", "reason", "provenance" } }  # NO beneficiary, NO travelRuleData
+→ 200 { "result": { "executed": false, "status": "blocked", "reason": "kyc_gate_not_passed" } }  # KYC hard gate (server-side, not the caller's) or identity mismatch
+→ 200 { "result": { "executed": false, "status": "blocked", "reason": "kyc_identity_claim_missing" } }  # identity claim missing
+→ 400 { "error": "invalid_input", "details": {...} }  # invalid body (Zod messages, no PII)
+→ 502 { "error": "payout_unavailable" }               # fail-safe / provider misconfig
 ```
 
-> **Nota**: el campo `kycPayoutAllowed` fue **removido del schema**. El hard-gate KYC se **re-deriva server-side** contra Didit: `KycProvider.status(verificationId, identityClaim)` → allowlist `REAL_KYC_PROVENANCES`. (El 2º parámetro es **requerido**: un opcional se puede olvidar en un call site nuevo y degradaría el binding en silencio; uno requerido **no compila**.) Si código legacy aún envía `kycPayoutAllowed: true`, **Zod lo strippea silenciosamente** (schema sin `.strict()`); el campo no tiene ningún efecto.
+> **Note**: the `kycPayoutAllowed` field was **removed from the schema**. The KYC hard gate is
+> **re-derived server-side** against Didit: `KycProvider.status(verificationId, identityClaim)` →
+> `REAL_KYC_PROVENANCES` allowlist. (The 2nd parameter is **required**: an optional one can be
+> forgotten at a new call site and would silently degrade the binding; a required one **does not
+> compile**.) If legacy code still sends `kycPayoutAllowed: true`, **Zod strips it silently** (schema
+> without `.strict()`); the field has no effect whatsoever.
 
 ### Identity binding — `senderIdentity`
 
-El hard-gate confirma que la verificación está **aprobada**, no que sea **del que pide el payout**. El
-binding ata las dos cosas: el caller presenta `senderIdentity` y el agente lo compara contra el `vendor_data`
-**real** que la fuente autoritativa (Didit) tiene atado a esa verificación. Si no coincide → **blocked**.
+The hard gate confirms that the verification is **approved**, not that it belongs to **whoever is
+requesting the payout**. The binding ties the two together: the caller presents `senderIdentity` and
+the agent compares it against the **real** `vendor_data` that the authoritative source (Didit) has
+bound to that verification. No match → **blocked**.
 
-- **`senderIdentity`** (`string`, opcional en el schema): el valor que quedó ligado como `vendor_data` a esa
-  verificación **en su creación** — el **DNI** si la creó `remit-kyc-validator`, la **wallet address** si la creó
-  la app consumidora. La comparación normaliza con `trim()` + `toLowerCase()`: deja el DNI intacto y absorbe
-  las diferencias de mayúsculas de un address. El valor **nunca** se ecoa en un response ni se loguea.
-- **`address`** (`string`, opcional): **DEPRECADO** — puente de compatibilidad con la app consumidora, que hoy
-  manda `address` y no `senderIdentity`. Se usa **solo** si `senderIdentity` está ausente (precedencia: gana el
-  explícito). No construir features nuevas sobre él.
-- **Fail-closed**: sin claim (o claim vacío/whitespace) → `kyc_identity_claim_missing` **sin llamar a Didit**. Si
-  la verificación no tiene `vendor_data` contra qué comparar → **blocked** (no se asume que coincide).
-- **No-oracle**: "no aprobado" y "aprobado pero no es tuyo" colapsan al **mismo** `reason:
-  "kyc_gate_not_passed"`, para no convertir el endpoint en un confirmador de DNIs.
+- **`senderIdentity`** (`string`, optional in the schema): the value that was bound as `vendor_data`
+  to that verification **at creation time** — the **national ID** if `remit-kyc-validator` created it,
+  the **wallet address** if the consuming app did. The comparison normalizes with `trim()` +
+  `toLowerCase()`: it leaves a national ID untouched and absorbs the case differences of an address.
+  The value is **never** echoed in a response and never logged.
+- **`address`** (`string`, optional): **DEPRECATED** — compatibility bridge for the consuming app,
+  which today sends `address` and not `senderIdentity`. It is used **only** if `senderIdentity` is
+  absent (precedence: the explicit one wins). Do not build new features on top of it.
+- **Fail-closed**: no claim (or an empty/whitespace claim) → `kyc_identity_claim_missing` **without
+  calling Didit**. If the verification has no `vendor_data` to compare against → **blocked** (a match
+  is not assumed).
+- **Non-oracle**: "not approved" and "approved but not yours" collapse into the **same** `reason:
+  "kyc_gate_not_passed"`, so the endpoint does not become a national-ID confirmation service.
 
-> ⚠️ **Alcance real de esta protección (sin eufemismos).** El binding `kycVerificationId` ↔ `senderIdentity`
-> **sube la barra** (deja de ser un ataque de un solo dato) pero **NO constituye prueba criptográfica de
-> posesión**: no hay firma ni SIWE, y `senderIdentity` es caller-controlado igual que `kycVerificationId`. Un
-> atacante que consiga **ambos** datos pasa. Además, cuando la sesión KYC fue creada con un `vendor_data`
-> **público** (ej. una wallet address), la protección de **ese** flujo es **≈nula**: el atacante que quiere
-> suplantar a esa víctima ya conoce su address. La prueba de posesión real es una HU de seguimiento.
+> ⚠️ **Real scope of this protection (no euphemisms).** The `kycVerificationId` ↔ `senderIdentity`
+> binding **raises the bar** (it stops being a single-datum attack) but does **NOT constitute
+> cryptographic proof of possession**: there is no signature and no SIWE, and `senderIdentity` is
+> caller-controlled just like `kycVerificationId`. An attacker who obtains **both** values gets
+> through. On top of that, when the KYC session was created with a **public** `vendor_data` (e.g. a
+> wallet address), the protection of **that** flow is **≈nil**: the attacker who wants to impersonate
+> that victim already knows their address. Real proof of possession is a follow-up work item.
 
-Etapa 1 corre 100% en **payout MOCK** (`FallbackPayoutProvider`, `provenance:"local-fallback"`,
-`deliveredLocal:null`, `txRef:null`): NUNCA mueve plata real. **TransFi queda OFF** (etapa 2):
-`TRANSFI_API_KEY` / `TRANSFI_ADAPTER_READY` **sin setear** en el deploy.
+Stage 1 runs 100% on the **MOCK payout** (`FallbackPayoutProvider`, `provenance:"local-fallback"`,
+`deliveredLocal:null`, `txRef:null`): it NEVER moves real money. **TransFi stays OFF** (stage 2):
+`TRANSFI_API_KEY` / `TRANSFI_ADAPTER_READY` **not set** in the deploy.
 
-**Flag `PAYOUT_ALLOW_MOCK`:** el fail-safe `assertPayoutProviderSafe()` lanza `payout_refused` en
-`NODE_ENV=production` sin provider real. Como Vercel fija `NODE_ENV=production`, el deploy de etapa 1 setea
-`PAYOUT_ALLOW_MOCK=true` para permitir SOLO el mock. **NO habilita ningún path a desembolso real** (ese sigue
-100% gated por `TRANSFI_API_KEY`+`TRANSFI_ADAPTER_READY`). ⚠️ Activar `PAYOUT_ALLOW_MOCK` en cualquier deploy
-que no sea el de etapa 1 (mock) es un **incidente de seguridad money-path**.
+**`PAYOUT_ALLOW_MOCK` flag:** the `assertPayoutProviderSafe()` fail-safe throws `payout_refused` under
+`NODE_ENV=production` with no real provider. Since Vercel pins `NODE_ENV=production`, the stage 1
+deploy sets `PAYOUT_ALLOW_MOCK=true` to allow ONLY the mock. **It enables no path to a real
+disbursement** (that one remains 100% gated by `TRANSFI_API_KEY`+`TRANSFI_ADAPTER_READY`). ⚠️ Turning
+`PAYOUT_ALLOW_MOCK` on in any deploy other than the stage 1 (mock) one is a **money-path security
+incident**.
 
-**Garantía dura NO-PII:** el output NUNCA expone `beneficiary.name`, `beneficiary.destination` (Yape/CCI) ni
-`travelRuleData` en ninguna respuesta (200/400/502).
+**Hard NO-PII guarantee:** the output NEVER exposes `beneficiary.name`, `beneficiary.destination`
+(Yape/CCI) or `travelRuleData` in any response (200/400/502).
 
 ---
 
-## Manifiesto de cobro (`/manifest`)
+## Billing manifest (`/manifest`)
 
-Cada agente publica **su propia ficha de cobro** en un endpoint hermano de su `/invoke`. Es lo que el
-operador copia al registro del gateway para que el agente **cobre por su trabajo**. Antes de esto, el
-`payment` de cada agente se escribía a mano en la base, por fuera de toda API: `remit-kyc-validator`
-quedó sin ficha y estuvo **cobrando $0 en silencio** (el caller le pagaba al gateway, el paso corría, y
-el settle hacia el operador se salteaba sin error).
+Every agent publishes **its own billing sheet** on an endpoint sibling to its `/invoke`. It is what
+the operator copies into the gateway's registry so that the agent **gets paid for its work**. Before
+this existed, each agent's `payment` was written by hand into the database, outside of any API:
+`remit-kyc-validator` ended up with no sheet and spent time **charging $0 silently** (the caller paid
+the gateway, the step ran, and the settlement toward the operator was skipped without an error).
 
 ### URLs
 
-| Método | URL |
+| Method | URL |
 |---|---|
 | `GET` | `/api/agents/remit-kyc-validator/manifest` |
 | `GET` | `/api/agents/remit-corridor-fx/manifest` |
 | `GET` | `/api/agents/remit-cashout-payout/manifest` |
 
-Derivación desde el `agentUrl` ya registrado: `manifestUrl = agentUrl.replace(/\/invoke\/?$/, '/manifest')`.
+Derivation from the already-registered `agentUrl`:
+`manifestUrl = agentUrl.replace(/\/invoke\/?$/, '/manifest')`.
 
-**El `GET` responde `200` o `503`, nada más** (no hay un tercer código para el método soportado). Ambas
-respuestas llevan `Cache-Control: no-store`. Otros métodos y otros paths no son parte del contrato y los
-resuelve el framework: un `POST` al mismo path devuelve `405`, y un path inexistente devuelve `404` — en
-particular el **slug canónico** (`/api/agents/remit-corridor-fx-solana/manifest`) **no es una URL**: las 3
-URLs válidas son las de la tabla de arriba, que usan el `pathSlug`.
+**The `GET` answers `200` or `503`, nothing else** (there is no third code for the supported method).
+Both responses carry `Cache-Control: no-store`. Other methods and other paths are not part of the
+contract and are handled by the framework: a `POST` to the same path returns `405`, and a nonexistent
+path returns `404` — in particular the **canonical slug**
+(`/api/agents/remit-corridor-fx-solana/manifest`) **is not a URL**: the 3 valid URLs are the ones in
+the table above, which use the `pathSlug`.
 
-### `200 OK` — exactamente 7 claves de primer nivel
+### `200 OK` — exactly 7 top-level keys
 
 ```json
 {
   "manifestVersion": "1",
   "slug": "remit-corridor-fx-solana",
   "name": "remit-corridor-fx-solana",
-  "description": "<texto estático, sin PII>",
+  "description": "<static text, no PII>",
   "capabilities": ["remittance-fx-quote", "usdc-to-pen", "corridor-pricing"],
   "priceUsdc": 0.03,
   "payment": { "method": "x402", "chain": "solana-devnet", "contract": "<base58 32B>", "asset": "USDC" }
 }
 ```
 
-`payment` tiene exactamente 4 claves (`method`, `chain`, `contract`, `asset`) y **se copia tal cual** al
-registro: no hay transformación ni normalización pendiente del lado del consumidor.
+`payment` has exactly 4 keys (`method`, `chain`, `contract`, `asset`) and is **copied verbatim** into
+the registry: there is no transformation or normalization pending on the consumer side.
 
-### `503 Service Unavailable` — ficha no publicable (fail-closed)
+### `503 Service Unavailable` — sheet not publishable (fail-closed)
 
 ```json
 { "error": "manifest_unavailable", "missing": ["payment.contract"], "invalid": [] }
 ```
 
-`missing` e `invalid` contienen **nombres de campo, nunca valores**: el valor de la env no se ecoa en el
-body ni en los logs (ni truncado, ni hasheado). Ambas claves están siempre presentes. El body de `503`
-**nunca** lleva una clave `payment`.
+`missing` and `invalid` contain **field names, never values**: the env's value is not echoed in the
+body nor in the logs (not truncated, not hashed). Both keys are always present. The `503` body
+**never** carries a `payment` key.
 
-### Semántica fail-closed (por qué no hay "200 a medias")
+### Fail-closed semantics (why there is no "half-filled 200")
 
-> **Un `200` con ficha a medias es peor que un error, porque alguien lo copia a un registro y el agente
-> termina cobrando $0 en silencio.**
+> **A `200` with a half-filled sheet is worse than an error, because somebody copies it into a
+> registry and the agent ends up charging $0 silently.**
 
-Por eso: sin `payTo` configurado, o con un `payTo` mal formado, el manifiesto **no se emite** (`503`). No
-existe ninguna rama de código que devuelva `200` sin un `payment.contract` válido.
+Hence: with no `payTo` configured, or with a malformed `payTo`, the manifest **is not emitted**
+(`503`). There is no code branch that returns `200` without a valid `payment.contract`.
 
-Los 3 slots son `solana-devnet`, y el validador está justamente para **rechazar cualquier cosa que no lo
-sea** — incluida una address `0x…` de otra familia de cadenas pegada por error, que es la equivocación más
-probable del operador al copiar y pegar entre entornos. Sin ese rechazo, el settle del consumidor la
-descartaría con `INVALID_PAY_TO_FORMAT`, el agente cobraría cero igual, y el manifiesto seguiría diciendo
-que todo está bien.
+The 3 slots are `solana-devnet`, and the validator is there precisely to **reject anything that is
+not** — including a `0x…` address from another chain family pasted by mistake, which is the operator's
+most likely slip when copying between environments. Without that rejection, the consumer's settle
+would discard it with `INVALID_PAY_TO_FORMAT`, the agent would charge zero anyway, and the manifest
+would keep saying everything was fine.
 
-El criterio de formato es el **mismo** que aplica el consumidor, y para estos 3 agentes se reduce a uno
-solo: base58 que decodifica a **exactamente 32 bytes**, no "entre 32 y 44 caracteres" — una base58 de largo
-válido que decodifica a 33 bytes pasa la regex laxa y el settle la rechaza igual.
+The format criterion is the **same** one the consumer applies, and for these 3 agents it reduces to a
+single rule: base58 that decodes to **exactly 32 bytes**, not "between 32 and 44 characters" — a
+base58 string of valid length that decodes to 33 bytes passes the loose regex and the settle rejects
+it all the same.
 
-### Envs de `payTo` (sin default, a propósito)
+### `payTo` envs (no defaults, on purpose)
 
-| Agente | Env del `payTo` | Único formato aceptado |
+| Agent | `payTo` env | Only accepted format |
 |---|---|---|
-| `remit-kyc-validator` | `REMIT_KYC_VALIDATOR_PAYTO` | base58 de Solana, 32 bytes |
-| `remit-corridor-fx` | `REMIT_CORRIDOR_FX_PAYTO` | base58 de Solana, 32 bytes |
-| `remit-cashout-payout` | `REMIT_CASHOUT_PAYOUT_PAYTO` | base58 de Solana, 32 bytes |
+| `remit-kyc-validator` | `REMIT_KYC_VALIDATOR_PAYTO` | Solana base58, 32 bytes |
+| `remit-corridor-fx` | `REMIT_CORRIDOR_FX_PAYTO` | Solana base58, 32 bytes |
+| `remit-cashout-payout` | `REMIT_CASHOUT_PAYOUT_PAYTO` | Solana base58, 32 bytes |
 
-Detalle completo de las 3 (qué agente, qué red, qué pasa si falta, dónde se setean de verdad):
-[`.env.example`](.env.example). **Hoy las 3 apuntan a propósito a la misma billetera** (decisión del
-founder); son variables separadas para que darle a cada agente la suya sea cambiar una variable de
-entorno, sin tocar ni deployar código. Ninguna dirección vive en el código.
+Full detail on all 3 (which agent, which network, what happens if it is missing, where they are
+really set): [`.env.example`](.env.example). **Today all 3 point to the same wallet on purpose**
+(founder's decision); they are separate variables so that giving each agent its own is a change to an
+environment variable, with no code change and no deploy. No address lives in the code.
 
-**Ninguna tiene default.** Sin la env (ausente, vacía o sólo whitespace) el endpoint responde `503`: es el
-comportamiento deseado, no un bug. La `chain` **no** es configurable: los 3 agentes la declaran como
-constante de código en `src/manifest/registry.ts`, y su tipo es un **conjunto cerrado de redes de test**
-donde mainnet no es representable. Ninguna variable de entorno puede llevar un manifiesto a mainnet: es
-imposible por construcción, no por disciplina.
+**None of them has a default.** Without the env (absent, empty, or whitespace only) the endpoint
+answers `503`: that is the intended behavior, not a bug. The `chain` is **not** configurable: the 3
+agents declare it as a code constant in `src/manifest/registry.ts`, and its type is a **closed set of
+test networks** where mainnet is not representable. No environment variable can take a manifest to
+mainnet: it is impossible by construction, not by discipline.
 
-### Tabla `pathSlug` → `slug` canónico → chain
+### `pathSlug` → canonical `slug` → chain table
 
-| pathSlug (directorio de la ruta) | slug canónico (registro) | chain |
+| pathSlug (route directory) | canonical slug (registry) | chain |
 |---|---|---|
 | `remit-kyc-validator` | `remit-kyc-validator` | `solana-devnet` |
 | `remit-corridor-fx` | `remit-corridor-fx-solana` | `solana-devnet` |
 | `remit-cashout-payout` | `remit-cashout-payout-solana` | `solana-devnet` |
 
-> **`pathSlug ≠ slug` en FX y payout es deliberado.** El directorio de la ruta es el histórico porque el
-> `agentUrl` ya registrado apunta ahí y **no se toca**; el `slug` que el manifiesto declara es el canónico
-> de cobro (`*-solana`). No "corregir" esta asimetría.
+> **`pathSlug ≠ slug` on FX and payout is deliberate.** The route directory is the historical one
+> because the already-registered `agentUrl` points there and **is not touched**; the `slug` the
+> manifest declares is the canonical billing one (`*-solana`). Do not "fix" this asymmetry.
 
-### Runbook operativo (el orden importa)
+### Operational runbook (the order matters)
 
-El registro y el deslistado **no los hace este repo**: son **ops `!` humano** en `wasiai-a2a`. Este repo
-sólo publica la ficha.
+Registration and delisting are **not done by this repo**: they are **human `!` ops** in `wasiai-a2a`.
+This repo only publishes the sheet.
 
-1. **Setear las 3 envs** en Vercel (Production) y redeploy — las 3 son base58 de Solana. Para FX y
-   payout: usar las **mismas** addresses que ya declaran las filas `*-solana` en el registro (leerlas de
-   `/discover` **antes** de setear; no inventar una segunda verdad). Para el KYC: hoy, por decisión del
-   founder, **la misma billetera que las otras dos**; el día que se separe, es esta variable y nada más.
-2. **Verificar los 3 manifiestos por `curl`**: `200`, `payment.chain` correcto y `Cache-Control: no-store`.
-   Con una env borrada a propósito, confirmar el `503` (prueba viva del fail-closed).
-3. **Drift check sin escribir**: comparar el `payment` del manifiesto contra el de `/discover` para los 2
-   slugs `*-solana`. Si difieren, **no** se corrige a mano.
-   > ⚠️ Este chequeo **no prueba nada sobre el cobro**: coinciden **por construcción**, porque el paso 1
-   > manda copiar las addresses **desde esas mismas filas**. Es un chequeo de consistencia documental.
-4. **Registrar/actualizar los 3 agentes** con el `payment` que declara su manifiesto (`solana-devnet`).
-   Si una fila del registro quedó con un `payment` viejo, el manifiesto y el registro dicen cosas
-   distintas y **manda el registro**: el cobro sale de ahí, no de este repo.
-5. **Probar que el rail de cobro está PRENDIDO** (prueba positiva, no coincidencia de documentos):
-   - **Mínimo obligatorio**: `GET /capabilities` del gateway y verificar que `chains[].key` incluye
-     `solana-devnet`. Si no está, el adapter Solana está apagado (`SOLANA_ADAPTER_ENABLED`, **default
-     OFF**) y el leg downstream se saltea con `CHAIN_NOT_SUPPORTED` para **los 3** agentes: cobran
-     **$0**, con manifiesto `200` y todo.
-   - **Ideal**: una invocación real en devnet contra cada slug `*-solana` y confirmar en el resultado /
-     los logs del gateway que el leg **settleó** (ninguno de los skip-codes `NO_PAYMENT_FIELD`,
+1. **Set the 3 envs** in Vercel (Production) and redeploy — all 3 are Solana base58. For FX and
+   payout: use the **same** addresses already declared by the `*-solana` rows in the registry (read
+   them from `/discover` **before** setting them; do not invent a second truth). For KYC: today, by
+   founder's decision, **the same wallet as the other two**; the day it gets separated, it is this
+   variable and nothing else.
+2. **Verify the 3 manifests by `curl`**: `200`, correct `payment.chain`, and `Cache-Control: no-store`.
+   With one env deliberately cleared, confirm the `503` (live proof of the fail-closed behavior).
+3. **Drift check without writing**: compare the manifest's `payment` against `/discover`'s for the 2
+   `*-solana` slugs. If they differ, it is **not** fixed by hand.
+   > ⚠️ This check **proves nothing about billing**: they match **by construction**, because step 1
+   > instructs you to copy the addresses **from those very rows**. It is a documentary consistency
+   > check.
+4. **Register/update the 3 agents** with the `payment` their manifest declares (`solana-devnet`). If a
+   registry row was left with an old `payment`, the manifest and the registry say different things and
+   **the registry wins**: the payment comes from there, not from this repo.
+5. **Prove that the billing rail is ON** (positive proof, not agreement between documents):
+   - **Mandatory minimum**: `GET /capabilities` on the gateway and check that `chains[].key` includes
+     `solana-devnet`. If it is not there, the Solana adapter is off (`SOLANA_ADAPTER_ENABLED`,
+     **default OFF**) and the downstream leg is skipped with `CHAIN_NOT_SUPPORTED` for **all three**
+     agents: they charge **$0**, manifest `200` and all.
+   - **Ideal**: a real devnet invocation against each `*-solana` slug, confirming in the result / the
+     gateway logs that the leg **settled** (none of the skip codes `NO_PAYMENT_FIELD`,
      `METHOD_NOT_SUPPORTED`, `CHAIN_NOT_SUPPORTED`, `INVALID_PAY_TO_FORMAT`).
-   > **Un `200` del manifiesto NO implica que el rail esté prendido.** El manifiesto declara *dónde*
-   > cobra el agente; que el gateway *pueda* pagarle ahí es configuración del gateway, no de este repo.
-6. ⚠️ **Deslistar cualquier fila anterior de estos agentes SÓLO DESPUÉS de que el paso 5 haya dado
-   prueba positiva de cobro** (los pasos 2 y 3 no alcanzan: los dos dan verde sin haber tocado nunca el
-   rail). Hacerlo antes deja al agente **sin ninguna ruta de cobro**. El deslistado es reversible;
-   quedarse sin ruta de cobro no es gratis.
+   > **A `200` from the manifest does NOT imply the rail is on.** The manifest declares *where* the
+   > agent charges; whether the gateway *can* pay it there is gateway configuration, not this repo's.
+6. ⚠️ **Delist any previous row for these agents ONLY AFTER step 5 has given positive proof of
+   payment** (steps 2 and 3 are not enough: both go green without ever touching the rail). Doing it
+   earlier leaves the agent **with no billing route at all**. Delisting is reversible; being left
+   without a billing route is not free.
 
 ---
 
-## Licencia
+## License
 
-MIT — ver [`LICENSE`](LICENSE).
+MIT — see [`LICENSE`](LICENSE).
