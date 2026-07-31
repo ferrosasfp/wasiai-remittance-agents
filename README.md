@@ -16,6 +16,21 @@ EVM ones (`base`, `polygon`, `arbitrum`, …). This corridor declares `solana`.
 | `remit-corridor-fx-solana` | Prices the USDC→PEN corridor: real market rate + declared spread + ETA. | 0.03 USDC | `solana-devnet` |
 | `remit-cashout-payout-solana` | Cash-out to Peru (Yape/Plin/CCI): the value delivery to the beneficiary. | 0.03 USDC | `solana-devnet` |
 
+⚠️ That last column is what the three **manifests** declare. What actually pays is the gateway's
+registry, and today the `remit-kyc-validator` row there has no `payment` block: it charges **$0** while
+its manifest answers `200`. Both halves are public, so anyone can see the mismatch (measured
+2026-07-31):
+
+```bash
+curl -s https://wasiai-remittance-agents.vercel.app/api/agents/remit-kyc-validator/manifest | jq .payment
+# {"method":"x402","chain":"solana-devnet","contract":"<base58 32B>","asset":"USDC"}
+curl -s https://wasiai-a2a-production.up.railway.app/discover \
+  | jq '.agents[] | select(.slug=="remit-kyc-validator") | .payment'
+# null
+```
+
+The order that avoids leaving an agent like that is the runbook at the end of this document.
+
 **Where this actually stands.** The three `/invoke` and the three `/manifest` endpoints are
 implemented and green (**469 tests across 21 files**, no network). What is real today: the **FX
 quote** (live market rate, cascade over two independent sources, and **fail-closed**: with no rate
@@ -148,8 +163,8 @@ field (which method produced that datum) and not on a signature from the agent i
 ### Pending (post-sandbox)
 
 - Map the exact fields of the Didit/TransFi responses (today the adapters use the documented shape).
-- Real value delivery: movement of the principal + settlement to the beneficiary's wallet, not a
-  self-transfer. See `remit-cashout-payout`.
+- Real value delivery: moving the principal and settling it to the beneficiary. Today the payout leg
+  answers with a mock and moves nothing. See `remit-cashout-payout`.
 
 ---
 
@@ -335,7 +350,7 @@ bound to that verification. No match → **blocked**.
   The value is **never** echoed in a response and never logged.
 - **`address`** (`string`, optional): **DEPRECATED**. Compatibility bridge for the consuming app,
   which today sends `address` and not `senderIdentity`. It is used **only** if `senderIdentity` is
-  absent (precedence: the explicit one wins). Do not build new features on top of it.
+  absent (precedence: the explicit one wins). A new integration should send `senderIdentity`.
 - **Fail-closed**: no claim (or an empty/whitespace claim) → `kyc_identity_claim_missing` **without
   calling Didit**. If the verification has no `vendor_data` to compare against → **blocked** (a match
   is not assumed).
@@ -355,7 +370,7 @@ Stage 1 runs 100% on the **MOCK payout** (`FallbackPayoutProvider`, `provenance:
 
 ### Which variables actually hold the lock on the disbursement
 
-The real adapter is chosen by `getPayoutProvider()` (`src/providers/payout.ts:310-324`), and the same
+The real adapter is chosen by `getPayoutProvider()` (`src/providers/payout.ts:310-325`), and the same
 four are re-checked by the `assertPayoutProviderSafe()` fail-safe (`src/agents/cashout-payout.ts:67-71`):
 
 | variable | what happens if it is missing |
@@ -391,10 +406,11 @@ incident**.
 ## Billing manifest (`/manifest`)
 
 Every agent publishes **its own billing sheet** on an endpoint sibling to its `/invoke`. It is what
-the operator copies into the gateway's registry so that the agent **gets paid for its work**. Before
-this existed, each agent's `payment` was written by hand into the database, outside of any API:
-`remit-kyc-validator` ended up with no sheet and spent time **charging $0 silently** (the caller paid
-the gateway, the step ran, and the settlement toward the operator was skipped without an error).
+the operator copies into the gateway's registry so that the agent **gets paid for its work**. The
+registry is what decides: an agent whose row there has no `payment` block **charges $0 silently**, and
+nothing looks broken while it happens (the caller pays the gateway, the step runs, and the settlement
+toward the operator is skipped without an error). That is the state of `remit-kyc-validator` today,
+and the two `curl`s at the top of this document show it.
 
 ### URLs
 
@@ -469,9 +485,9 @@ it all the same.
 | `remit-cashout-payout` | `REMIT_CASHOUT_PAYOUT_PAYTO` | Solana base58, 32 bytes |
 
 Full detail on all 3 (which agent, which network, what happens if it is missing, where they are
-really set): [`.env.example`](.env.example). **Today all 3 point to the same wallet on purpose**
-(founder's decision); they are separate variables so that giving each agent its own is a change to an
-environment variable, with no code change and no deploy. No address lives in the code.
+really set): [`.env.example`](.env.example). **Today all 3 point to the same wallet on purpose**, and
+the three live manifests show it. They are separate variables so that giving each agent its own is a
+change to an environment variable, with no code change and no deploy. No address lives in the code.
 
 **None of them has a default.** Without the env (absent, empty, or whitespace only) the endpoint
 answers `503`: that is the intended behavior, not a bug. The `chain` is **not** configurable: the 3
@@ -487,20 +503,21 @@ mainnet: it is impossible by construction, not by discipline.
 | `remit-corridor-fx` | `remit-corridor-fx-solana` | `solana-devnet` |
 | `remit-cashout-payout` | `remit-cashout-payout-solana` | `solana-devnet` |
 
-> **`pathSlug ≠ slug` on FX and payout is deliberate.** The route directory is the historical one
-> because the already-registered `agentUrl` points there and **is not touched**; the `slug` the
-> manifest declares is the canonical billing one (`*-solana`). Do not "fix" this asymmetry.
+> **`pathSlug ≠ slug` on FX and payout is deliberate, and it is not a typo.** The route directory is
+> the historical one, because the `agentUrl` already registered in the gateway points there; the
+> `slug` the manifest declares is the canonical billing one (`*-solana`). Lining the two up would
+> break the registered URL.
 
 ### Operational runbook (the order matters)
 
-Registration and delisting are **not done by this repo**: they are **human `!` ops** in `wasiai-a2a`.
-This repo only publishes the sheet.
+Registration and delisting are **not done by this repo**: they are manual operations against the
+gateway (`wasiai-a2a`). This repo only publishes the sheet.
 
 1. **Set the 3 envs** in Vercel (Production) and redeploy. All 3 are Solana base58. For FX and
    payout: use the **same** addresses already declared by the `*-solana` rows in the registry (read
-   them from `/discover` **before** setting them; do not invent a second truth). For KYC: today, by
-   founder's decision, **the same wallet as the other two**; the day it gets separated, it is this
-   variable and nothing else.
+   them from `/discover` **before** setting them; do not invent a second truth). For KYC: today,
+   **the same wallet as the other two**; the day it gets separated, it is this variable and nothing
+   else.
 2. **Verify the 3 manifests by `curl`**: `200`, correct `payment.chain`, and `Cache-Control: no-store`.
    With one env deliberately cleared, confirm the `503` (live proof of the fail-closed behavior).
 3. **Drift check without writing**: compare the manifest's `payment` against `/discover`'s for the 2
