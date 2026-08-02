@@ -9,7 +9,12 @@
 
 import { z } from "zod";
 import { getPayoutProvider } from "../providers/payout";
-import { getKycProvider, normalizeIdentity, REAL_KYC_PROVENANCES } from "../providers/kyc";
+import {
+  getKycProvider,
+  MOCK_KYC_PROVENANCES,
+  normalizeIdentity,
+  REAL_KYC_PROVENANCES,
+} from "../providers/kyc";
 import { checkQuoteBinding } from "../providers/quote-ref";
 import type { KycStatusResult, PayoutResult } from "../providers/types";
 
@@ -72,12 +77,23 @@ export interface CashoutPayoutOutput {
  * FAIL-SAFE: nunca ejecutar un payout REAL con el fallback (mock). En prod se exige un provider
  * real (TransFi key + readiness); en dev el fallback requiere opt-in explícito y ruidoso.
  */
-function assertPayoutProviderSafe(): void {
-  const hasReal =
+/**
+ * ¿El desembolso mueve plata de verdad? Extraída de `assertPayoutProviderSafe` para tener UNA sola
+ * definición: la consumen el fail-safe de abajo y el gate de KYC simulado (`isKycGatePassed`). Dos
+ * copias de este predicado divergirían, y la forma de divergir sería que una diga "es mock" mientras
+ * la otra desembolsa de verdad, que es exactamente el escenario que no puede pasar.
+ */
+export function isPayoutProviderReal(): boolean {
+  return (
     !!process.env.TRANSFI_USERNAME &&
     !!process.env.TRANSFI_PASSWORD &&
     !!process.env.TRANSFI_MID &&
-    process.env.TRANSFI_ADAPTER_READY === "true";
+    process.env.TRANSFI_ADAPTER_READY === "true"
+  );
+}
+
+function assertPayoutProviderSafe(): void {
+  const hasReal = isPayoutProviderReal();
   if (hasReal) return;
   if (process.env.NODE_ENV === "production") {
     // ⚠️ SEGURIDAD MONEY-PATH (WKH-172, etapa 1): PAYOUT_ALLOW_MOCK habilita SOLO el
@@ -192,7 +208,32 @@ async function isKycGatePassed(verificationId: string, claim: IdentityClaim): Pr
     });
     return false;
   }
-  if (REAL_KYC_PROVENANCES.has(s.provenance)) return true; // B1: única rama que abre en prod
+  if (REAL_KYC_PROVENANCES.has(s.provenance)) return true; // B1: única rama que abre con plata real
+  // B1-sim: KYC SIMULADO. Sólo abre si el desembolso TAMPOCO mueve plata. Con un provider real
+  // configurado esta rama no devuelve nada y se sigue de largo hasta el `return false` final: una
+  // verificación que nadie hizo no puede desembolsar dinero de verdad, y no depende de que alguien
+  // se acuerde de chequearlo — no hay ninguna rama que lo permita.
+  //
+  // El orden importa y es el mismo criterio que B1/B3: la pregunta por el dinero va PRIMERO. Y
+  // `isPayoutProviderReal()` es la MISMA función que usa el fail-safe del provider, no una copia:
+  // si las dos pudieran discrepar, la forma de discrepar sería aceptar un KYC falso contra un
+  // desembolso real.
+  if (MOCK_KYC_PROVENANCES.has(s.provenance)) {
+    if (isPayoutProviderReal()) {
+      console.warn(
+        "[remit-payout] KYC SIMULADO rechazado: el provider de payout es REAL. Una verificación " +
+          "que nadie hizo no desembolsa plata de verdad.",
+        { branch: "B1-sim" },
+      );
+      return false;
+    }
+    console.warn(
+      "[remit-payout] gate KYC pasado con verificación SIMULADA (didit-mock) contra un payout que " +
+        "TAMPOCO mueve plata — recorrido de prueba, nada de esto es un desembolso",
+      { branch: "B1-sim" },
+    );
+    return true;
+  }
   // B3: en prod el fallback JAMÁS abre — ninguna env puede abrirlo. El orden (isProd primero)
   // es deliberado: no lo inviertas.
   const isProd = process.env.NODE_ENV === "production";

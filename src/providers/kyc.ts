@@ -3,7 +3,12 @@
 // SBS-compliant Perú. Docs: https://docs.didit.me  (endpoints exactos a confirmar en sandbox).
 
 import { z } from "zod";
-import { resolveDiditBaseUrl, type DiditBaseUrl } from "./didit-env";
+import {
+  resolveDiditBaseUrl,
+  resolveDiditEnvironment,
+  type DiditBaseUrl,
+  type DiditEnvironment,
+} from "./didit-env";
 import type { KycInput, KycProvider, KycResult, KycStatusResult } from "./types";
 
 // MNR-3 (re-AR): allowlist explícita de proveniencias REALES (fail-safe en el eje provenance).
@@ -11,6 +16,40 @@ import type { KycInput, KycProvider, KycResult, KycStatusResult } from "./types"
 // WKH-203/CD-9: vive ACÁ (junto a los providers que PRODUCEN estos valores) y es la ÚNICA;
 // la consumen kyc-validator.ts (isPayoutAllowed) y cashout-payout.ts (isKycGatePassed).
 export const REAL_KYC_PROVENANCES = new Set<string>(["didit"]);
+
+/**
+ * Proveniencias SIMULADAS: una verificación que nadie hizo.
+ *
+ * La emite el mock de Didit de `chaski-v3` (`app/api/mock-didit/**`), que existe porque Didit **no
+ * publica un host de sandbox** y la única forma de recorrer el producto sin el documento de una
+ * persona real es un endpoint propio. La etiqueta no la elige esa ruta: sale del ambiente con el que
+ * se resolvió el host (`mapDiditDecision`), así que el host y la etiqueta no pueden discrepar.
+ *
+ * 🔴 ESTE SET NO ABRE NADA POR SÍ SOLO, y ese es el punto. Está separado de `REAL_KYC_PROVENANCES`
+ * a propósito: la regla es que **un KYC simulado sólo puede desbloquear un desembolso simulado**.
+ * Con un provider de payout REAL configurado, estar acá adentro no sirve de nada — la rama que lo
+ * acepta pregunta primero si el desembolso mueve plata de verdad, y si la mueve, no acepta.
+ * PROHIBIDO fusionar los dos sets, y PROHIBIDO agregar `didit-mock` al de arriba.
+ */
+
+export const MOCK_KYC_PROVENANCES = new Set<string>(["didit-mock"]);
+
+/**
+ * Etiqueta de origen para lo que devuelve el adapter de Didit. Sale del ambiente DECLARADO, no de un
+ * literal.
+ *
+ * 🔴 POR QUÉ. Hasta acá las dos salidas de este adapter escribían `provenance: "didit"` fijo, así que
+ * CUALQUIER host que se configurara quedaba etiquetado como verificación real. Mientras el único host
+ * posible era el de Didit eso era cierto por construcción; con un mock configurable deja de serlo, y
+ * `REAL_KYC_PROVENANCES` (arriba) es justamente lo que decide si el desembolso abre. Una etiqueta que
+ * no mira contra quién se habló convierte ese set en decorativo.
+ *
+ * El mismo arreglo vive en `chaski-v3/src/infrastructure/didit/decision.ts`. Son dos repos y dos
+ * adapters distintos que consultan al MISMO proveedor: los dos tenían el literal y los dos lo pierden.
+ */
+export function provenanceForEnvironment(env: DiditEnvironment): string {
+  return env === "live" ? "didit" : "didit-mock";
+}
 
 /**
  * WKH-204: normalización ÚNICA de identity claims. Sirve a las DOS convenciones de vendor_data:
@@ -59,6 +98,13 @@ export class DiditKycProvider implements KycProvider {
   constructor(
     private readonly apiKey: string,
     private readonly baseUrl: DiditBaseUrl,
+    /**
+     * Ambiente con el que se resolvió `baseUrl`. Se RECIBE por la misma razón que el host: si se
+     * leyera de la env acá adentro, el host y la etiqueta podrían salir de dos lecturas distintas, y
+     * la forma de divergir sería etiquetar como real algo consultado contra el mock. Vienen del mismo
+     * lugar (`getKycProvider`) o no vienen.
+     */
+    private readonly environment: DiditEnvironment,
   ) {}
 
   async verify(input: KycInput): Promise<KycResult> {
@@ -118,7 +164,7 @@ export class DiditKycProvider implements KycProvider {
           ],
       travelRuleData: buildTravelRule(input),
       verificationId: String(data.session_id ?? data.id ?? "unknown"),
-      provenance: "didit",
+      provenance: provenanceForEnvironment(this.environment),
     };
   }
 
@@ -200,7 +246,7 @@ export class DiditKycProvider implements KycProvider {
     return assertValidKycStatus({
       approved,
       verificationId, // canónico = el PEDIDO (igual que payout.ts:53)
-      provenance: "didit",
+      provenance: provenanceForEnvironment(this.environment),
       identityMatches,
       // Los dos ejes son INDEPENDIENTES (una verificación puede estar aprobada Y no ser tuya):
       // por eso los reasons de identidad se CONCATENAN, no reemplazan a los de compliance.
@@ -305,5 +351,5 @@ export function getKycProvider(): KycProvider {
   // deliberada: la rama de arriba (sin key → FallbackKycProvider) NUNCA necesita `DIDIT_ENV`, así
   // que el deploy devnet actual sigue andando inerte sin tocar ninguna env nueva. El fail-closed
   // solo muerde a quien de verdad va a hablarle a Didit.
-  return new DiditKycProvider(key, resolveDiditBaseUrl());
+  return new DiditKycProvider(key, resolveDiditBaseUrl(), resolveDiditEnvironment());
 }
