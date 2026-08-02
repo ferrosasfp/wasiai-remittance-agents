@@ -96,7 +96,7 @@ describe("DiditKycProvider.status (WKH-203)", () => {
         jsonResponse({ status: "Approved", session_id: "v1", vendor_data: "12345678" }),
       ),
     );
-    const s = await new DiditKycProvider("k", MOCK_BASE_URL).status("v1", "12345678");
+    const s = await new DiditKycProvider("k", MOCK_BASE_URL, "live").status("v1", "12345678");
     expect(s.approved).toBe(true);
     expect(s.provenance).toBe("didit");
     expect(s.verificationId).toBe("v1");
@@ -121,7 +121,7 @@ describe("DiditKycProvider.status (WKH-203)", () => {
         }),
       ),
     );
-    const s = await new DiditKycProvider("k", MOCK_BASE_URL).status("v1", "12345678");
+    const s = await new DiditKycProvider("k", MOCK_BASE_URL, "live").status("v1", "12345678");
     expect(s.approved).toBe(false);
     expect(s.reasons).toEqual(["didit_status_declined", "aml_hits_0"]);
     // la PII del partner NUNCA entra al KycStatusResult
@@ -136,14 +136,14 @@ describe("DiditKycProvider.status (WKH-203)", () => {
         jsonResponse({ status: "Approved", session_id: "v1", aml: { hits: [{ x: 1 }] } }),
       ),
     );
-    const s = await new DiditKycProvider("k", MOCK_BASE_URL).status("v1", "12345678");
+    const s = await new DiditKycProvider("k", MOCK_BASE_URL, "live").status("v1", "12345678");
     expect(s.approved).toBe(false);
     expect(s.reasons).toContain("aml_hits_1");
   });
 
   it("!res.ok → throws didit_status_error_<n> (fail-closed, rama B6)", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => jsonResponse({}, 500)));
-    await expect(new DiditKycProvider("k", MOCK_BASE_URL).status("v1", "12345678")).rejects.toThrow(
+    await expect(new DiditKycProvider("k", MOCK_BASE_URL, "live").status("v1", "12345678")).rejects.toThrow(
       /didit_status_error_500/,
     );
   });
@@ -153,7 +153,7 @@ describe("DiditKycProvider.status (WKH-203)", () => {
       "fetch",
       vi.fn(async () => jsonResponse({ status: "Approved", session_id: "otro" })),
     );
-    await expect(new DiditKycProvider("k", MOCK_BASE_URL).status("v1", "12345678")).rejects.toThrow(
+    await expect(new DiditKycProvider("k", MOCK_BASE_URL, "live").status("v1", "12345678")).rejects.toThrow(
       /didit_status_id_mismatch/,
     );
   });
@@ -171,7 +171,7 @@ describe("DiditKycProvider.status — identity binding (WKH-204/C5-C8)", () => {
       "fetch",
       vi.fn(async () => jsonResponse({ status: "Approved", session_id: "v1" })),
     );
-    const s = await new DiditKycProvider("k", MOCK_BASE_URL).status("v1", "12345678");
+    const s = await new DiditKycProvider("k", MOCK_BASE_URL, "live").status("v1", "12345678");
     expect(s.identityMatches).toBe(false);
     expect(s.approved).toBe(true); // el binding NO contamina el eje de compliance
   });
@@ -181,7 +181,7 @@ describe("DiditKycProvider.status — identity binding (WKH-204/C5-C8)", () => {
       "fetch",
       vi.fn(async () => jsonResponse({ status: "Approved", session_id: "v1", vendor_data: "" })),
     );
-    const s = await new DiditKycProvider("k", MOCK_BASE_URL).status("v1", "");
+    const s = await new DiditKycProvider("k", MOCK_BASE_URL, "live").status("v1", "");
     expect(s.identityMatches).toBe(false);
   });
 
@@ -192,7 +192,7 @@ describe("DiditKycProvider.status — identity binding (WKH-204/C5-C8)", () => {
         jsonResponse({ status: "Approved", session_id: "v1", vendor_data: "12345678" }),
       ),
     );
-    const s = await new DiditKycProvider("k", MOCK_BASE_URL).status("v1", "99999999");
+    const s = await new DiditKycProvider("k", MOCK_BASE_URL, "live").status("v1", "99999999");
     expect(s.identityMatches).toBe(false);
     expect(s.approved).toBe(true);
   });
@@ -210,7 +210,7 @@ describe("DiditKycProvider.status — identity binding (WKH-204/C5-C8)", () => {
         jsonResponse({ status: "Approved", session_id: "v1", vendor_data: "12345678" }),
       ),
     );
-    const s = await new DiditKycProvider("k", MOCK_BASE_URL).status("v1", "1234");
+    const s = await new DiditKycProvider("k", MOCK_BASE_URL, "live").status("v1", "1234");
     expect(s.identityMatches).toBe(false); // con .startsWith() o .includes() esto sería true
     expect(s.approved).toBe(true); // el binding NO contamina el eje de compliance
   });
@@ -222,7 +222,7 @@ describe("DiditKycProvider.status — identity binding (WKH-204/C5-C8)", () => {
         jsonResponse({ status: "Approved", session_id: "v1", vendor_data: "12345678" }),
       ),
     );
-    const s = await new DiditKycProvider("k", MOCK_BASE_URL).status("v1", "2345");
+    const s = await new DiditKycProvider("k", MOCK_BASE_URL, "live").status("v1", "2345");
     expect(s.identityMatches).toBe(false); // con .includes() esto sería true
   });
 
@@ -233,7 +233,7 @@ describe("DiditKycProvider.status — identity binding (WKH-204/C5-C8)", () => {
         jsonResponse({ status: "Approved", session_id: "v1", vendor_data: "12345678" }),
       ),
     );
-    const s = await new DiditKycProvider("k", MOCK_BASE_URL).status("v1", "12345678");
+    const s = await new DiditKycProvider("k", MOCK_BASE_URL, "live").status("v1", "12345678");
     expect(s.identityMatches).toBe(true);
   });
 
@@ -244,7 +244,7 @@ describe("DiditKycProvider.status — identity binding (WKH-204/C5-C8)", () => {
       "fetch",
       vi.fn(async () => jsonResponse({ status: "Approved", session_id: "v1", vendor_data: 123 })),
     );
-    const s = await new DiditKycProvider("k", MOCK_BASE_URL).status("v1", "123");
+    const s = await new DiditKycProvider("k", MOCK_BASE_URL, "live").status("v1", "123");
     expect(s.identityMatches).toBe(false);
   });
 
@@ -253,7 +253,7 @@ describe("DiditKycProvider.status — identity binding (WKH-204/C5-C8)", () => {
       "fetch",
       vi.fn(async () => jsonResponse({ status: "Approved", session_id: "v1", vendor_data: {} })),
     );
-    const s = await new DiditKycProvider("k", MOCK_BASE_URL).status("v1", "[object Object]");
+    const s = await new DiditKycProvider("k", MOCK_BASE_URL, "live").status("v1", "[object Object]");
     expect(s.identityMatches).toBe(false);
   });
 
@@ -262,14 +262,14 @@ describe("DiditKycProvider.status — identity binding (WKH-204/C5-C8)", () => {
       "fetch",
       vi.fn(async () => jsonResponse({ status: "Approved", session_id: "v1", vendor_data: null })),
     );
-    expect((await new DiditKycProvider("k", MOCK_BASE_URL).status("v1", "12345678")).identityMatches).toBe(false);
+    expect((await new DiditKycProvider("k", MOCK_BASE_URL, "live").status("v1", "12345678")).identityMatches).toBe(false);
     vi.stubGlobal(
       "fetch",
       vi.fn(async () =>
         jsonResponse({ status: "Approved", session_id: "v1", vendor_data: ["12345678"] }),
       ),
     );
-    expect((await new DiditKycProvider("k", MOCK_BASE_URL).status("v1", "12345678")).identityMatches).toBe(false);
+    expect((await new DiditKycProvider("k", MOCK_BASE_URL, "live").status("v1", "12345678")).identityMatches).toBe(false);
   });
 
   it("normalización: vendor_data '  12345678  ' vs claim '12345678' → identityMatches:true", async () => {
@@ -279,7 +279,7 @@ describe("DiditKycProvider.status — identity binding (WKH-204/C5-C8)", () => {
         jsonResponse({ status: "Approved", session_id: "v1", vendor_data: "  12345678  " }),
       ),
     );
-    const s = await new DiditKycProvider("k", MOCK_BASE_URL).status("v1", "12345678");
+    const s = await new DiditKycProvider("k", MOCK_BASE_URL, "live").status("v1", "12345678");
     expect(s.identityMatches).toBe(true);
   });
 
@@ -290,7 +290,7 @@ describe("DiditKycProvider.status — identity binding (WKH-204/C5-C8)", () => {
         jsonResponse({ status: "Approved", session_id: "v1", vendor_data: "0xAbCd" }),
       ),
     );
-    const s = await new DiditKycProvider("k", MOCK_BASE_URL).status("v1", "0xabcd");
+    const s = await new DiditKycProvider("k", MOCK_BASE_URL, "live").status("v1", "0xabcd");
     expect(s.identityMatches).toBe(true);
   });
 
@@ -302,7 +302,7 @@ describe("DiditKycProvider.status — identity binding (WKH-204/C5-C8)", () => {
       "fetch",
       vi.fn(async () => jsonResponse({ status: "Approved", session_id: "v1" })),
     );
-    const s = await new DiditKycProvider("k", MOCK_BASE_URL).status("v1", "12345678");
+    const s = await new DiditKycProvider("k", MOCK_BASE_URL, "live").status("v1", "12345678");
     expect(s.reasons).toContain("identity_no_binding");
     expect(s.reasons).not.toContain("identity_mismatch");
   });
@@ -314,7 +314,7 @@ describe("DiditKycProvider.status — identity binding (WKH-204/C5-C8)", () => {
         jsonResponse({ status: "Approved", session_id: "v1", vendor_data: "12345678" }),
       ),
     );
-    const s = await new DiditKycProvider("k", MOCK_BASE_URL).status("v1", "99999999");
+    const s = await new DiditKycProvider("k", MOCK_BASE_URL, "live").status("v1", "99999999");
     expect(s.reasons).toContain("identity_mismatch");
     expect(s.reasons).not.toContain("identity_no_binding");
   });
@@ -324,7 +324,7 @@ describe("DiditKycProvider.status — identity binding (WKH-204/C5-C8)", () => {
       "fetch",
       vi.fn(async () => jsonResponse({ status: "Approved", session_id: "v1", vendor_data: 123 })),
     );
-    const s = await new DiditKycProvider("k", MOCK_BASE_URL).status("v1", "123");
+    const s = await new DiditKycProvider("k", MOCK_BASE_URL, "live").status("v1", "123");
     expect(s.reasons).toContain("identity_no_binding");
   });
 
@@ -335,7 +335,7 @@ describe("DiditKycProvider.status — identity binding (WKH-204/C5-C8)", () => {
         jsonResponse({ status: "Approved", session_id: "v1", vendor_data: "12345678" }),
       ),
     );
-    const s = await new DiditKycProvider("k", MOCK_BASE_URL).status("v1", "12345678");
+    const s = await new DiditKycProvider("k", MOCK_BASE_URL, "live").status("v1", "12345678");
     expect(s.reasons).toEqual([]);
   });
 
@@ -345,7 +345,7 @@ describe("DiditKycProvider.status — identity binding (WKH-204/C5-C8)", () => {
       "fetch",
       vi.fn(async () => jsonResponse({ status: "Declined", session_id: "v1" })),
     );
-    const s = await new DiditKycProvider("k", MOCK_BASE_URL).status("v1", "12345678");
+    const s = await new DiditKycProvider("k", MOCK_BASE_URL, "live").status("v1", "12345678");
     expect(s.reasons).toEqual(["didit_status_declined", "aml_hits_0", "identity_no_binding"]);
   });
 
@@ -358,7 +358,7 @@ describe("DiditKycProvider.status — identity binding (WKH-204/C5-C8)", () => {
         jsonResponse({ status: "Approved", session_id: "v1", vendor_data: "12345678" }),
       ),
     );
-    const s = await new DiditKycProvider("k", MOCK_BASE_URL).status("v1", "99999999");
+    const s = await new DiditKycProvider("k", MOCK_BASE_URL, "live").status("v1", "99999999");
     const dump = JSON.stringify(s.reasons);
     expect(dump).not.toContain("12345678"); // el vendor_data (DNI de la verificación)
     expect(dump).not.toContain("99999999"); // el claim que mandó el caller
@@ -373,7 +373,7 @@ describe("DiditKycProvider.status — identity binding (WKH-204/C5-C8)", () => {
         jsonResponse({ status: "Declined", session_id: "v1", vendor_data: "12345678" }),
       ),
     );
-    const s = await new DiditKycProvider("k", MOCK_BASE_URL).status("v1", "12345678");
+    const s = await new DiditKycProvider("k", MOCK_BASE_URL, "live").status("v1", "12345678");
     expect(JSON.stringify(s)).not.toContain("12345678");
     expect(JSON.stringify(s)).not.toContain("vendor_data");
   });
@@ -388,7 +388,7 @@ describe("DiditKycProvider.status — identity binding (WKH-204/C5-C8)", () => {
       "fetch",
       vi.fn(async () => jsonResponse({ status: "Approved", session_id: "v1" })), // C5: Didit NO lo ecoa
     );
-    const s = await new DiditKycProvider("k", MOCK_BASE_URL).status("v1", "12345678");
+    const s = await new DiditKycProvider("k", MOCK_BASE_URL, "live").status("v1", "12345678");
     expect(s.reasons).toContain("identity_no_binding");
     const dump = JSON.stringify(s);
     expect(dump).not.toContain("vendor_data"); // ni el nombre del campo del partner
@@ -474,7 +474,7 @@ describe("DiditKycProvider.verify — validación de shape de la respuesta del p
 
   it("(a) Approved sin AML hits → approved true, riskLevel low, provenance didit, id del partner", async () => {
     stub({ status: "Approved", session_id: "s-1" });
-    const r = await new DiditKycProvider("k", MOCK_BASE_URL).verify(base);
+    const r = await new DiditKycProvider("k", MOCK_BASE_URL, "live").verify(base);
     expect(r.approved).toBe(true);
     expect(r.riskLevel).toBe("low");
     expect(r.provenance).toBe("didit");
@@ -484,7 +484,7 @@ describe("DiditKycProvider.verify — validación de shape de la respuesta del p
 
   it("(a) Declined → approved false + reasons históricos INTACTOS", async () => {
     stub({ status: "Declined", session_id: "s-2" });
-    const r = await new DiditKycProvider("k", MOCK_BASE_URL).verify(base);
+    const r = await new DiditKycProvider("k", MOCK_BASE_URL, "live").verify(base);
     expect(r.approved).toBe(false);
     expect(r.riskLevel).toBe("medium");
     expect(r.reasons).toEqual(["didit_status_declined", "aml_hits_0"]);
@@ -492,7 +492,7 @@ describe("DiditKycProvider.verify — validación de shape de la respuesta del p
 
   it("(a) AML hits (array) → approved false + riskLevel high + conteo en reasons", async () => {
     stub({ status: "Approved", session_id: "s-3", aml: { hits: [{ x: 1 }, { x: 2 }] } });
-    const r = await new DiditKycProvider("k", MOCK_BASE_URL).verify(base);
+    const r = await new DiditKycProvider("k", MOCK_BASE_URL, "live").verify(base);
     expect(r.approved).toBe(false);
     expect(r.riskLevel).toBe("high");
     expect(r.reasons).toEqual(["didit_status_approved", "aml_hits_2"]);
@@ -512,7 +512,7 @@ describe("DiditKycProvider.verify — validación de shape de la respuesta del p
       id_verifications: [{ document_number: "87654321", portrait_image: "https://x/y.jpg" }],
       warnings: [{ risk: "OCR_MISMATCH" }],
     });
-    const r = await new DiditKycProvider("k", MOCK_BASE_URL).verify(base);
+    const r = await new DiditKycProvider("k", MOCK_BASE_URL, "live").verify(base);
     expect(r.approved).toBe(true);
     expect(r.verificationId).toBe("s-4");
     const dump = JSON.stringify(r);
@@ -525,23 +525,23 @@ describe("DiditKycProvider.verify — validación de shape de la respuesta del p
 
   it("(b) session_id numérico → String() preservado", async () => {
     stub({ status: "Approved", session_id: 12345 });
-    expect((await new DiditKycProvider("k", MOCK_BASE_URL).verify(base)).verificationId).toBe("12345");
+    expect((await new DiditKycProvider("k", MOCK_BASE_URL, "live").verify(base)).verificationId).toBe("12345");
   });
 
   it("(b) sin session_id pero con id → usa id (cadena de nombres preservada)", async () => {
     stub({ status: "Approved", id: "alt-id" });
-    expect((await new DiditKycProvider("k", MOCK_BASE_URL).verify(base)).verificationId).toBe("alt-id");
+    expect((await new DiditKycProvider("k", MOCK_BASE_URL, "live").verify(base)).verificationId).toBe("alt-id");
   });
 
   it("(b) sin ningún id → 'unknown' (default histórico)", async () => {
     stub({ status: "Approved" });
-    expect((await new DiditKycProvider("k", MOCK_BASE_URL).verify(base)).verificationId).toBe("unknown");
+    expect((await new DiditKycProvider("k", MOCK_BASE_URL, "live").verify(base)).verificationId).toBe("unknown");
   });
 
   it("(c) body null → NO lanza: approved false + didit_response_bad_shape (antes: TypeError crudo)", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     stub(null);
-    const r = await new DiditKycProvider("k", MOCK_BASE_URL).verify(base);
+    const r = await new DiditKycProvider("k", MOCK_BASE_URL, "live").verify(base);
     expect(r.approved).toBe(false);
     expect(r.provenance).toBe("didit");
     expect(r.reasons).toContain("didit_response_bad_shape");
@@ -552,7 +552,7 @@ describe("DiditKycProvider.verify — validación de shape de la respuesta del p
   it("(c) status de tipo inesperado (objeto) → fail-closed + reason de shape, sin throw", async () => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
     stub({ status: { code: "approved" }, session_id: "s-5" });
-    const r = await new DiditKycProvider("k", MOCK_BASE_URL).verify(base);
+    const r = await new DiditKycProvider("k", MOCK_BASE_URL, "live").verify(base);
     expect(r.approved).toBe(false); // NUNCA se lee un objeto como "approved"
     expect(r.reasons).toContain("didit_response_bad_shape");
     // los reasons históricos se AGREGAN, no se reemplazan (no se rompen consumidores)
@@ -562,7 +562,7 @@ describe("DiditKycProvider.verify — validación de shape de la respuesta del p
   it("(c) body array → fail-closed + reason de shape", async () => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
     stub([{ status: "Approved" }]);
-    const r = await new DiditKycProvider("k", MOCK_BASE_URL).verify(base);
+    const r = await new DiditKycProvider("k", MOCK_BASE_URL, "live").verify(base);
     expect(r.approved).toBe(false);
     expect(r.reasons).toContain("didit_response_bad_shape");
   });
@@ -570,7 +570,7 @@ describe("DiditKycProvider.verify — validación de shape de la respuesta del p
   it("(c) el reason de shape es una ETIQUETA value-free (CD-7: nunca el body del partner)", async () => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
     stub({ status: { nested: "Approved" }, document_number: "87654321", vendor_data: "12345678" });
-    const r = await new DiditKycProvider("k", MOCK_BASE_URL).verify(base);
+    const r = await new DiditKycProvider("k", MOCK_BASE_URL, "live").verify(base);
     const dump = JSON.stringify(r.reasons);
     expect(dump).not.toContain("87654321");
     expect(dump).not.toContain("vendor_data");
@@ -579,13 +579,13 @@ describe("DiditKycProvider.verify — validación de shape de la respuesta del p
 
   it("(c) shape válido → NO se emite el reason de shape (el discriminador no es ruido)", async () => {
     stub({ status: "Declined", session_id: "s-6" });
-    const r = await new DiditKycProvider("k", MOCK_BASE_URL).verify(base);
+    const r = await new DiditKycProvider("k", MOCK_BASE_URL, "live").verify(base);
     expect(r.reasons).not.toContain("didit_response_bad_shape");
   });
 
   it("!res.ok → sigue lanzando didit_error_<n> (fail-closed intacto, nada cambió antes del parseo)", async () => {
     stub({}, 500);
-    await expect(new DiditKycProvider("k", MOCK_BASE_URL).verify(base)).rejects.toThrow(/didit_error_500/);
+    await expect(new DiditKycProvider("k", MOCK_BASE_URL, "live").verify(base)).rejects.toThrow(/didit_error_500/);
   });
 
   // 🔴 Guard de REGRESIÓN, no de deseo: `aml.hits` NO-array sigue contando 0 hits. Es el fail-open
@@ -594,14 +594,14 @@ describe("DiditKycProvider.verify — validación de shape de la respuesta del p
   // alguien lo endurece, este test se pone rojo y hay que ir a leer ese TODO.
   it("aml.hits no-array (number) → amlHits 0: comportamiento PRESERVADO (TODO(sandbox) item 2)", async () => {
     stub({ status: "Approved", session_id: "s-7", aml: { hits: 3 } });
-    const r = await new DiditKycProvider("k", MOCK_BASE_URL).verify(base);
+    const r = await new DiditKycProvider("k", MOCK_BASE_URL, "live").verify(base);
     expect(r.approved).toBe(true); // fail-open latente, hoy inocuo tras DIDIT_ADAPTER_READY
     expect(r.reasons).toEqual([]);
   });
 
   it("aml null → amlHits 0 sin romper (nullish preservado)", async () => {
     stub({ status: "Approved", session_id: "s-8", aml: null });
-    expect((await new DiditKycProvider("k", MOCK_BASE_URL).verify(base)).approved).toBe(true);
+    expect((await new DiditKycProvider("k", MOCK_BASE_URL, "live").verify(base)).approved).toBe(true);
   });
 });
 

@@ -813,3 +813,73 @@ describe("runCashoutPayout — flag PAYOUT_ALLOW_MOCK (prod opt-in, etapa 1)", (
     await expect(runCashoutPayout(validInput)).rejects.toThrow(/payout_refused/);
   });
 });
+
+// ── B1-sim: KYC SIMULADO ────────────────────────────────────────────────────────────────────────
+// Didit no publica sandbox, así que el modo de prueba es un mock NUESTRO. Eso crea un eje que antes
+// no existía: una verificación que nadie hizo. La regla es que sólo puede desbloquear un desembolso
+// que TAMPOCO mueve plata.
+//
+// ⚠️ NOTA SOBRE EL RESTO DE ESTE ARCHIVO, y es una consecuencia real de este cambio: el `beforeEach`
+// global fija `DIDIT_ENV=mock` como BLINDAJE (ningún test puede pegarle al host real de Didit). Con
+// la etiqueta ahora derivada del ambiente, eso significa que los demás tests del adapter Didit pasan
+// por B1-sim y NO por B1. Sus veredictos no cambian (ninguno configura un payout real, así que las
+// dos ramas abren en el mismo lugar), pero el que se llama "provenance didit → EJECUTA" ya no
+// ejercita la rama que su nombre dice. Se deja el blindaje y se cubre B1 acá abajo, declarando
+// `live` explícitamente en el único test que lo necesita.
+describe("runCashoutPayout — KYC simulado (B1-sim)", () => {
+  let executeSpy: MockInstance;
+  beforeEach(() => {
+    executeSpy = vi.spyOn(FallbackPayoutProvider.prototype, "execute");
+    vi.stubEnv("DIDIT_API_KEY", "k");
+    vi.stubEnv("DIDIT_ADAPTER_READY", "true");
+    vi.stubEnv("ALLOW_FALLBACK_PAYOUT", "true");
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+  });
+
+  it("KYC simulado + payout que NO mueve plata → ejecuta (es el recorrido de prueba)", async () => {
+    vi.stubEnv("TRANSFI_ADAPTER_READY", ""); // el desembolso tampoco es real
+    stubDiditDecision({ status: "Approved", session_id: "v1", vendor_data: "12345678" });
+    const out = await runCashoutPayout(validInput);
+    expect(out.executed).toBe(true);
+    // 🔴 NO se assertea `out.provenance`: ese campo reporta el PROVEEDOR DE DESEMBOLSO
+    // ("local-fallback"), no el KYC. Confundirlos fue un error real al escribir este test, y la
+    // etiqueta del KYC no cruza el borde de salida a propósito. Lo que discrimina la rama es el PAR
+    // de tests: mismo KYC simulado, dos modos de desembolso, veredictos opuestos.
+  });
+
+  // 🔴 ESTE ES EL TEST QUE IMPORTA. Con un provider de payout REAL configurado, una verificación
+  // simulada NO abre. Si esta rama se cayera, el modo de prueba se volvería un bypass del KYC sobre
+  // dinero de verdad.
+  it("KYC simulado + payout REAL → BLOQUEA, y no ejecuta nada", async () => {
+    vi.stubEnv("TRANSFI_USERNAME", "u");
+    vi.stubEnv("TRANSFI_PASSWORD", "p");
+    vi.stubEnv("TRANSFI_MID", "m");
+    vi.stubEnv("TRANSFI_ENV", "sandbox"); // el adapter de TransFi también falla cerrado sin ambiente
+    vi.stubEnv("TRANSFI_ADAPTER_READY", "true"); // ← desembolso REAL
+    stubDiditDecision({ status: "Approved", session_id: "v1", vendor_data: "12345678" });
+    const out = await runCashoutPayout(validInput);
+    expect(out.executed).toBe(false);
+    expect(out.status).toBe("blocked");
+    expect(out.reason).toBe("kyc_gate_not_passed");
+    expect(executeSpy).not.toHaveBeenCalled();
+  });
+
+  // El reverso, y la única cobertura real de B1 que queda en este archivo: con el ambiente declarado
+  // `live` la etiqueta vuelve a ser `didit`, que es la que la allowlist acepta contra plata real.
+  it("B1: KYC REAL (live) sí abre — la rama de siempre sigue viva", async () => {
+    // `live` exige además NODE_ENV=production en este repo (mismo criterio que el guard de Vercel en
+    // chaski: un build de dev no crea verificaciones reales). Se declara, no se saltea.
+    vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv("DIDIT_ENV", "live"); // pisa el blindaje SOLO acá
+    vi.stubEnv("DIDIT_BASE_URL", ""); // sin override: live resuelve el host canónico
+    vi.stubEnv("PAYOUT_ALLOW_MOCK", "true"); // en prod el fail-safe del payout exige el opt-in
+    vi.stubEnv("TRANSFI_ADAPTER_READY", "");
+    stubDiditDecision({ status: "Approved", session_id: "v1", vendor_data: "12345678" });
+    const out = await runCashoutPayout(validInput);
+    expect(out.executed).toBe(true); // B1 sigue abriendo con verificación real
+  });
+});
