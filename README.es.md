@@ -313,6 +313,19 @@ body: { "senderName": "Alice", "senderCountry": "US", "legalId": "<DNI>", "amoun
 
 Etapa 1 corre 100% en **fallback KYC** (`provenance: "local-fallback"`): verificación determinística, sin
 red real. **Didit queda OFF** (etapa 2): `DIDIT_API_KEY` / `DIDIT_ADAPTER_READY` **sin setear** en el deploy.
+**El escape-hatch de devnet, que cambia cómo se ve el mock desde afuera.** Sin credenciales el proveedor
+es el mock y por defecto devuelve `depositAddress: null`. Pero si **`TRANSFI_DEVNET_SOLANA_DEPOSIT_ADDRESS`**
+tiene una address base58 válida **y** `TRANSFI_USDC_NETWORK` vale exactamente `solana` (igualdad estricta,
+sin recortar espacios), el mock devuelve esa address y se etiqueta `provenance: "devnet-stub"`
+(`resolveDevnetStubAddress`, `payout.ts:82-97`). Existe para que una corrida en devnet tenga dónde
+depositar de verdad mientras nada se desembolsa. Dos consecuencias:
+
+- **No mueve plata.** El mock nunca desembolsa y el escape-hatch no cambia eso: hereda el fail-safe
+  `assertPayoutProviderSafe()` como cualquier otro camino de mock.
+- **Por eso `depositAddress` no distingue lo real de lo simulado.** Hay que leer `provenance`. Una
+  address malformada, o cualquier red que no sea `solana`, cae fail-closed a `null` y `"local-fallback"`
+  en vez de adivinar.
+
 **Garantía dura NO-PII:** el output NUNCA expone `legalId` (DNI) ni `travelRuleData` en ninguna respuesta
 (200/400/502).
 
@@ -350,8 +363,12 @@ body: { "quoteId": "<el quoteId TAL CUAL lo devolvió remit-corridor-fx>", "amou
 
 El `result` del camino feliz lleva **9 claves**. La última, **`depositAddress`**, es la address dedicada
 de la orden que devuelve TransFi en el create-order: la address a la que el sender tiene que mandar el
-USDC on-chain. Es `null` en el mock y en toda respuesta `blocked`, así que un valor no nulo es también
-la señal de que se creó una orden real (`src/agents/cashout-payout.ts:59`).
+USDC on-chain. Es `null` en toda respuesta `blocked` y en el mock simple. **Un valor no nulo NO significa por sí solo
+que se haya creado una orden real**, y leerlo así es justo el error que este párrafo viene a evitar: el
+escape-hatch de devnet que se documenta más abajo hace que el mock devuelva una address real sin mover
+nada. El campo que contesta la pregunta es `provenance`, no `depositAddress`: `"transfi"` es una orden
+real, `"devnet-stub"` es el escape-hatch, `"local-fallback"` es el mock simple
+(`src/agents/cashout-payout.ts:59`).
 
 > **Nota**: el campo `kycPayoutAllowed` fue **removido del schema**. El hard-gate KYC se **re-deriva server-side** contra Didit: `KycProvider.status(verificationId, identityClaim)` → allowlist `REAL_KYC_PROVENANCES`. (El 2º parámetro es **requerido**: un opcional se puede olvidar en un call site nuevo y degradaría el binding en silencio; uno requerido **no compila**.) Si código legacy aún envía `kycPayoutAllowed: true`, **Zod lo strippea silenciosamente** (schema sin `.strict()`); el campo no tiene ningún efecto.
 
@@ -380,8 +397,9 @@ binding ata las dos cosas: el caller presenta `senderIdentity` y el agente lo co
 > **público** (ej. una wallet address), la protección de **ese** flujo es **≈nula**: el atacante que quiere
 > suplantar a esa víctima ya conoce su address. La prueba de posesión real todavía está pendiente.
 
-Etapa 1 corre 100% en **payout MOCK** (`FallbackPayoutProvider`, `provenance:"local-fallback"`,
-`deliveredLocal:null`, `txRef:null`): NUNCA mueve plata real. **TransFi queda OFF** (etapa 2).
+Etapa 1 corre 100% en **payout MOCK** (`FallbackPayoutProvider`, `deliveredLocal:null`, `txRef:null`): NUNCA mueve plata real. **TransFi queda OFF** (etapa 2).
+Su `provenance` es `"local-fallback"`, o `"devnet-stub"` cuando el escape-hatch de devnet está armado.
+Ninguno de los dos desembolsa.
 
 ### Qué variables sostienen de verdad el candado del desembolso
 

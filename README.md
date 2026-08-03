@@ -354,8 +354,12 @@ body: { "quoteId": "<the quoteId EXACTLY as remit-corridor-fx returned it>", "am
 
 The `result` of the happy path carries **9 keys**. The last one, **`depositAddress`**, is the address
 dedicated to the order that TransFi returns on create-order: the address the sender is supposed to send
-the USDC to on-chain. It is `null` in the mock and in every `blocked` response, so a non-null value is
-also the sign that a real order was created (`src/agents/cashout-payout.ts:59`).
+the USDC to on-chain. It is `null` in every `blocked` response and in the plain mock. **A non-null value does not by itself
+mean a real order was created**, and reading it that way is the mistake this paragraph exists to
+prevent: the devnet escape hatch below makes the mock return a real, non-null address while moving
+nothing. The field that answers the question is `provenance`, not `depositAddress`: `"transfi"` is a
+real order, `"devnet-stub"` is the escape hatch, `"local-fallback"` is the plain mock
+(`src/agents/cashout-payout.ts:59`).
 
 > **Note**: the `kycPayoutAllowed` field was **removed from the schema**. The KYC hard gate is
 > **re-derived server-side** against Didit: `KycProvider.status(verificationId, identityClaim)` →
@@ -393,8 +397,10 @@ bound to that verification. No match → **blocked**.
 > wallet address), the protection of **that** flow is **≈nil**: the attacker who wants to impersonate
 > that victim already knows their address. Real proof of possession is still pending.
 
-Stage 1 runs 100% on the **MOCK payout** (`FallbackPayoutProvider`, `provenance:"local-fallback"`,
-`deliveredLocal:null`, `txRef:null`): it NEVER moves real money. **TransFi stays OFF** (stage 2).
+Stage 1 runs 100% on the **MOCK payout** (`FallbackPayoutProvider`, `deliveredLocal:null`,
+`txRef:null`): it NEVER moves real money. **TransFi stays OFF** (stage 2). Its `provenance` is
+`"local-fallback"`, or `"devnet-stub"` when the devnet escape hatch below is armed. Neither of them
+disburses.
 
 ### Which variables actually hold the lock on the disbursement
 
@@ -425,6 +431,20 @@ deploy sets `PAYOUT_ALLOW_MOCK=true` to allow ONLY the mock. **It enables no pat
 disbursement** (that one remains gated by the four variables in the table above). ⚠️ Turning
 `PAYOUT_ALLOW_MOCK` on in any deploy other than the stage 1 (mock) one is a **money-path security
 incident**.
+
+**The devnet escape hatch, which changes what the mock looks like from outside.** With no credentials
+the provider is the mock, and by default it returns `depositAddress: null`. But if
+**`TRANSFI_DEVNET_SOLANA_DEPOSIT_ADDRESS`** is set to a valid base58 address **and**
+`TRANSFI_USDC_NETWORK` is exactly `solana` (strict equality, not trimmed), the mock returns that
+address and tags itself `provenance: "devnet-stub"` (`resolveDevnetStubAddress`,
+`payout.ts:82-97`). It exists so a devnet run can have somewhere real to deposit while nothing
+disburses. Two consequences worth stating:
+
+- **It moves no money.** The mock never disburses, and the escape hatch does not change that. It
+  inherits the `assertPayoutProviderSafe()` fail-safe like any other mock path.
+- **It is why `depositAddress` is not a real-versus-mock signal.** Read `provenance` instead. A
+  malformed address, or any network other than `solana`, fails closed back to `null` and
+  `"local-fallback"` rather than guessing.
 
 **Hard NO-PII guarantee:** the output NEVER exposes `beneficiary.name`, `beneficiary.destination`
 (Yape/CCI) or `travelRuleData` in any response (200/400/502).
