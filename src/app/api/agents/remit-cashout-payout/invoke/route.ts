@@ -5,8 +5,15 @@
 // CD-6 (eje crítico): NINGÚN response (200/400/502) puede exponer beneficiary.name/destination ni travelRuleData.
 import { NextRequest, NextResponse } from "next/server";
 import { CashoutPayoutInputSchema, runCashoutPayout } from "@/agents/cashout-payout";
+import { guardInvokeAuth } from "@/auth/invoke-auth";
 
 export async function POST(req: NextRequest) {
+  // Va ANTES de leer el body a propósito: sin credencial no se parsea el beneficiary de nadie (CD-6
+  // se refuerza, no se afloja). Con `INVOKE_AUTH_SECRET` sin configurar devuelve `null` SIEMPRE, y
+  // ésa es la rama que mantiene vivo el leg de payout mientras el gateway no pueda mandar cabecera.
+  const unauthorized = guardInvokeAuth(req, "remit-cashout-payout");
+  if (unauthorized !== null) return unauthorized;
+
   const parsed = CashoutPayoutInputSchema.safeParse(await req.json().catch(() => null));
   if (!parsed.success) {
     // CD-6: SOLO parsed.error.flatten() (mensajes Zod, value-free). NUNCA parsed.data / body crudo /

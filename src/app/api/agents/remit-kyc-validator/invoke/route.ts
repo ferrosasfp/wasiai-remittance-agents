@@ -5,8 +5,14 @@
 // CD-6 (eje crítico): NINGÚN response (200/400/502) puede exponer legalId ni travelRuleData.
 import { NextRequest, NextResponse } from "next/server";
 import { KycInputSchema, runKycValidator } from "@/agents/kyc-validator";
+import { guardInvokeAuth } from "@/auth/invoke-auth";
 
 export async function POST(req: NextRequest) {
+  // Va ANTES de leer el body a propósito: sin credencial no se parsea nada del caller (CD-6 se
+  // refuerza, no se afloja). Con `INVOKE_AUTH_SECRET` sin configurar devuelve `null` SIEMPRE.
+  const unauthorized = guardInvokeAuth(req, "remit-kyc-validator");
+  if (unauthorized !== null) return unauthorized;
+
   const parsed = KycInputSchema.safeParse(await req.json().catch(() => null));
   if (!parsed.success) {
     // CD-6: SOLO parsed.error.flatten() (mensajes Zod, value-free). NUNCA parsed.data / body crudo /
