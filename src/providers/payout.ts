@@ -243,13 +243,23 @@ export class TransFiPayoutProvider implements PayoutProvider {
  * Fallback MOCK — dev/demo. NO desembolsa plata real. Devuelve un resultado simulado
  * SIEMPRE tageado `provenance:"local-fallback"` + `deliveredLocal:null` (no hubo entrega real).
  * El gate del agente/orquestador NUNCA debe ejecutar un payout real con este provider (fail-safe).
+ *
+ * 🔴 EL MOCK NO PUEDE AFIRMAR MÁS QUE EL ADAPTER REAL EN EL MISMO PUNTO. Hasta este fix los dos
+ * métodos devolvían `"settled"`, un estado que `TransFiPayoutProvider.execute()` NO PUEDE EMITIR
+ * NUNCA (fuerza `"submitted"`: el POST solo crea la orden) y que `status()` solo emite cuando el
+ * partner lo afirma. O sea que el simulado se reportaba MÁS TERMINAL que la realidad, y hay
+ * consumidores que leen `"settled"` como "entregado" y lo muestran (chaski-v3
+ * `track-remittance.ts` → `markSettled`). El mock no habló con ningún partner: lo máximo que puede
+ * decir es lo que dice el adapter real cuando el partner no afirma ningún desenlace, que es
+ * `"submitted"` (`normalizeStatus` más abajo). Lo hace cumplir `payout-mock-ceiling.test.ts`,
+ * que mide el techo EJECUTANDO el adapter real en vez de comparar contra un literal.
  */
 export class FallbackPayoutProvider implements PayoutProvider {
   async execute(input: PayoutInput): Promise<PayoutResult> {
     const stub = resolveDevnetStubAddress(); // WKH-232: null salvo doble-gate + base58 válido
     return {
       payoutId: `fallback-${input.idempotencyKey}`,
-      status: "settled",
+      status: "submitted", // techo del mock (ver el bloque de arriba) — NUNCA un estado terminal
       deliveredLocal: null, // NO hubo entrega real
       txRef: null,
       failureReason: null,
@@ -261,7 +271,7 @@ export class FallbackPayoutProvider implements PayoutProvider {
     const stub = resolveDevnetStubAddress(); // WKH-232: null salvo doble-gate + base58 válido
     return {
       payoutId,
-      status: "settled",
+      status: "submitted", // ídem execute(): sin partner al que consultarle, no hay estado terminal
       deliveredLocal: null,
       txRef: null,
       failureReason: null,
