@@ -961,11 +961,41 @@ describe("FX mid — cascada, guards y fail-closed", () => {
       fee: 0.5,
       destAmount: 358.4,
       quoteId: "tq-min",
+      // El `expiresAt` del partner ENTRÓ AL ARRANGE (2026-08-04) y no es decoración: desde que el
+      // vencimiento viaja firmado dentro de la referencia, el núcleo no puede emitir una cotización
+      // que no diga hasta cuándo vale. Sin este campo el caso de abajo lo cubre explícitamente.
+      expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
     });
 
     const q = await quoteViaCore(core, 100);
     expect(q.provenance).toBe("transfi");
     expect(fetchMock).toHaveBeenCalled();
+  });
+
+  // 🔴 EL CAMINO DEL SOCIO SIN VENCIMIENTO NO COTIZA (2026-08-04). `fx.ts` mapea
+  // `expiresAt: String(d.expiresAt ?? "")`: si el partner no lo manda, llega vacío. Antes eso era
+  // inocuo porque el vencimiento era decorativo; ahora es la vigencia que el desembolso hace
+  // cumplir, y una referencia sin ella no vence NUNCA. Se corta al EMITIR (502 ruidoso, y el
+  // `TRANSFI_ADAPTER_READY` existe justo para que esto se descubra al activar el adapter y no con
+  // plata real), en vez de emitir una referencia eterna: mismo criterio que `assertValidQuote` con
+  // una tasa NaN — antes que emitir algo que nadie pueda respaldar, no se emite.
+  it("T-EXP-1: el socio que NO declara expiresAt no produce cotización (nada de referencias eternas)", async () => {
+    const core = await freshCore();
+    vi.stubEnv("TRANSFI_API_KEY", "clave-de-prueba");
+    vi.stubEnv("TRANSFI_ADAPTER_READY", "true");
+    vi.stubEnv("TRANSFI_ENV", "sandbox");
+    // Exactamente el body de arriba, MENOS `expiresAt`: la única diferencia es la que decide.
+    stubFetchOk({ rate: 3.6, fee: 0.5, destAmount: 358.4, quoteId: "tq-min" });
+
+    const resultado = await quoteViaCore(core, 100).then(
+      (q) => q,
+      (e: unknown) => e,
+    );
+
+    // Efecto primero: NO hay cotización. Y el rechazo viene del guard del vencimiento y no de
+    // cualquier otro throw del camino — si no, el caso no estaría realmente cubierto.
+    expect(resultado, "no puede emitirse una referencia que no vence nunca").toBeInstanceOf(Error);
+    expect((resultado as Error).message).toMatch(/^quote_ref_unusable_expiry:/);
   });
 
   it("T-314-8: el mínimo se rota por env sin reimportar el módulo (call-time, como el resto)", async () => {

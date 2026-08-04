@@ -15,8 +15,30 @@ import {
   normalizeIdentity,
   REAL_KYC_PROVENANCES,
 } from "../providers/kyc";
-import { checkQuoteBinding } from "../providers/quote-ref";
+import { checkQuoteBinding, type QuoteBindingVerdict } from "../providers/quote-ref";
 import type { KycStatusResult, PayoutResult } from "../providers/types";
+
+/**
+ * Motivo del `blocked` por cada veredicto de binding que NO es `bound`. Es una TABLA y no un
+ * ternario encadenado a propósito: el tipo `Record<Exclude<…>>` obliga a que agregar un veredicto
+ * nuevo a `QuoteBindingVerdict` NO COMPILE hasta que alguien decida qué le dice al caller. El
+ * ternario que había acá mandaba todo lo que no fuera `amount_mismatch` al cajón de
+ * `quote_unresolvable`, así que un veredicto nuevo habría heredado en silencio el motivo
+ * equivocado — que es exactamente cómo un `expired` se habría reportado como "no pude resolver".
+ *
+ * 🔴 Sin números: ni el monto pedido, ni el cotizado, ni el instante de vencimiento. Ecoarlos
+ * convertiría al agente en un oráculo que revela, con una referencia ajena, cuánto cotizó otro y
+ * hasta cuándo. Y son motivos PROPIOS, distintos de los del agente FX
+ * (`fx_amount_below_minimum` / `fx_amount_above_maximum`): aquéllos dicen "el monto está fuera de lo
+ * que cotizamos", éstos dicen "el monto no es el de TU cotización".
+ */
+const QUOTE_BINDING_BLOCK_REASON: Record<Exclude<QuoteBindingVerdict, "bound">, string> = {
+  amount_mismatch: "quote_amount_mismatch",
+  // Se corrige volviendo a cotizar, NO cambiando el monto: por eso no comparte motivo con el de
+  // arriba. Y no es `quote_unresolvable`: la referencia se resolvió, la respuesta es que ya no vale.
+  expired: "quote_expired",
+  unresolvable: "quote_unresolvable",
+};
 
 export const SLUG = "remit-cashout-payout";
 export const PRICE_USDC = 0.03;
@@ -269,11 +291,17 @@ export async function runCashoutPayout(raw: unknown): Promise<CashoutPayoutOutpu
   // KYC por el mismo motivo que C3/C4: es cero-I/O y ya determina el rechazo, así que no se gasta
   // una llamada a Didit ni se le da esa señal a un caller cuya cotización ni siquiera resuelve.
   //
-  // 🔴 SON TRES ESTADOS, NO DOS. "No coinciden los montos" y "no pude resolver la referencia" NO son
-  // el mismo hecho y no comparten motivo: el primero es una respuesta, el segundo es la ausencia de
-  // una respuesta. Los dos bloquean, pero quien integra necesita saber cuál le pasó — y ops necesita
-  // distinguir una avalancha pareja (referencias viejas / secreto mal configurado) de un intento
-  // puntual de falsificación. Un booleano acá habría borrado exactamente esa diferencia.
+  // 🔴 SON CUATRO ESTADOS, NO DOS. "No coinciden los montos", "la cotización ya venció" y "no pude
+  // resolver la referencia" NO son el mismo hecho y no comparten motivo: los dos primeros son
+  // respuestas (y se corrigen en direcciones distintas — mandar el monto correcto vs. volver a
+  // cotizar), el tercero es la ausencia de una respuesta. Los tres bloquean, pero quien integra
+  // necesita saber cuál le pasó — y ops necesita distinguir una avalancha pareja (referencias
+  // viejas / secreto mal configurado) de un intento puntual de falsificación. Un booleano acá habría
+  // borrado exactamente esa diferencia; el mapa de motivos vive en `QUOTE_BINDING_BLOCK_REASON`.
+  //
+  // ⚠️ EL VENCIMIENTO SE HACE CUMPLIR ACÁ, DEL LADO SERVIDOR, y NO es redundante con el chequeo que
+  // hace chaski en el dominio del navegador: ése se saltea invocando al agente directo, y así se
+  // midió (2026-08-04) un desembolso `executed:true` contra una cotización vencida hacía 50 segundos.
   const quoteBinding = checkQuoteBinding(input.quoteId, input.amountUsd);
   if (quoteBinding !== "bound") {
     return {
@@ -283,12 +311,7 @@ export async function runCashoutPayout(raw: unknown): Promise<CashoutPayoutOutpu
       payoutId: null,
       deliveredLocal: null,
       txRef: null,
-      // Motivos PROPIOS, distintos de los del agente FX (`fx_amount_below_minimum` /
-      // `fx_amount_above_maximum`): aquéllos dicen "el monto está fuera de lo que cotizamos", éstos
-      // dicen "el monto no es el de TU cotización". Se corrigen de formas distintas.
-      // 🔴 Sin números: ni el monto pedido ni el cotizado. Ecoar el monto de la referencia
-      // convertiría al agente en un oráculo que revela, con una referencia ajena, cuánto cotizó otro.
-      reason: quoteBinding === "amount_mismatch" ? "quote_amount_mismatch" : "quote_unresolvable",
+      reason: QUOTE_BINDING_BLOCK_REASON[quoteBinding],
       provenance: "n/a",
       depositAddress: null,
     };
