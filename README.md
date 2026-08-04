@@ -478,7 +478,7 @@ path returns `404`. In particular, the **canonical slug**
 (`/api/agents/remit-corridor-fx-solana/manifest`) **is not a URL**: the 3 valid URLs are the ones in
 the table above, which use the `pathSlug`.
 
-### `200 OK`: exactly 7 top-level keys
+### `200 OK`: exactly 8 top-level keys
 
 ```json
 {
@@ -488,12 +488,27 @@ the table above, which use the `pathSlug`.
   "description": "<static text, no PII>",
   "capabilities": ["remittance-fx-quote", "usdc-to-pen", "corridor-pricing"],
   "priceUsdc": 0.03,
-  "payment": { "method": "x402", "chain": "solana-devnet", "contract": "<base58 32B>", "asset": "USDC" }
+  "payment": { "method": "x402", "chain": "solana-devnet", "contract": "<base58 32B>", "asset": "USDC" },
+  "inputSchema": { "type": "object", "required": ["amountUsd"], "properties": { "...": {} } }
 }
 ```
 
 `payment` has exactly 4 keys (`method`, `chain`, `contract`, `asset`) and is **copied verbatim** into
 the registry: there is no transformation or normalization pending on the consumer side.
+
+### `inputSchema`: the fields the agent ACTUALLY requires
+
+`inputSchema` is what whoever builds the call copies, `/orchestrate`'s planner included. It comes from
+the same table as the rest of the sheet (`src/manifest/registry.ts`) and is **tied to the real Zod
+validator by `src/manifest/input-schema-drift.test.ts`**: if somebody edits a `z.object` under
+`src/agents/` and does not update the sheet, or the other way round, the suite goes red. Measured on
+2026-08-04, before that check existed, the published catalog demanded `kycPayoutAllowed` (deleted in
+WKH-203) and never mentioned `senderIdentity`, so the payload copied from the catalog returned
+`blocked / kyc_identity_claim_missing` **every time**.
+
+A field can sit in `required` without being mandatory for Zod: that is the case of `senderIdentity`,
+which the validator accepts as absent but without which the agent never disburses. The drift check does
+not let that be declared for free — it demands the behavioral proof that omitting it blocks.
 
 ### `503 Service Unavailable`: sheet not publishable (fail-closed)
 
@@ -593,9 +608,47 @@ gateway (`wasiai-a2a`). This repo only publishes the sheet.
    lock (`TRANSFI_USERNAME`, `TRANSFI_PASSWORD`, `TRANSFI_MID`, `TRANSFI_ADAPTER_READY=true`) **and**
    `TRANSFI_USDC_NETWORK` (for this corridor, `solana`). Skipping that last one is the trap: the gate
    lets the adapter through and then every order dies with `transfi_usdc_network_unset`. Once a real
-   provider is in place, remove `PAYOUT_ALLOW_MOCK` from that deploy.
+   provider is in place, remove `PAYOUT_ALLOW_MOCK` from that deploy. **The same step deletes the two
+   halves of the stage marker** in `src/manifest/registry.ts`: the `disbursement-simulated` capability
+   and the `ETAPA 1 … SIMULADO` sentence in the payout description. Nothing deletes them on its own —
+   the stage is deploy config and that table is static code (`registry.test.ts` pins both halves so the
+   deletion is a deliberate, reviewed edit).
 
----
+### Republishing `description` / `capabilities` / `inputSchema` in the gateway (other repo)
+
+This repo does **not** write to the registry. After changing `src/manifest/registry.ts`, the sheet the
+catalog serves stays stale until somebody pushes it. Route and shape:
+
+```
+PATCH https://wasiai-a2a-production.up.railway.app/agents/<canonical-slug>
+Headers: X-A2A-Key: <owner key of that agent row>, Content-Type: application/json
+Body:    { "description": …, "capabilities": [...], "inputSchema": {...} }
+```
+
+The three canonical slugs are `remit-kyc-validator`, `remit-corridor-fx-solana` and
+`remit-cashout-payout-solana` (the `*-solana` ones, **not** the `pathSlug`). The gateway route is
+`wasiai-a2a/src/routes/agents.ts:289`; `inputSchema` lands in `metadata.inputSchema` through a **merge**
+that does not erase `outputSchema` or `discoverable` (`src/services/agent.ts:612-627`).
+
+Take the three bodies from the live sheet, so what gets registered is what the agent serves:
+
+```bash
+BASE=https://wasiai-remittance-agents.vercel.app/api/agents
+GW=https://wasiai-a2a-production.up.railway.app
+for pair in "remit-kyc-validator:remit-kyc-validator" \
+            "remit-corridor-fx:remit-corridor-fx-solana" \
+            "remit-cashout-payout:remit-cashout-payout-solana"; do
+  path="${pair%%:*}"; slug="${pair##*:}"
+  curl -s "$BASE/$path/manifest" \
+    | jq '{description, capabilities, inputSchema}' \
+    | curl -s -X PATCH "$GW/agents/$slug" \
+        -H "X-A2A-Key: $A2A_KEY" -H 'Content-Type: application/json' --data @-
+done
+```
+
+Verify with `GET $GW/agents/<slug>/agent-card` (`/discover` redacts `inputSchema` to `null`, so it is
+not the endpoint to check this with). `PATCH` does **not** touch `payment`: that keeps following the
+runbook above.
 
 ## License
 
