@@ -149,7 +149,8 @@ export function resolveDiditBaseUrl(): DiditBaseUrl {
     );
   }
 
-  // Normalización: sin la barra final, porque los call sites concatenan `/v2/session/` y
-  // `/v3/session/{id}/decision/`.
+  // Normalización: sin la barra final, porque los call sites concatenan `/v3/session/` y
+  // `/v3/session/{id}/decision/` (las DOS en v3 desde 2026-08-04 — ver el bloque de `verify()`
+  // en kyc.ts).
   return override.replace(/\/+$/, "") as DiditBaseUrl;
 }

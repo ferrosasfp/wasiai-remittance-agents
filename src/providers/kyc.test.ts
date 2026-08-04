@@ -605,6 +605,53 @@ describe("DiditKycProvider.verify — validación de shape de la respuesta del p
   });
 });
 
+// ── Versión del endpoint que llama el adapter ──────────────────────────────────────────────────
+// Fija 2026-08-04, después de que el agente publicado devolviera 502 en TODAS sus invocaciones:
+// `verify()` creaba la sesión en `/v2/session/` (404 en el host configurado) mientras `status()`
+// consultaba `/v3/session/{id}/decision/`. Ningún test miraba la URL, así que la suite entera
+// pasaba con el agente caído en producción: los stubs de `fetch` responden igual a cualquier path.
+// Estos dos tests son lo único que ata el código al host.
+describe("DiditKycProvider — versión del endpoint (regresión 502 del 2026-08-04)", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  /** Devuelve la URL (string) del último `fetch` + el spy, para assertear el path exacto. */
+  function stubFetch(body: unknown) {
+    const spy = vi.fn(async () => jsonResponse(body));
+    vi.stubGlobal("fetch", spy);
+    return spy;
+  }
+  const urlOf = (spy: ReturnType<typeof stubFetch>, i = 0): string =>
+    String((spy.mock.calls[i] as unknown[])[0]);
+
+  it("verify() crea la sesión en POST {base}/v3/session/ (NO v2: el host responde 404)", async () => {
+    const spy = stubFetch({ status: "Approved", session_id: "s-1" });
+    await new DiditKycProvider("k", MOCK_BASE_URL, "live").verify(base);
+    expect(urlOf(spy)).toBe(`${MOCK_BASE_URL}/v3/session/`);
+    expect((spy.mock.calls[0] as unknown[])[1]).toMatchObject({ method: "POST" });
+  });
+
+  it("status() consulta GET {base}/v3/session/{id}/decision/", async () => {
+    const spy = stubFetch({ status: "Approved", session_id: "v1", vendor_data: "12345678" });
+    await new DiditKycProvider("k", MOCK_BASE_URL, "live").status("v1", "12345678");
+    expect(urlOf(spy)).toBe(`${MOCK_BASE_URL}/v3/session/v1/decision/`);
+  });
+
+  // El invariante que el bug violaba: crear y consultar en la MISMA versión. Se compara una URL
+  // contra la OTRA (no contra un literal repetido), así que mover cualquiera de las dos sola lo
+  // pone rojo, en las dos direcciones.
+  it("verify() y status() hablan la MISMA versión de la API (v2 en una sola era el bug)", async () => {
+    const version = (u: string) => new URL(u).pathname.split("/").find((s) => /^v\d+$/.test(s));
+    const spyV = stubFetch({ status: "Approved", session_id: "s-1" });
+    await new DiditKycProvider("k", MOCK_BASE_URL, "live").verify(base);
+    const verifyVersion = version(urlOf(spyV));
+    vi.unstubAllGlobals();
+    const spyS = stubFetch({ status: "Approved", session_id: "v1", vendor_data: "12345678" });
+    await new DiditKycProvider("k", MOCK_BASE_URL, "live").status("v1", "12345678");
+    expect(verifyVersion).toBeDefined();
+    expect(verifyVersion).toBe(version(urlOf(spyS)));
+  });
+});
+
 describe("getKycProvider factory (MNR-2: readiness fail-loud)", () => {
   afterEach(() => vi.unstubAllEnvs());
 

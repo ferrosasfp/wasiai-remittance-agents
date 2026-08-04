@@ -111,7 +111,16 @@ export class DiditKycProvider implements KycProvider {
     // Didit expone verificación por "session"; acá se crea/consulta la verificación
     // del legalId (DNI) + screening AML. La forma exacta de request/response se fija
     // con el sandbox (Fase A) — TODO: mapear campos reales.
-    const res = await fetch(`${this.baseUrl}/v2/session/`, {
+    //
+    // 🔴 LA VERSIÓN DEL PATH ES `v3` Y TIENE QUE COINCIDIR CON LA DE `status()` (abajo).
+    // Hasta 2026-08-04 esta línea decía `/v2/session/` mientras `status()` consultaba
+    // `/v3/session/{id}/decision/`: el agente creaba la sesión en una versión y la consultaba en
+    // otra. Medido en producción ese día: el host configurado (el mock de `chaski-v3`) responde 404
+    // a `POST /v2/session/` y 200 a `POST /v3/session/`, así que TODA invocación del agente
+    // publicado terminaba en `didit_error_404` → 502 `verification_unavailable`, cobrada igual.
+    // `v3` no es "la versión que sirve el mock": es la que `chaski-v3` usa contra el Didit REAL
+    // (`app/api/kyc/session/route.ts:72`, el flujo hosted-redirect que ya corre en producción).
+    const res = await fetch(`${this.baseUrl}/v3/session/`, {
       method: "POST",
       signal: AbortSignal.timeout(8000), // MNR-3: no colgar el money-path si el partner stallea
       headers: {
@@ -172,9 +181,17 @@ export class DiditKycProvider implements KycProvider {
     // TODO(sandbox / DIDIT_ADAPTER_READY — R-1): checklist OBLIGATORIO antes de activar
     // DIDIT_ADAPTER_READY=true. Los TRES items son bloqueantes:
     //
-    // 1. COMPAT v2↔v3: confirmar que un session_id creado con POST /v2/session/ (ver verify())
-    //    es consultable por GET /v3/session/{id}/decision/. Si v3 no acepta ids de v2 → cae en
-    //    la rama B6 (kyc_gate_unavailable → 502), NUNCA fail-open. Este item es fail-SAFE.
+    // 1. CUERPO del create (2026-08-04 — REEMPLAZA al viejo item "compat v2↔v3"): las dos llamadas
+    //    de este adapter ya viven en la MISMA versión (`POST /v3/session/` en verify() +
+    //    `GET /v3/session/{id}/decision/` acá), así que no queda ninguna pregunta de compat entre
+    //    versiones. Lo que sigue SIN confirmar contra Didit real es el BODY que manda verify():
+    //    hoy manda `features: ["ID_VERIFICATION","LIVENESS","AML"]` y NO manda `workflow_id`,
+    //    mientras el único llamador nuestro que habló con el Didit REAL (chaski-v3
+    //    `app/api/kyc/session/route.ts:72-80`) manda `workflow_id` + `vendor_data` + `callback`.
+    //    El mock no exige `workflow_id`, así que la diferencia NO se ve en DIDIT_ENV=mock. Si Didit
+    //    lo exige, con DIDIT_ENV=live el create devuelve !ok → `didit_error_<n>` → 502: fail-SAFE,
+    //    nunca fail-open. Confirmarlo (y, si hace falta, agregar DIDIT_WORKFLOW_ID) es parte del
+    //    checklist previo a DIDIT_ADAPTER_READY=true contra el host real.
     //
     // 2. ⚠️ FORMA DE `aml.hits` — FAIL-OPEN LATENTE (AR/MNR-1): confirmar contra el sandbox la
     //    forma EXACTA que devuelve Didit. ¿Es un array? ¿Un número (`aml: { hits: 3 }`)? ¿Otro
