@@ -34,7 +34,10 @@
 // `DIDIT_WORKFLOW_ID`. Este módulo agrega el eje que faltaba (la INTENCIÓN de hablarle a Didit).
 //
 // El movimiento del money-path sigue gated donde ya estaba (`DIDIT_API_KEY` +
-// `DIDIT_ADAPTER_READY`, ver `getKycProvider()`), igual que TransFi con `TRANSFI_ADAPTER_READY`.
+// `DIDIT_ADAPTER_READY`, ver `getKycProvider()`), igual que TransFi con sus flags de readiness.
+// Diferencia de forma con TransFi (no la copies sin leer): Didit expone UNA capacidad (verificar
+// identidad) y por eso le alcanza UN flag; TransFi expone DOS (cotizar y desembolsar) y tiene una
+// por capacidad desde el fix del candado compartido (`transfi-readiness.ts`).
 
 /** Ambientes de Didit. Conjunto CERRADO: no existe "sandbox" (Didit no publica uno), ni "staging". */
 export type DiditEnvironment = "mock" | "live";

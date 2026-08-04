@@ -411,7 +411,13 @@ las vuelve a chequear el fail-safe `assertPayoutProviderSafe()` (`src/agents/cas
 | `TRANSFI_USERNAME` | cae al mock; alcanza con que falte cualquiera de las tres credenciales |
 | `TRANSFI_PASSWORD` | ídem |
 | `TRANSFI_MID` | ídem |
-| `TRANSFI_ADAPTER_READY` (tiene que ser `"true"`) | con las 3 credenciales seteadas y ésta distinta de `"true"`, **lanza** `transfi_adapter_not_ready`; no degrada al mock en silencio |
+| `TRANSFI_PAYOUT_ADAPTER_READY` (tiene que ser `"true"`) | con las 3 credenciales seteadas y ésta distinta de `"true"`, **lanza** `transfi_adapter_not_ready`; no degrada al mock en silencio. `TRANSFI_ADAPTER_READY` (legada) la suple mientras ésta **no esté definida**; si está definida, manda ésta, incluso valiendo `""` (⇒ apagada) |
+
+> ⚠️ **`TRANSFI_FX_ADAPTER_READY` tampoco gatea el desembolso.** TransFi expone dos capacidades que
+> no se necesitan entre sí —cotizar (lee) y desembolsar (mueve plata)— y desde el fix del candado
+> compartido cada una tiene su flag. Encender la cotización del socio para verificar su mapeo en
+> sandbox ya no arma, de paso, el adapter que crea órdenes de off-ramp. La resolución vive en un solo
+> módulo, `src/providers/transfi-readiness.ts`, y sólo el literal exacto `"true"` enciende algo.
 
 > ⚠️ **`TRANSFI_API_KEY` NO gatea el desembolso.** La lee el adapter de **FX** (`fx.ts`) y nadie del
 > path de payout: el código lo dice explícito en `src/providers/payout.ts:308`. Setearla o borrarla no
@@ -581,7 +587,8 @@ El registro y el deslistado **no los hace este repo**: son operaciones manuales 
    quedarse sin ruta de cobro no es gratis.
 7. **Sólo etapa 2 (hoy no): prender el desembolso real.** Los pasos 1-6 son sobre *cobrar*; éste es
    sobre *pagar*, y es el paso que mueve plata real. Setear las cuatro variables del candado
-   (`TRANSFI_USERNAME`, `TRANSFI_PASSWORD`, `TRANSFI_MID`, `TRANSFI_ADAPTER_READY=true`) **y**
+   (`TRANSFI_USERNAME`, `TRANSFI_PASSWORD`, `TRANSFI_MID`, `TRANSFI_PAYOUT_ADAPTER_READY=true` — la
+   flag del desembolso, **no** `TRANSFI_FX_ADAPTER_READY`, que sólo decide de dónde sale la tasa) **y**
    `TRANSFI_USDC_NETWORK` (para este corredor, `solana`). Saltearse esta última es la trampa: el gate
    deja pasar al adapter y después toda orden muere con `transfi_usdc_network_unset`. Una vez que hay
    provider real, sacar `PAYOUT_ALLOW_MOCK` de ese deploy. **Ese mismo paso borra las dos mitades de la

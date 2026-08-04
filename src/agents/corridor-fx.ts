@@ -38,8 +38,9 @@ export async function runCorridorFx(raw: unknown): Promise<CorridorFxOutput> {
   const input = CorridorFxInputSchema.parse(raw);
   // WKH-314 (AR) — EL MONTO MÍNIMO SE VALIDA ACÁ, ANTES DE ELEGIR PROVEEDOR.
   //
-  // Vivía dentro de `LiveMidFxProvider`, y ahí protegía UN camino: el día que alguien active
-  // `TRANSFI_ADAPTER_READY` (dos envs, y después de ese opt-in nada vuelve a fallar ruidoso),
+  // Vivía dentro de `LiveMidFxProvider`, y ahí protegía UN camino: el día que alguien active el
+  // adapter del socio (`TRANSFI_API_KEY` + `TRANSFI_FX_ADAPTER_READY`, y después de ese opt-in
+  // nada vuelve a fallar ruidoso),
   // el mínimo desaparecía sin que nada avisara. La alternativa que se descartó era repetir la
   // llamada en el otro proveedor, que es la duplicación que esta HU viene evitando.
   //
