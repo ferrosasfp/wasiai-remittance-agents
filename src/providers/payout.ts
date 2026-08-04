@@ -11,6 +11,7 @@
 //    DESPUÉS por webhook (fuera de scope, CD-4). El POST NUNCA se asume `settled`.
 
 import { resolveTransFiBaseUrl, type TransFiBaseUrl } from "./transfi-env";
+import { assertTransFiCapabilityReady } from "./transfi-readiness";
 import type { PayoutInput, PayoutProvider, PayoutResult } from "./types";
 
 // CD-1 (evolucionado): este archivo YA NO define un default de host ni lee `TRANSFI_BASE_URL`.
@@ -316,18 +317,19 @@ export function assertValidPayout(p: PayoutResult): PayoutResult {
 /**
  * Factory: adapter TransFi si están las 3 creds (user+pass+mid) + readiness, si no el fallback
  * (mock, no mueve plata). CD-9: NO lee `TRANSFI_API_KEY` (esa la usa fx.ts, se preserva).
+ *
+ * El readiness que se exige acá es el de la capacidad `"payout"` (`TRANSFI_PAYOUT_ADAPTER_READY`),
+ * NO el de la cotización: son dos llaves distintas desde el fix del candado compartido. Encender
+ * la cotización del socio para verificar su mapeo ya no arma, de paso, el adapter que crea órdenes
+ * de desembolso. La legada (`TRANSFI_ADAPTER_READY`) sigue valiendo mientras la específica no esté
+ * definida — la precedencia completa está en `transfi-readiness.ts`.
  */
 export function getPayoutProvider(): PayoutProvider {
   const username = process.env.TRANSFI_USERNAME;
   const password = process.env.TRANSFI_PASSWORD;
   const mid = process.env.TRANSFI_MID;
   if (!username || !password || !mid) return new FallbackPayoutProvider(); // falta cualquiera → mock
-  if (process.env.TRANSFI_ADAPTER_READY !== "true") {
-    throw new Error(
-      "transfi_adapter_not_ready: credenciales TransFi seteadas pero TRANSFI_ADAPTER_READY!=true — " +
-        "confirmá el mapeo + el flujo de depósito con el sandbox antes de mover plata.",
-    );
-  }
+  assertTransFiCapabilityReady("payout");
   // Mismo llamado que `getFxQuoteProvider()`: un solo resolvedor para los dos providers, así no
   // pueden hablarle a ambientes distintos. Sin `TRANSFI_ENV` lanza `transfi_env_unset` (fail-closed);
   // el modo mock/devnet ni llega acá (retorna antes, en el `if` de las creds).

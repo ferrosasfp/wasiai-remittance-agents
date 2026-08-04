@@ -412,7 +412,13 @@ four are re-checked by the `assertPayoutProviderSafe()` fail-safe (`src/agents/c
 | `TRANSFI_USERNAME` | falls back to the mock; any one of the three credentials missing is enough |
 | `TRANSFI_PASSWORD` | idem |
 | `TRANSFI_MID` | idem |
-| `TRANSFI_ADAPTER_READY` (must be `"true"`) | with the 3 credentials set and this one not `"true"`, it **throws** `transfi_adapter_not_ready`; it does not quietly downgrade to the mock |
+| `TRANSFI_PAYOUT_ADAPTER_READY` (must be `"true"`) | with the 3 credentials set and this one not `"true"`, it **throws** `transfi_adapter_not_ready`; it does not quietly downgrade to the mock. `TRANSFI_ADAPTER_READY` (legacy) still stands in for it while this one is **not defined**; if it is defined, this one wins, even when its value is `""` (⇒ off) |
+
+> ⚠️ **`TRANSFI_FX_ADAPTER_READY` does not gate the disbursement either.** TransFi exposes two
+> capabilities that do not need each other — quoting (reads) and disbursing (moves money) — and each
+> one has its own flag since the shared-lock fix. Turning the partner quote on to verify its mapping
+> in sandbox no longer arms the adapter that creates off-ramp orders. Resolution lives in a single
+> module, `src/providers/transfi-readiness.ts`; only the exact literal `"true"` enables anything.
 
 > ⚠️ **`TRANSFI_API_KEY` does NOT gate the disbursement.** It is read by the **FX** adapter (`fx.ts`)
 > and by nothing on the payout path: the code states it out loud at `src/providers/payout.ts:308`.
@@ -605,7 +611,9 @@ gateway (`wasiai-a2a`). This repo only publishes the sheet.
    without a billing route is not free.
 7. **Stage 2 only (not today): turning the real disbursement on.** Steps 1-6 are about *charging*; this
    one is about *paying out*, and it is the step that moves real money. Set the four variables of the
-   lock (`TRANSFI_USERNAME`, `TRANSFI_PASSWORD`, `TRANSFI_MID`, `TRANSFI_ADAPTER_READY=true`) **and**
+   lock (`TRANSFI_USERNAME`, `TRANSFI_PASSWORD`, `TRANSFI_MID`, `TRANSFI_PAYOUT_ADAPTER_READY=true`
+   — the payout flag, **not** `TRANSFI_FX_ADAPTER_READY`, which only decides where the rate comes
+   from) **and**
    `TRANSFI_USDC_NETWORK` (for this corridor, `solana`). Skipping that last one is the trap: the gate
    lets the adapter through and then every order dies with `transfi_usdc_network_unset`. Once a real
    provider is in place, remove `PAYOUT_ALLOW_MOCK` from that deploy. **The same step deletes the two

@@ -18,9 +18,10 @@
 //  3. El override `TRANSFI_BASE_URL` (legado / mock de CI) NO puede CONTRADECIR a `TRANSFI_ENV`:
 //     apuntar a producción declarando sandbox es un throw, no una advertencia.
 //
-// El movimiento de plata real sigue gated donde ya estaba (creds + `TRANSFI_ADAPTER_READY`, ver
-// `getPayoutProvider()` y `assertPayoutProviderSafe()`). Este módulo agrega el eje que faltaba:
-// el AMBIENTE de la URL, no solo las credenciales.
+// El movimiento de plata real sigue gated donde ya estaba (las 3 creds + el readiness de la
+// capacidad `"payout"`, ver `getPayoutProvider()` y `assertPayoutProviderSafe()`; la resolución
+// de ese readiness vive en `transfi-readiness.ts`, el otro módulo hermano). Este módulo agrega el
+// eje que faltaba: el AMBIENTE de la URL, no solo las credenciales.
 
 /** Ambientes de TransFi. Conjunto CERRADO: no existe "staging", "dev" ni un tercer valor. */
 export type TransFiEnvironment = "sandbox" | "production";

@@ -153,7 +153,10 @@ export const MANIFEST_ENTRIES: readonly ManifestEntry[] = Object.freeze([
       // discovery las tiene que seguir encontrando); ésta declara qué puede hacer HOY con plata.
       // Es aditiva a propósito: no le saca ningún match a quien busca por rol.
       // 🔴 SE BORRA EL DÍA QUE `isPayoutProviderReal()` pueda ser true en el deploy — o sea, cuando
-      // el deploy tenga TRANSFI_USERNAME + TRANSFI_PASSWORD + TRANSFI_MID + TRANSFI_ADAPTER_READY.
+      // el deploy tenga TRANSFI_USERNAME + TRANSFI_PASSWORD + TRANSFI_MID + el readiness de la
+      // capacidad "payout" (`TRANSFI_PAYOUT_ADAPTER_READY=true`, o la legada `TRANSFI_ADAPTER_READY`
+      // mientras la específica no esté definida). Encender SÓLO la cotización del socio
+      // (`TRANSFI_FX_ADAPTER_READY`) NO borra esta marca, y es correcto: sigue sin desembolsar.
       // No hay ningún mecanismo que lo borre solo: la etapa es config del deploy y esta tabla es
       // código estático. Mientras la marca esté, la ficha promete de menos, que es el lado seguro.
       "disbursement-simulated",

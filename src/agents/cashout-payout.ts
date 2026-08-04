@@ -16,6 +16,7 @@ import {
   REAL_KYC_PROVENANCES,
 } from "../providers/kyc";
 import { checkQuoteBinding, type QuoteBindingVerdict } from "../providers/quote-ref";
+import { isTransFiCapabilityReady } from "../providers/transfi-readiness";
 import type { KycStatusResult, PayoutResult } from "../providers/types";
 
 /**
@@ -110,7 +111,10 @@ export function isPayoutProviderReal(): boolean {
     !!process.env.TRANSFI_USERNAME &&
     !!process.env.TRANSFI_PASSWORD &&
     !!process.env.TRANSFI_MID &&
-    process.env.TRANSFI_ADAPTER_READY === "true"
+    // La MISMA resolución que usa `getPayoutProvider()` (un solo módulo lee las envs de readiness),
+    // así que este predicado no puede decir "es mock" mientras la factory arma el adapter real.
+    // Es readiness de `"payout"`: el de la cotización (`"fx"`) no habilita ningún desembolso.
+    isTransFiCapabilityReady("payout")
   );
 }
 
@@ -120,13 +124,15 @@ function assertPayoutProviderSafe(): void {
   if (process.env.NODE_ENV === "production") {
     // ⚠️ SEGURIDAD MONEY-PATH (WKH-172, etapa 1): PAYOUT_ALLOW_MOCK habilita SOLO el
     // FallbackPayoutProvider (mock, NUNCA mueve plata). NO abre ningún path a desembolso real:
-    // el path real sigue gated por TRANSFI_USERNAME + TRANSFI_PASSWORD + TRANSFI_MID +
-    // TRANSFI_ADAPTER_READY==="true" (el `hasReal` de arriba, y de nuevo en getPayoutProvider()).
+    // el path real sigue gated por TRANSFI_USERNAME + TRANSFI_PASSWORD + TRANSFI_MID + el readiness
+    // de la capacidad "payout" (el `hasReal` de arriba, y de nuevo en getPayoutProvider()).
     // NO lo gatea TRANSFI_API_KEY: esa la lee fx.ts y nadie de este path (ver el comentario de
     // getPayoutProvider() en providers/payout.ts). Auditar el candado por esa variable es mirar
-    // la que no es: setearla o borrarla no mueve NADA del payout.
+    // la que no es: setearla o borrarla no mueve NADA del payout. Desde el fix del candado
+    // compartido, TRANSFI_FX_ADAPTER_READY tampoco mueve nada de acá: el desembolso lo habilita
+    // TRANSFI_PAYOUT_ADAPTER_READY (o, mientras no esté definida, la legada TRANSFI_ADAPTER_READY).
     // Ojo que los dos modos de falla NO son el mismo: faltando cualquiera de las 3 credenciales
-    // se cae al mock en silencio, mientras que con las 3 puestas y TRANSFI_ADAPTER_READY!=="true"
+    // se cae al mock en silencio, mientras que con las 3 puestas y el readiness de payout apagado
     // getPayoutProvider() LANZA transfi_adapter_not_ready en vez de degradar al mock.
     // Activar este flag en CUALQUIER deploy que no sea el de etapa 1 (mock) es un
     // INCIDENTE DE SEGURIDAD money-path.

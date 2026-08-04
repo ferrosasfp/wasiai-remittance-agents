@@ -36,6 +36,7 @@
 import { z } from "zod";
 import { type FxConfig, resolveFxConfig } from "./fx-config";
 import { resolveTransFiBaseUrl, type TransFiBaseUrl } from "./transfi-env";
+import { assertTransFiCapabilityReady } from "./transfi-readiness";
 import type { FxProvenance, FxQuote, FxQuoteInput, FxQuoteProvider } from "./types";
 
 // 🔴 NO existe acá ninguna constante de host de TransFi, y este archivo NO lee `TRANSFI_BASE_URL`.
@@ -94,7 +95,7 @@ const TransFiQuoteResponseSchema = z
  * ⚠️ WKH-314: el monto mínimo YA CUBRE este camino, aunque no aparezca en esta clase: se valida
  * en `runCorridorFx` (`agents/corridor-fx.ts`) antes de elegir proveedor. La primera versión lo
  * puso dentro de `LiveMidFxProvider` y dejó a este camino descubierto para el día que alguien
- * active `TRANSFI_ADAPTER_READY`; el AR lo marcó y se movió al núcleo.
+ * active `TRANSFI_FX_ADAPTER_READY`; el AR lo marcó y se movió al núcleo.
  *
  * ⚠️ WKH-312 — LA BANDA Y LA FRESCURA YA CUBREN ESTE CAMINO, y tampoco aparecen en esta clase:
  * viven en `assertValidQuote()`, la invariante de SALIDA por la que pasan LOS DOS proveedores.
@@ -609,18 +610,18 @@ export function assertValidQuote(q: FxQuote, config: FxConfig): FxQuote {
 
 /**
  * Factory: adapter TransFi si hay key + readiness confirmado, si no el fallback (FX mid real).
- * MNR-2 (AR): el mapeo del adapter es sandbox-unverified hasta la Fase A → se exige
- * `TRANSFI_ADAPTER_READY=true` para activarlo (key sin readiness = fail-loud, no downgrade silencioso).
+ * MNR-2 (AR): el mapeo del adapter es sandbox-unverified hasta la Fase A → se exige el readiness
+ * para activarlo (key sin readiness = fail-loud, no downgrade silencioso).
+ *
+ * El readiness que se exige acá es el de la capacidad `"fx"` (`TRANSFI_FX_ADAPTER_READY`), NO el
+ * del desembolso. Hasta este fix las dos capacidades compartían `TRANSFI_ADAPTER_READY`, así que
+ * habilitar el desembolso cambiaba de paso la FUENTE DE LA TASA en el mismo redeploy. La legada
+ * sigue valiendo como paraguas mientras la específica no esté definida (ver `transfi-readiness.ts`).
  */
 export function getFxQuoteProvider(): FxQuoteProvider {
   const key = process.env.TRANSFI_API_KEY;
   if (!key) return new LiveMidFxProvider();
-  if (process.env.TRANSFI_ADAPTER_READY !== "true") {
-    throw new Error(
-      "transfi_adapter_not_ready: TRANSFI_API_KEY seteada pero TRANSFI_ADAPTER_READY!=true — " +
-        "confirmá el mapeo de campos con el sandbox antes de activar el adapter en el money-path.",
-    );
-  }
+  assertTransFiCapabilityReady("fx");
   // El ambiente se resuelve ACÁ (lazy, mismo llamado que usa `getPayoutProvider()`): sin
   // `TRANSFI_ENV` esto lanza `transfi_env_unset` en vez de apuntar a la API productiva del partner.
   return new TransFiFxProvider(key, resolveTransFiBaseUrl());
