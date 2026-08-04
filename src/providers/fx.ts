@@ -14,6 +14,24 @@
 //
 // 🔴 PROHIBIDO reintroducir cualquier constante de tasa acá. La banda de plausibilidad NO es una
 // tasa: es un límite, y vive en `fx-config.ts`.
+//
+// ⚠️ DÓNDE VIVEN LOS GUARDS DE LA TASA (WKH-312, 2026-08-04) — LEER ANTES DE AGREGAR UNO:
+// esos cinco guards protegían UN camino. `TransFiFxProvider` no atravesaba ninguno: su único
+// control sobre el número era "finito y > 0", así que un socio que respondiera `rate: 37.5` —diez
+// veces el mercado, con la banda en 2.5–5.0— emitía la cotización con HTTP 200 y con la etiqueta
+// `transfi`, que está DENTRO de `MARKET_FX_PROVENANCES` (el camino sin verificar era, además, el
+// que recibía el sello de "tasa de mercado"). Medido el 2026-08-04 sobre el código de `main`.
+// La respuesta NO fue copiar la banda al otro proveedor —dos copias divergen en el primer ajuste
+// de límites, y la que se olvida es siempre la del camino que nadie mira— sino repartir así:
+//   · `isRateWithinBand(rate, config)` — ÚNICO criterio de banda. Lo consultan la cascada por
+//     fuente (G4), el hit de caché, y la invariante de salida.
+//   · `checkFreshness(dataAsOf, maxAgeMs)` — ÚNICO criterio de frescura (ya lo era desde WKH-301).
+//   · `assertValidQuote(quote, config)` — LA PUERTA COMÚN: montos usables + banda + frescura. Los
+//     dos proveedores salen por acá, y `config` es un parámetro REQUERIDO para que un proveedor
+//     nuevo no compile sin verificar nada.
+// Los límites son LOS MISMOS para los dos caminos (`FX_MID_MIN_USD_PEN` / `FX_MID_MAX_USD_PEN` /
+// `FX_MID_MAX_AGE_MS`): es el mismo par de monedas y el mismo mercado, y dos bandas serían dos
+// verdades sobre el mismo precio. No se agregó ninguna env nueva.
 
 import { z } from "zod";
 import { type FxConfig, resolveFxConfig } from "./fx-config";
@@ -78,8 +96,21 @@ const TransFiQuoteResponseSchema = z
  * puso dentro de `LiveMidFxProvider` y dejó a este camino descubierto para el día que alguien
  * active `TRANSFI_ADAPTER_READY`; el AR lo marcó y se movió al núcleo.
  *
- * Lo que sigue SIN cubrir acá es la familia de guards de la TASA (banda, frescura, procedencia),
- * que vive dentro de `getUsdToPenMid` y este camino no atraviesa: es **WKH-312**.
+ * ⚠️ WKH-312 — LA BANDA Y LA FRESCURA YA CUBREN ESTE CAMINO, y tampoco aparecen en esta clase:
+ * viven en `assertValidQuote()`, la invariante de SALIDA por la que pasan LOS DOS proveedores.
+ * Medido el 2026-08-04 antes del arreglo, con el adapter instanciado a mano: un socio que
+ * respondía `rate: 37.5` (diez veces el mercado, con la banda por defecto en 2.5–5.0) emitía la
+ * cotización tal cual, etiquetada `transfi` —que está dentro de `MARKET_FX_PROVENANCES`— y con
+ * HTTP 200. Su único control sobre el número era "finito y > 0".
+ * 🔴 NO re-agregues acá una copia de la banda: quedaría escrita en dos lados y divergiría en el
+ * primer ajuste de límites, exactamente como pasó con el monto mínimo.
+ *
+ * QUÉ SIGUE SIN SER UN CONTROL REAL EN ESTE CAMINO, y por qué está escrito y no olvidado:
+ * la FRESCURA. `rateAsOf` lo sella ESTE adapter al recibir la respuesta (ver abajo), así que el
+ * guard de frescura de la salida se cumple siempre por construcción mientras el mapeo sea éste.
+ * No es un guard apagado: es un guard cuyo insumo hoy lo produce el propio código. Se aplica en
+ * el punto común igual —para que el día que el socio declare la fecha de SU tasa el control ya
+ * esté cableado y no haya que acordarse— y está pinneado en dos tests (T-312-F1/T-312-F2).
  */
 export class TransFiFxProvider implements FxQuoteProvider {
   /** `baseUrl` es OBLIGATORIO y branded: solo `resolveTransFiBaseUrl()` puede producir uno. */
@@ -89,21 +120,46 @@ export class TransFiFxProvider implements FxQuoteProvider {
   ) {}
 
   async quote(input: FxQuoteInput): Promise<FxQuote> {
-    // TODO(sandbox): confirmar el endpoint/shape exactos del quote API de TransFi.
-    const res = await fetch(`${this.baseUrl}/v1/quotes`, {
-      method: "POST",
-      signal: AbortSignal.timeout(8000), // MNR-3: no colgar el money-path
-      headers: { "content-type": "application/json", authorization: `Bearer ${this.apiKey}` },
-      body: JSON.stringify({
-        sourceAsset: input.sourceAsset,
-        sourceAmount: input.amountUsd,
-        destCurrency: input.destCurrency,
-        destCountry: input.destCountry,
-        payoutMethod: input.payoutMethod,
-      }),
-    });
-    if (!res.ok) throw new Error(`transfi_quote_error_${res.status}`);
-    const parsed = TransFiQuoteResponseSchema.safeParse(await res.json());
+    // UNA sola lectura de config por cotización, igual que `LiveMidFxProvider`: los límites con los
+    // que se verifica la tasa emitida salen de la MISMA foto de la configuración.
+    const config = resolveFxConfig();
+    let res: Response;
+    let body: unknown;
+    try {
+      // TODO(sandbox): confirmar el endpoint/shape exactos del quote API de TransFi.
+      res = await fetch(`${this.baseUrl}/v1/quotes`, {
+        method: "POST",
+        signal: AbortSignal.timeout(8000), // MNR-3: no colgar el money-path
+        headers: { "content-type": "application/json", authorization: `Bearer ${this.apiKey}` },
+        body: JSON.stringify({
+          sourceAsset: input.sourceAsset,
+          sourceAmount: input.amountUsd,
+          destCurrency: input.destCurrency,
+          destCountry: input.destCountry,
+          payoutMethod: input.payoutMethod,
+        }),
+      });
+      // El `!res.ok` NO va acá adentro: un 4xx/5xx del socio ES una respuesta (tiene status, y el
+      // status es la información con la que ops decide) y ya tiene su propio código estable.
+      if (res.ok) body = await res.json();
+    } catch {
+      // 🔴 "NO PUDE PREGUNTAR" ≠ "LA TASA ES MALA". Red caída, timeout de los 8 s, TLS, o un cuerpo
+      // que no es JSON: en todos esos casos NO SABEMOS la tasa, y eso se rechaza igual pero NO con
+      // el código de la banda. Antes esta rama no existía y el error crudo (`TypeError: fetch
+      // failed`, `TimeoutError`) subía sin clasificar hasta el route, que sólo logea `err.name`:
+      // una caída de red y una tasa fuera de mercado llegaban al log indistinguibles, y alguien
+      // iba a depurar un problema de precios que era un cable. Es el bug que este ecosistema ya
+      // pagó caro ("no pude preguntar no es no").
+      rejectQuote("transfi", TRANSFI_QUOTE_UNREACHABLE_CODE);
+      throw new Error(TRANSFI_QUOTE_UNREACHABLE_CODE);
+    }
+    if (!res.ok) {
+      // El socio SÍ contestó, y contestó que no. También es "no sé la tasa" (no hay número que
+      // verificar), por eso comparte el warn con la rama de arriba y NO el código de la banda.
+      rejectQuote("transfi", `transfi_quote_error_${res.status}`);
+      throw new Error(`transfi_quote_error_${res.status}`);
+    }
+    const parsed = TransFiQuoteResponseSchema.safeParse(body);
     // Shape NO reconocible (body que no es objeto, o un campo escalar que vino como objeto/array):
     // se corta ACÁ con un error tipado. Antes moría igual (`Number({})` → NaN → invalid_quote_rate),
     // pero sin distinguir "el partner cambió el contrato" de "el partner cotizó cualquier cosa".
@@ -133,9 +189,10 @@ export class TransFiFxProvider implements FxQuoteProvider {
       // es más viejo que el momento de servir y por eso conserva su fecha original.)
       rateAsOf: new Date().toISOString(),
     };
-    // BLQ-MED-2: si el mapeo (aún sandbox-unverified) produce NaN/invalidos, LANZAR —
-    // nunca emitir una cotización con basura numérica que el payout ataría a un monto real.
-    return assertValidQuote(quote);
+    // BLQ-MED-2 + WKH-312: la MISMA invariante de salida que el camino del mid. Acá se verifica
+    // que el número que el socio mandó sea usable (finito y > 0), esté DENTRO DE LA BANDA y no sea
+    // viejo. No hay un chequeo propio de este adapter: si lo hubiera, sería la segunda copia.
+    return assertValidQuote(quote, config);
   }
 }
 
@@ -158,15 +215,16 @@ export class LiveMidFxProvider implements FxQuoteProvider {
     const effRate = mid.rate * (1 - config.spreadBps / 10000); // spread en contra del cliente
     const netUsd = Math.max(0, input.amountUsd - config.flatFeeUsd);
     const netDeliveredLocal = Number((netUsd * effRate).toFixed(2));
-    // La tasa EMITIDA pasa por la misma banda que el mid. El mid ya está en banda y el spread está
-    // acotado a [0, 10000), así que esto sólo puede dispararse con un spread grande-pero-válido
-    // (p.ej. 3000 bps sobre 3.40 ⇒ 2.38, por debajo del piso): lo que sale al usuario se verifica,
-    // no sólo lo que entró. La banda es un límite, NUNCA una tasa de reemplazo (no hay clamp acá).
-    if (effRate < config.minRate || effRate > config.maxRate) {
-      throw new Error(`fx_rate_out_of_band:${effRate.toFixed(6)}`);
-    }
-    // MNR-1 (re-AR): el fallback también pasa por el guard — un env misconfig
-    // NO debe emitir una cotización con NaN.
+    // 🔴 ACÁ VIVÍA LA BANDA SOBRE LA TASA EMITIDA (WKH-301 fix-pack), inline y sólo en este
+    // proveedor. Se mudó a `assertValidQuote()` (WKH-312) porque el camino del socio no pasaba por
+    // ella: un guard que cada proveedor tiene que ACORDARSE de ejecutar ya se olvidó una vez.
+    // NO la re-agregues acá. Dos efectos secundarios del movimiento, los dos deseables:
+    //  · lo que se verifica ahora es el número REDONDEADO que efectivamente sale (`toFixed(6)`),
+    //    no el intermedio de precisión completa — la banda mira lo que recibe el usuario (AC-2);
+    //  · el rechazo pasa a nombrar su origen (`fx_rate_out_of_band:fx-mid-live:…`), que es lo que
+    //    durante un incidente separa "nuestro margen dejó la tasa fuera de banda" de "el socio
+    //    cotizó fuera de banda" — dos acciones opuestas (corregir una env vs. llamar al partner).
+    // MNR-1 (re-AR): el mid también pasa por el guard — un env misconfig NO debe emitir NaN.
     return assertValidQuote({
       rate: Number(effRate.toFixed(6)),
       feeUsd: config.flatFeeUsd,
@@ -181,7 +239,7 @@ export class LiveMidFxProvider implements FxQuoteProvider {
       rateSource: mid.sourceId,
       // La fecha del DATO según la fuente — no el momento de servir (ver getUsdToPenMid).
       rateAsOf: mid.dataAsOf,
-    });
+    }, config);
   }
 }
 
@@ -246,9 +304,37 @@ export function checkFreshness(dataAsOf: string, maxAgeMs: number): FreshnessVer
   return "ok";
 }
 
+/**
+ * ÚNICO criterio de banda de plausibilidad del repo (WKH-312). Antes la misma comparación estaba
+ * escrita TRES veces —la cascada por fuente, el hit de caché, y la tasa emitida del mid— y ninguna
+ * de las tres cubría al socio. Ahora los cuatro call sites (esos tres + la invariante de salida por
+ * la que pasan los dos proveedores) preguntan acá: cambiar la forma de evaluar la banda es cambiar
+ * esta función, y alcanza a todos los caminos sin edición por proveedor (AC-3).
+ *
+ * 🔴 La banda es un LÍMITE, jamás una tasa de reemplazo: esta función responde sí o no, y no existe
+ * ninguna variante que "acomode" la tasa al borde. Fuera de banda se rechaza, no se ajusta.
+ *
+ * `!(a && b)` sobre las dos comparaciones y no `rate < min || rate > max`: con `rate = NaN` las dos
+ * formas dan lo mismo hoy, pero la afirmativa deja el fail-closed explícito — un `NaN` NO está
+ * dentro de la banda. Es la trampa que este módulo ya documentó en `assertAmountAboveMinimum`.
+ */
+export function isRateWithinBand(rate: number, config: FxConfig): boolean {
+  return rate >= config.minRate && rate <= config.maxRate;
+}
+
 /** Warn value-free: SÓLO id de fuente + código. Nunca el body, la URL completa, ni datos del caller. */
 function rejectSource(sourceId: string, code: string): void {
   console.warn("[remit-fx] fx_mid_source_rejected", { sourceId, code });
+}
+
+/**
+ * Warn value-free del guard de SALIDA y del camino del socio. Va aparte de `rejectSource` a
+ * propósito: aquél habla de una FUENTE que se descartó y la cascada sigue; éste habla de una
+ * COTIZACIÓN que no se emite. Sólo el id de la fuente/procedencia y el código de rama; nunca el
+ * body del partner, ni la URL, ni nada del caller.
+ */
+function rejectQuote(rateSource: string, code: string): void {
+  console.warn("[remit-fx] fx_quote_rejected", { rateSource, code });
 }
 
 /**
@@ -275,8 +361,7 @@ async function getUsdToPenMid(config: FxConfig): Promise<MidRate> {
     cache !== null &&
     cache.fetchedAt + config.cacheTtlMs > Date.now() &&
     checkFreshness(cache.dataAsOf, config.maxAgeMs) === "ok" &&
-    cache.rate >= config.minRate &&
-    cache.rate <= config.maxRate
+    isRateWithinBand(cache.rate, config)
   ) {
     return {
       rate: cache.rate,
@@ -320,7 +405,9 @@ async function getUsdToPenMid(config: FxConfig): Promise<MidRate> {
     }
 
     // G4 — banda de plausibilidad. Ataja un cero, un orden de magnitud, o la tasa de OTRA moneda.
-    if (parsed.rate < config.minRate || parsed.rate > config.maxRate) {
+    // El CRITERIO es el mismo que usa la invariante de salida (`isRateWithinBand`); lo que cambia
+    // es la consecuencia: acá se descarta la fuente y la cascada sigue, allá no se emite nada.
+    if (!isRateWithinBand(parsed.rate, config)) {
       rejectSource(source.id, "fx_mid_out_of_band");
       continue;
     }
@@ -423,9 +510,55 @@ export function assertAmountBelowMaximum(amountUsd: number, config: FxConfig): v
   }
 }
 
-// BLQ-MED-2: guard de salida — un quote solo es válido si los montos de dinero son finitos y
-// coherentes. Lanza si no (mejor fallar que atar un NaN a un desembolso real).
-export function assertValidQuote(q: FxQuote): FxQuote {
+/**
+ * Código del rechazo por tasa FUERA DE BANDA. Lleva la PROCEDENCIA adentro (`…:transfi:37.500000`,
+ * `…:fx-mid-live:2.380000`) y ésa es la parte que importa durante un incidente: "el socio cotizó
+ * fuera de banda" se corrige llamando al partner y "nuestro margen dejó la tasa fuera de banda" se
+ * corrige tocando una env. Un código único mandaría a la mitad de la gente al lugar equivocado.
+ * El prefijo NO cambió (era el de WKH-301) para no romper nada que ya lo reconozca.
+ */
+export const RATE_OUT_OF_BAND_CODE = "fx_rate_out_of_band";
+
+/**
+ * Código del rechazo por tasa VIEJA (o fechada en el futuro, o con una fecha impresentable). Lleva
+ * la procedencia y el veredicto de `checkFreshness` adentro: `stale`, `future` y `unparseable` no
+ * son el mismo problema —los dos primeros son un dato malo, el tercero es "no sé de cuándo es"— y
+ * quien mire el log tiene que poder separarlos sin adivinar.
+ */
+export const RATE_NOT_FRESH_CODE = "fx_rate_not_fresh";
+
+/**
+ * Código de "NO PUDE PREGUNTARLE AL SOCIO": red caída, timeout, TLS, o un cuerpo que ni siquiera
+ * es JSON. Deliberadamente distinto de `RATE_OUT_OF_BAND_CODE` y de `RATE_NOT_FRESH_CODE`, que
+ * afirman algo SOBRE UNA TASA QUE SÍ CONOCEMOS. Los dos rechazan la cotización, pero uno dice "el
+ * precio está mal" y el otro dice "no hay precio": colapsarlos hace que mañana alguien depure una
+ * caída de red buscando un problema de precios.
+ */
+export const TRANSFI_QUOTE_UNREACHABLE_CODE = "transfi_quote_unreachable";
+
+/**
+ * Guard de SALIDA — la ÚNICA puerta por la que pasan las cotizaciones de los DOS proveedores
+ * (`TransFiFxProvider` y `LiveMidFxProvider`) antes de emitirse. Lanza si no la pasa.
+ *
+ * Verifica, en este orden:
+ *  1. **BLQ-MED-2 — montos usables**: finitos, la tasa y lo entregado > 0, el fee >= 0, id no vacío.
+ *  2. **WKH-312 — banda de plausibilidad sobre la tasa EMITIDA** (`isRateWithinBand`).
+ *  3. **WKH-312 — frescura del dato** (`checkFreshness`, el mismo criterio que usan la cascada y
+ *     el hit de caché).
+ *
+ * 🔴 EL ORDEN DE 1 ANTES DE 2 NO ES COSMÉTICO: con `rate = NaN` la banda también rechaza, pero
+ * diría "fuera de banda" sobre un número que no existe. El diagnóstico correcto de un `NaN` es
+ * `invalid_quote_rate` (mapeo roto), no un problema de precio de mercado. Preservar ese orden
+ * mantiene además byte-idénticos los códigos que el camino del mid ya devolvía (AC-6).
+ *
+ * 🔴 POR QUÉ `config` ES UN PARÁMETRO REQUERIDO Y NO SE RESUELVE ACÁ ADENTRO (DT-1): resolverla
+ * acá sería una SEGUNDA lectura de `process.env` por cotización, y una env a medio rotar dejaría a
+ * la tasa verificada contra límites de una configuración distinta de la que la produjo. Que sea
+ * requerido es además el candado: un proveedor nuevo NO COMPILA sin pasar la config, así que no
+ * existe la variante "se olvidó de verificar la banda" — que es exactamente lo que pasó con el
+ * camino del socio mientras la banda vivía inline en el otro proveedor.
+ */
+export function assertValidQuote(q: FxQuote, config: FxConfig): FxQuote {
   const finitePos = (n: number) => Number.isFinite(n) && n > 0;
   const finiteNonNeg = (n: number) => Number.isFinite(n) && n >= 0;
   if (!finitePos(q.rate)) throw new Error(`invalid_quote_rate:${q.rate}`);
@@ -446,6 +579,31 @@ export function assertValidQuote(q: FxQuote): FxQuote {
   // El fee SÍ puede ser 0 (una remesa sin comisión es legítima); `finiteNonNeg` es correcto acá.
   if (!finiteNonNeg(q.feeUsd)) throw new Error(`invalid_quote_fee:${q.feeUsd}`);
   if (!q.quoteId) throw new Error("invalid_quote_id");
+
+  // WKH-312 — LA BANDA, para los dos proveedores. Es la tasa que sale, no un intermedio.
+  if (!isRateWithinBand(q.rate, config)) {
+    rejectQuote(q.rateSource, RATE_OUT_OF_BAND_CODE);
+    throw new Error(`${RATE_OUT_OF_BAND_CODE}:${q.provenance}:${q.rate.toFixed(6)}`);
+  }
+
+  // WKH-312 — LA FRESCURA, con el MISMO criterio y el MISMO límite (`FX_MID_MAX_AGE_MS`) que la
+  // cascada y el hit de caché: una tasa vieja es plata mal calculada venga de donde venga.
+  //
+  // ⚠️ HONESTIDAD SOBRE QUÉ ATAJA HOY EN CADA CAMINO, para que nadie lea de más:
+  //  · mid (en vivo o cacheado): `rateAsOf` es la fecha que declaró la FUENTE, y ya pasó por G5 /
+  //    por el chequeo del hit de caché. Acá vuelve a pasar como red de seguridad del punto de
+  //    salida, y no puede cambiar ningún veredicto existente (mismo criterio, mismo límite).
+  //  · socio: `rateAsOf` lo sella el adapter al recibir la respuesta, porque el socio cotiza POR
+  //    REQUEST y no declara la fecha de su tasa en el mapeo que hoy tenemos (sandbox-unverified).
+  //    O sea que hoy este chequeo se satisface por construcción en ese camino. Está igual, y en el
+  //    punto común, por dos razones: para que el día que el socio declare la fecha de su tasa el
+  //    control YA esté cableado en vez de depender de que alguien se acuerde, y porque un guard que
+  //    vive en un solo proveedor es precisamente lo que produjo este agujero.
+  const freshness = checkFreshness(q.rateAsOf, config.maxAgeMs);
+  if (freshness !== "ok") {
+    rejectQuote(q.rateSource, `${RATE_NOT_FRESH_CODE}_${freshness}`);
+    throw new Error(`${RATE_NOT_FRESH_CODE}:${q.provenance}:${freshness}`);
+  }
   return q;
 }
 
