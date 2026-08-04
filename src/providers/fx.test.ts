@@ -5,9 +5,35 @@ import {
   assertValidQuote,
   checkFreshness,
   getFxQuoteProvider,
+  isRateWithinBand,
 } from "./fx";
+import type { FxConfig } from "./fx-config";
 import { resolveTransFiBaseUrl, type TransFiBaseUrl } from "./transfi-env";
 import { MARKET_FX_PROVENANCES, type FxQuote, type FxQuoteInput } from "./types";
+
+/**
+ * Config EXPLÍCITA para los tests del guard de salida (WKH-312).
+ *
+ * ⚠️ LOS NÚMEROS SON LITERALES ESCRITOS ACÁ, a propósito: si el test resolviera la config con
+ * `resolveFxConfig()` estaría comparando la salida del código contra los mismos límites que el
+ * código usó, y aplaudiría cualquier banda —incluida una vacía o una desactivada. El valor
+ * esperado tiene que venir de AFUERA. Cada caso además dice qué número está probando contra qué
+ * límite, para que se lea sin reconstruir la aritmética.
+ */
+function testFxConfig(overrides: Partial<FxConfig> = {}): FxConfig {
+  return {
+    sources: [],
+    cacheTtlMs: 0,
+    maxAgeMs: 48 * 3600_000, // 48 h
+    minRate: 2.5,
+    maxRate: 5,
+    spreadBps: 250,
+    flatFeeUsd: 0.5,
+    minSendUsd: 5,
+    maxSendUsd: 10000,
+    ...overrides,
+  };
+}
 
 // ── Cuerpos de feed con FECHA DECLARADA ──────────────────────────────────────
 // Toda fuente registrada DEBE declarar la fecha de su dato: un feed sin fecha es shape inválido
@@ -60,29 +86,45 @@ const goodQuote: FxQuote = {
 
 describe("assertValidQuote (BLQ-MED-2: no NaN en montos)", () => {
   it("pasa un quote válido", () => {
-    expect(assertValidQuote(goodQuote)).toBe(goodQuote);
+    expect(assertValidQuote(goodQuote, testFxConfig())).toBe(goodQuote);
   });
   it("lanza si rate = NaN", () => {
-    expect(() => assertValidQuote({ ...goodQuote, rate: NaN })).toThrow(/invalid_quote_rate/);
+    expect(() => assertValidQuote({ ...goodQuote, rate: NaN }, testFxConfig())).toThrow(
+      /invalid_quote_rate/,
+    );
   });
   it("lanza si netDeliveredLocal = NaN", () => {
-    expect(() => assertValidQuote({ ...goodQuote, netDeliveredLocal: NaN })).toThrow(
+    expect(() => assertValidQuote({ ...goodQuote, netDeliveredLocal: NaN }, testFxConfig())).toThrow(
       /invalid_quote_net/,
     );
   });
   it("lanza si quoteId vacío", () => {
-    expect(() => assertValidQuote({ ...goodQuote, quoteId: "" })).toThrow(/invalid_quote_id/);
+    expect(() => assertValidQuote({ ...goodQuote, quoteId: "" }, testFxConfig())).toThrow(
+      /invalid_quote_id/,
+    );
   });
 
   // WKH-314 (AR) — la asimetría que quedaba: se exigía tasa > 0 pero entregado >= 0.
   it("T-314-FP1-a: lanza si netDeliveredLocal = 0 (una cotización que no entrega nada no es válida)", () => {
-    expect(() => assertValidQuote({ ...goodQuote, netDeliveredLocal: 0 })).toThrow(
+    expect(() => assertValidQuote({ ...goodQuote, netDeliveredLocal: 0 }, testFxConfig())).toThrow(
       /invalid_quote_net/,
     );
   });
 
   it("T-314-FP1-b: el fee SÍ puede ser 0 — una remesa sin comisión es legítima", () => {
-    expect(assertValidQuote({ ...goodQuote, feeUsd: 0 })).toBeTruthy();
+    expect(assertValidQuote({ ...goodQuote, feeUsd: 0 }, testFxConfig())).toBeTruthy();
+  });
+
+  // WKH-312 — el ORDEN de los guards dentro de la puerta común. Una tasa `NaN` también está fuera
+  // de la banda, así que si la banda corriera primero el diagnóstico de un mapeo roto sería "el
+  // precio está fuera de mercado". Este test fija que el `NaN` sigue saliendo por su propia puerta.
+  it("T-312-ORD: una tasa NaN sigue siendo invalid_quote_rate, NO fuera de banda", () => {
+    expect(() => assertValidQuote({ ...goodQuote, rate: NaN }, testFxConfig())).toThrow(
+      /invalid_quote_rate/,
+    );
+    expect(() => assertValidQuote({ ...goodQuote, rate: NaN }, testFxConfig())).not.toThrow(
+      /fx_rate_out_of_band/,
+    );
   });
 });
 
@@ -263,6 +305,354 @@ describe("TransFiFxProvider.quote — validación de shape de la respuesta del p
     await expect(new TransFiFxProvider("k", SANDBOX_BASE).quote(fxInput)).rejects.toThrow(
       /transfi_quote_error_503/,
     );
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════════════════════
+// WKH-312 · LA BANDA Y LA FRESCURA TAMBIÉN CUBREN EL CAMINO DEL SOCIO
+//
+// MEDIDO EL 2026-08-04 sobre `main`, con el adapter instanciado a mano (la bandera compartida
+// `TRANSFI_ADAPTER_READY` sigue apagada): un socio que respondía `rate: 37.5` —diez veces el
+// mercado, con la banda por defecto en 2.5–5.0— emitía
+//   {"rate":37.5,…,"provenance":"transfi","rateSource":"transfi"}
+// tal cual, sin ningún rechazo. Su único control sobre el número era "finito y > 0"
+// (`assertValidQuote`), y `"transfi"` está DENTRO de `MARKET_FX_PROVENANCES`: el camino que nadie
+// verificaba era además el que llevaba el sello de "tasa de mercado".
+//
+// Los guards NO se duplicaron: se movieron al punto por el que pasan los DOS proveedores
+// (`assertValidQuote(quote, config)`) y el criterio de banda quedó en UNA función
+// (`isRateWithinBand`) que consultan los cuatro call sites. Ver la mutación M2 del reporte: con
+// `isRateWithinBand` devolviendo `true` mueren tests de los dos caminos a la vez.
+// ════════════════════════════════════════════════════════════════════════════════════════════
+
+describe("WKH-312 — banda de plausibilidad en el camino del socio", () => {
+  /** Cuerpo mínimo y bien formado del socio; sólo la tasa cambia entre casos. */
+  const partnerBody = (rate: number) => ({
+    rate,
+    fee: 0.5,
+    destAmount: 350,
+    quoteId: "tq-band",
+    expiresAt: new Date(Date.now() + 600_000).toISOString(),
+  });
+
+  const stubPartner = (rate: number) =>
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => partnerBody(rate) })));
+
+  const quoteFromPartner = () => new TransFiFxProvider("k", SANDBOX_BASE).quote(fxInput);
+
+  beforeEach(() => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+  });
+
+  // EL test del hallazgo. 37.5 es el número que salía con 200 antes de este cambio, y 2.5–5.0 son
+  // los límites POR DEFECTO (`fx-config.ts`) — acá no se stubea ninguna env justamente para fijar
+  // que la protección existe con la configuración que corre hoy, sin ayuda del test.
+  it("T-312-B0 (EL test): tasa 37.5 del socio, diez veces el mercado ⇒ NO se emite cotización", async () => {
+    stubPartner(37.5);
+    const error = await quoteFromPartner().then(
+      (q) => q as unknown,
+      (e: unknown) => e,
+    );
+    // El efecto de dinero primero: lo que importa no es cómo se llama el error, es que NO salió
+    // una cotización que promete diez veces el mercado.
+    expect(error, "no puede emitirse una cotización con la tasa fuera de banda").toBeInstanceOf(
+      Error,
+    );
+    const message = (error as Error).message;
+    expect(message).toMatch(/^fx_rate_out_of_band:/);
+    // DT-5: el rechazo nombra su origen. "el socio cotizó fuera de banda" y "nuestro margen dejó
+    // la tasa fuera de banda" se corrigen en direcciones opuestas.
+    expect(message).toContain("transfi");
+  });
+
+  // Los tres casos de borde se miden contra una banda ESCRITA EN EL TEST (3.0–4.0), distinta de la
+  // de producción a propósito: si el código ignorara la config y usara sus propios números, estos
+  // casos se caerían. El valor esperado viene de afuera, no de recalcular la fórmula.
+  it("T-312-B1: dentro de banda [3.0, 4.0] ⇒ la tasa del socio sale tal cual", async () => {
+    vi.stubEnv("FX_MID_MIN_USD_PEN", "3");
+    vi.stubEnv("FX_MID_MAX_USD_PEN", "4");
+    stubPartner(3.5);
+    const q = await quoteFromPartner();
+    expect(q.rate).toBe(3.5);
+    expect(q.provenance).toBe("transfi");
+    expect(MARKET_FX_PROVENANCES.has(q.provenance)).toBe(true);
+  });
+
+  it("T-312-B2: fuera de banda POR ARRIBA (4.01 con techo 4.0) ⇒ rechaza; el techo exacto pasa", async () => {
+    vi.stubEnv("FX_MID_MIN_USD_PEN", "3");
+    vi.stubEnv("FX_MID_MAX_USD_PEN", "4");
+    stubPartner(4.01);
+    await expect(quoteFromPartner()).rejects.toThrow(/fx_rate_out_of_band:transfi:4\.010000/);
+    // el borde inclusive: 4.0 EXACTO todavía es banda, no "casi"
+    stubPartner(4);
+    expect((await quoteFromPartner()).rate).toBe(4);
+  });
+
+  it("T-312-B3: fuera de banda POR ABAJO (2.99 con piso 3.0) ⇒ rechaza; el piso exacto pasa", async () => {
+    vi.stubEnv("FX_MID_MIN_USD_PEN", "3");
+    vi.stubEnv("FX_MID_MAX_USD_PEN", "4");
+    stubPartner(2.99);
+    await expect(quoteFromPartner()).rejects.toThrow(/fx_rate_out_of_band:transfi:2\.990000/);
+    stubPartner(3);
+    expect((await quoteFromPartner()).rate).toBe(3);
+  });
+
+  // AC-3 — el criterio es UNO SOLO y se lee de la config VIGENTE en cada cotización: estrechar la
+  // banda sin redeploy tiene que alcanzar también al socio. Es la única maniobra en tiempo real que
+  // tiene un operador frente a un incidente de tasa.
+  it("T-312-B4: estrechar la banda por env alcanza al socio en la cotización siguiente", async () => {
+    vi.stubEnv("FX_MID_MIN_USD_PEN", "3");
+    vi.stubEnv("FX_MID_MAX_USD_PEN", "4");
+    stubPartner(3.9);
+    expect((await quoteFromPartner()).rate).toBe(3.9); // la MISMA tasa, antes de tocar nada
+
+    vi.stubEnv("FX_MID_MAX_USD_PEN", "3.8"); // el operador estrecha el techo
+    await expect(quoteFromPartner()).rejects.toThrow(/fx_rate_out_of_band:transfi:3\.900000/);
+  });
+
+  // El criterio, como unidad. Mismo criterio que usan la cascada, el hit de caché y la salida.
+  it("T-312-B5: isRateWithinBand — bordes inclusive y NaN fuera (fail-closed)", () => {
+    const config = testFxConfig({ minRate: 3, maxRate: 4 });
+    expect(isRateWithinBand(3, config)).toBe(true);
+    expect(isRateWithinBand(4, config)).toBe(true);
+    expect(isRateWithinBand(3.5, config)).toBe(true);
+    expect(isRateWithinBand(2.999, config)).toBe(false);
+    expect(isRateWithinBand(4.001, config)).toBe(false);
+    // Un `NaN` NO está dentro de la banda: la forma afirmativa lo rechaza, la negada lo aceptaría.
+    expect(isRateWithinBand(NaN, config)).toBe(false);
+  });
+});
+
+describe("WKH-312 — frescura de la tasa en el camino del socio", () => {
+  const transfiQuote: FxQuote = {
+    ...goodQuote,
+    provenance: "transfi",
+    rateSource: "transfi",
+  };
+
+  beforeEach(() => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+  });
+
+  // La ventana es la MISMA que la del mid (`FX_MID_MAX_AGE_MS`, 48 h por defecto) y acá se escribe
+  // como literal: 48 h en la config del test, un dato de hace 5 días como entrada, y el veredicto
+  // esperado escrito a mano. En ningún lado se recalcula la resta que hace el código.
+  it("T-312-F1: una tasa del socio de hace 5 días, con ventana de 48 h ⇒ no se emite", () => {
+    const config = testFxConfig({ maxAgeMs: 48 * 3600_000 });
+    const cincoDiasAtras = new Date(Date.now() - 5 * 24 * 3600_000).toISOString();
+    expect(() =>
+      assertValidQuote({ ...transfiQuote, rateAsOf: cincoDiasAtras }, config),
+    ).toThrow("fx_rate_not_fresh:transfi:stale");
+
+    // dentro de la ventana: una hora atrás sí sale
+    const unaHoraAtras = new Date(Date.now() - 3600_000).toISOString();
+    expect(assertValidQuote({ ...transfiQuote, rateAsOf: unaHoraAtras }, config).rateAsOf).toBe(
+      unaHoraAtras,
+    );
+  });
+
+  // Las otras dos ramas del mismo criterio, con códigos DISTINTOS entre sí: una fecha futura es un
+  // dato malo (y desactivaría el guard para siempre si se aceptara), y una fecha impresentable es
+  // "no sé de cuándo es". No son el mismo problema y no comparten código.
+  it("T-312-F2: fecha futura y fecha impresentable rechazan con veredictos distintos", () => {
+    const config = testFxConfig({ maxAgeMs: 48 * 3600_000 });
+    expect(() =>
+      assertValidQuote(
+        { ...transfiQuote, rateAsOf: new Date(Date.now() + 365 * 24 * 3600_000).toISOString() },
+        config,
+      ),
+    ).toThrow("fx_rate_not_fresh:transfi:future");
+    expect(() =>
+      assertValidQuote({ ...transfiQuote, rateAsOf: "no-es-una-fecha" }, config),
+    ).toThrow("fx_rate_not_fresh:transfi:unparseable");
+  });
+
+  /**
+   * AC-4 — LA JUSTIFICACIÓN, FIJADA CON UN TEST Y NO CON UN COMENTARIO.
+   *
+   * El guard de frescura está cableado en el punto común (T-312-F1 lo prueba), pero HOY no puede
+   * dispararse por el camino del socio, y eso hay que decirlo en vez de dejar que se lea como una
+   * protección que no es: `rateAsOf` lo sella ESTE adapter al recibir la respuesta, porque el
+   * socio cotiza por request y el mapeo actual (sandbox-unverified, `TODO(sandbox)`) no tiene
+   * ningún campo donde el socio declare la fecha de SU tasa. Inventarle un nombre de campo sería
+   * escribir un guard contra una forma imaginada.
+   *
+   * Este test mide justamente eso: un socio que manda fechas viejas en campos plausibles NO mueve
+   * el `rateAsOf` emitido. El día que el sandbox confirme un campo de fecha real, este test se cae
+   * —que es lo que tiene que pasar— y el guard de arriba pasa a ser un control con dientes.
+   */
+  it("T-312-F3 (AC-4): el `rateAsOf` del socio lo sella el adapter al responder, no lo declara el socio", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        json: async () => ({
+          rate: 3.5,
+          destAmount: 350,
+          quoteId: "tq-fresh",
+          expiresAt: new Date(Date.now() + 600_000).toISOString(),
+          // el socio "declara" que su tasa es vieja, en tres campos plausibles que hoy NADIE lee
+          rateAsOf: "2020-01-01T00:00:00.000Z",
+          asOf: "2020-01-01T00:00:00.000Z",
+          timestamp: "2020-01-01T00:00:00.000Z",
+        }),
+      })),
+    );
+    const antes = Date.now();
+    const q = await new TransFiFxProvider("k", SANDBOX_BASE).quote(fxInput);
+    const despues = Date.now();
+    // La ventana se mide con el reloj DEL TEST, que es externo al código bajo prueba.
+    expect(Date.parse(q.rateAsOf)).toBeGreaterThanOrEqual(antes);
+    expect(Date.parse(q.rateAsOf)).toBeLessThanOrEqual(despues);
+    expect(q.rateAsOf).not.toContain("2020");
+  });
+});
+
+describe("WKH-312 — 'no sé la tasa' NO se colapsa con 'la tasa es mala'", () => {
+  // El bug que este bloque evita ya se pagó caro en este ecosistema: si una caída de red llega al
+  // log con el mismo código que una tasa fuera de mercado, mañana alguien depura un problema de
+  // precios que era un cable. Los dos rechazan la cotización; ninguno se puede leer por el otro.
+
+  const quoteFromPartner = () => new TransFiFxProvider("k", SANDBOX_BASE).quote(fxInput);
+
+  async function codeOf(stub: () => void): Promise<string> {
+    stub();
+    return quoteFromPartner().then(
+      () => "NO_LANZO",
+      (e: unknown) => (e instanceof Error ? e.message : String(e)),
+    );
+  }
+
+  let warn: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+  });
+
+  it("T-312-U1: el socio no responde (red caída) ⇒ transfi_quote_unreachable, con su warn propio", async () => {
+    const code = await codeOf(() =>
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => {
+          throw new TypeError("fetch failed");
+        }),
+      ),
+    );
+    expect(code).toBe("transfi_quote_unreachable");
+    expect(warn).toHaveBeenCalledWith("[remit-fx] fx_quote_rejected", {
+      rateSource: "transfi",
+      code: "transfi_quote_unreachable",
+    });
+  });
+
+  it("T-312-U2: el socio responde algo que ni siquiera es JSON ⇒ transfi_quote_unreachable", async () => {
+    const code = await codeOf(() =>
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => ({
+          ok: true,
+          json: async () => {
+            throw new SyntaxError("Unexpected token < in JSON at position 0");
+          },
+        })),
+      ),
+    );
+    expect(code).toBe("transfi_quote_unreachable");
+  });
+
+  it("T-312-U3: los cuatro 'no sé' tienen códigos propios y NINGUNO se lee como un problema de precio", async () => {
+    const noSe = [
+      {
+        caso: "red caída / timeout",
+        code: await codeOf(() =>
+          vi.stubGlobal(
+            "fetch",
+            vi.fn(async () => {
+              throw new TypeError("fetch failed");
+            }),
+          ),
+        ),
+        esperado: "transfi_quote_unreachable",
+      },
+      {
+        caso: "cuerpo que no es JSON",
+        code: await codeOf(() =>
+          vi.stubGlobal(
+            "fetch",
+            vi.fn(async () => ({
+              ok: true,
+              json: async () => {
+                throw new SyntaxError("no json");
+              },
+            })),
+          ),
+        ),
+        esperado: "transfi_quote_unreachable",
+      },
+      {
+        caso: "el socio contesta 503",
+        code: await codeOf(() =>
+          vi.stubGlobal(
+            "fetch",
+            vi.fn(async () => ({ ok: false, status: 503, json: async () => ({}) })),
+          ),
+        ),
+        esperado: "transfi_quote_error_503",
+      },
+      {
+        caso: "el socio contesta un shape ilegible",
+        code: await codeOf(() =>
+          vi.stubGlobal(
+            "fetch",
+            vi.fn(async () => ({
+              ok: true,
+              json: async () => ({ rate: { value: 3.6 }, destAmount: 350, quoteId: "x" }),
+            })),
+          ),
+        ),
+        esperado: "transfi_quote_bad_shape",
+      },
+    ];
+
+    for (const entry of noSe) {
+      expect(entry.code, entry.caso).toBe(entry.esperado);
+      // Ninguno de los cuatro puede confundirse con un veredicto SOBRE una tasa conocida.
+      expect(entry.code, `${entry.caso} no debe leerse como un problema de precio`).not.toMatch(
+        /fx_rate_out_of_band|fx_rate_not_fresh/,
+      );
+    }
+
+    // Y el contraste: una tasa que SÍ conocemos y está fuera de banda usa el otro vocabulario.
+    const banda = await codeOf(() =>
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => ({
+          ok: true,
+          json: async () => ({
+            rate: 37.5,
+            destAmount: 3750,
+            quoteId: "tq-band",
+            expiresAt: new Date(Date.now() + 600_000).toISOString(),
+          }),
+        })),
+      ),
+    );
+    expect(banda).toMatch(/^fx_rate_out_of_band:transfi:/);
+    expect(banda).not.toMatch(/unreachable|bad_shape|quote_error/);
   });
 });
 
