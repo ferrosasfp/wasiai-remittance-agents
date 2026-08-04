@@ -5,6 +5,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { CorridorFxInputSchema, runCorridorFx } from "@/agents/corridor-fx";
 import { AMOUNT_ABOVE_MAXIMUM_CODE, AMOUNT_BELOW_MINIMUM_CODE } from "@/providers/fx";
+import { guardInvokeAuth } from "@/auth/invoke-auth";
 
 /**
  * Rechazos de POLÍTICA DEL MONTO: son 4xx (el caller mandó un monto fuera de lo que este agente
@@ -20,6 +21,11 @@ const AMOUNT_POLICY_ERRORS = [
 ] as const;
 
 export async function POST(req: NextRequest) {
+  // Va ANTES de leer el body a propósito: sin credencial no se parsea nada del caller. Con
+  // `INVOKE_AUTH_SECRET` sin configurar devuelve `null` SIEMPRE y esta ruta es la de siempre.
+  const unauthorized = guardInvokeAuth(req, "remit-corridor-fx");
+  if (unauthorized !== null) return unauthorized;
+
   const parsed = CorridorFxInputSchema.safeParse(await req.json().catch(() => null));
   if (!parsed.success) {
     return NextResponse.json(
