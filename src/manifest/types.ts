@@ -23,6 +23,32 @@ export interface AgentPaymentSpec {
   asset: "USDC";
 }
 
+/**
+ * Subconjunto de JSON Schema que el registro del gateway acepta en `metadata.inputSchema`
+ * (`wasiai-a2a/src/services/agent.ts:177-189`) y que su planner lee para armar la llamada
+ * (`wasiai-a2a/src/services/llm/transform.ts:73-78` sólo mira `required`).
+ *
+ * ⚠️ ESTE TIPO NO GARANTIZA QUE EL SCHEMA SEA VERDAD. Que coincida con el validador Zod del agente
+ * lo hace cumplir `input-schema-drift.test.ts`, no el compilador: acá cabe cualquier objeto bien
+ * formado, incluido uno que exija un campo que el agente ni conoce (que fue exactamente el bug).
+ */
+export interface JsonSchemaProperty {
+  readonly type: "string" | "number" | "boolean" | "object";
+  readonly enum?: readonly string[];
+  readonly const?: string;
+  readonly minLength?: number;
+  readonly exclusiveMinimum?: number;
+  readonly description?: string;
+  readonly properties?: Readonly<Record<string, JsonSchemaProperty>>;
+  readonly required?: readonly string[];
+}
+
+export interface JsonSchemaObject {
+  readonly type: "object";
+  readonly required: readonly string[];
+  readonly properties: Readonly<Record<string, JsonSchemaProperty>>;
+}
+
 export interface AgentManifest {
   manifestVersion: "1";
   slug: string;
@@ -31,6 +57,8 @@ export interface AgentManifest {
   capabilities: readonly string[];
   priceUsdc: number;
   payment: AgentPaymentSpec;
+  /** Los campos que el agente REALMENTE exige. Ver `registry.ts` y el check de deriva. */
+  inputSchema: JsonSchemaObject;
 }
 
 export interface ManifestEntry {
@@ -39,6 +67,7 @@ export interface ManifestEntry {
   readonly name: string;
   readonly description: string;
   readonly capabilities: readonly string[];
+  readonly inputSchema: JsonSchemaObject;
   readonly chain: ManifestChain;
   readonly family: ChainFamily;
   readonly asset: "USDC";
