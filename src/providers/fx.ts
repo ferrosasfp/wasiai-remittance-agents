@@ -117,6 +117,14 @@ export class TransFiFxProvider implements FxQuoteProvider {
       localCurrency: "PEN",
       etaMinutes: Number(d.etaMinutes ?? 30),
       quoteId: String(d.quoteId ?? d.id ?? ""),
+      // ⚠️ EL `?? ""` YA NO ES INOCUO (2026-08-04). Este `expiresAt` entra al material FIRMADO de la
+      // referencia de cotización (`quote-ref.ts`) y es la vigencia que el agente de payout hace
+      // cumplir. Si el partner no lo manda, el vacío llega a `issueQuoteRef`, que LANZA
+      // `quote_ref_unusable_expiry` y el route corta con 502: se prefiere no cotizar antes que
+      // emitir una referencia que no vence nunca. Se conserva el `?? ""` a propósito —degradar acá
+      // sigue siendo byte-idéntico a antes— porque la decisión de money-path vive en un solo lugar,
+      // el emisor de la referencia, y no repartida entre los dos proveedores. Pinneado en
+      // `fx.test.ts` (T-EXP-1).
       expiresAt: String(d.expiresAt ?? ""),
       provenance: "transfi",
       rateSource: "transfi",

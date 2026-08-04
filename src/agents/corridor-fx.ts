@@ -84,7 +84,15 @@ export async function runCorridorFx(raw: unknown): Promise<CorridorFxOutput> {
   // acá cubre a los dos caminos y no desaparece el día que se active el adapter del socio. Envolver
   // al id del proveedor (en vez de reemplazarlo) conserva el id real del partner para auditoría.
   //
-  // ⚠️ Lo que ata es el MONTO, y nada más. `expiresAt` sigue viajando informativo y sin enforcement:
-  // esta referencia NO es un quote-lock (ver el encabezado de `quote-ref.ts`).
-  return { slug: SLUG, ...quote, quoteId: issueQuoteRef(quote.quoteId, input.amountUsd) };
+  // ⚠️ ATA EL MONTO **Y LA VIGENCIA**, y nada más. `expiresAt` dejó de ser decorativo: entra al
+  // material firmado (`issueQuoteRef`) y el agente de payout lo hace cumplir. Se le pasa el MISMO
+  // `quote.expiresAt` que sale en la respuesta —el que declaró quien cotizó— y no una ventana
+  // calculada acá: si fueran dos números, la cotización prometería una vigencia y el desembolso
+  // haría cumplir otra. Sigue sin atar la TASA, el BENEFICIARIO ni el uso único (ver el encabezado
+  // de `quote-ref.ts`: el uso único necesita almacenamiento y este repo no tiene ninguno).
+  return {
+    slug: SLUG,
+    ...quote,
+    quoteId: issueQuoteRef(quote.quoteId, input.amountUsd, quote.expiresAt),
+  };
 }

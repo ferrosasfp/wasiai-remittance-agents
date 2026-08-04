@@ -13,7 +13,9 @@ const validInput = {
   // tests bloquearían en `quote_unresolvable` antes de llegar a las ramas que ejercitan. El monto
   // que se firma acá (100) tiene que ser el mismo `amountUsd` de abajo, si no el binding rechaza.
   // Solo crece el ARRANGE — los asserts quedan intactos (mismo patrón que WKH-203/WKH-204).
-  quoteId: issueQuoteRef("fxmid-test", 100),
+  // Y desde el vencimiento firmado, la referencia además tiene que estar VIGENTE: se emite con la
+  // misma ventana de 10 min que promete `fx.ts`, calculada en el momento de armar el fixture.
+  quoteId: issueQuoteRef("fxmid-test", 100, new Date(Date.now() + 10 * 60_000).toISOString()),
   amountUsd: 100,
   kycVerificationId: "v1",
   kycPayoutAllowed: true,
@@ -497,6 +499,108 @@ describe("runCashoutPayout — binding quote ↔ monto", () => {
     const out = await runCashoutPayout({ ...validInput, quoteId: quote.quoteId, amountUsd: 100 });
     expect(out.executed).toBe(true);
     expect(executeSpy).toHaveBeenCalledTimes(1);
+  });
+
+  // ── EL VENCIMIENTO, a nivel agente ────────────────────────────────────────────────────────────
+  /** Feed FX sano, fechado SIEMPRE contra el reloj vigente (funciona con timers falsos). */
+  const stubFeed = () =>
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        json: async () => ({
+          rates: { PEN: 3.4 },
+          time_last_update_unix: Math.floor(Date.now() / 1000),
+        }),
+      })),
+    );
+
+  // 🔴 LA CORRIDA DE PRODUCCIÓN, REPRODUCIDA CON SUS INSTANTES EXACTOS (medida el 2026-08-04):
+  // cotización con `expiresAt` 10:46:03.863Z, invocada a las 10:46:53.965Z (50 s VENCIDA) ⇒
+  // `executed:true`. El monto es el CORRECTO a propósito: es lo que hace que el único guard que
+  // puede frenarla sea el del vencimiento.
+  it("e2e: la cotización REAL, invocada 50 s después de vencer → blocked quote_expired, sin ejecutar", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.stubEnv("FX_RATE_CACHE_TTL_MS", "0");
+      // Diez minutos antes del vencimiento medido: `LiveMidFxProvider` promete `now + 10 min`.
+      vi.setSystemTime(new Date("2026-08-04T10:36:03.863Z"));
+      stubFeed();
+      const quote = await runCorridorFx({ amountUsd: 100 });
+      expect(quote.expiresAt).toBe("2026-08-04T10:46:03.863Z"); // control: la ventana es la esperada
+
+      // El KYC aprobaría: si el vencimiento no frenara, esto desembolsa.
+      stubDiditDecision({ status: "Approved", session_id: "v1", vendor_data: "12345678" });
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      vi.setSystemTime(new Date("2026-08-04T10:46:53.965Z"));
+
+      const out = await runCashoutPayout({ ...validInput, quoteId: quote.quoteId, amountUsd: 100 });
+
+      // El efecto de dinero primero.
+      expect(executeSpy).not.toHaveBeenCalled();
+      expect(out.executed).toBe(false);
+      expect(out.status).toBe("blocked");
+      // Motivo PROPIO: no es "no coinciden los montos" (coinciden) ni "no pude resolver" (resolvió).
+      expect(out.reason).toBe("quote_expired");
+      expect(out.reason).not.toBe("quote_amount_mismatch");
+      expect(out.reason).not.toBe("quote_unresolvable");
+      expect(out.depositAddress).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // El reverso, y el candado que muere si alguien invierte el comparador: DENTRO de la ventana la
+  // misma cotización sigue sirviendo. Un guard de vencimiento que también rechaza lo vigente no
+  // protege nada, corta el money-path entero.
+  it("e2e: la MISMA cotización, un segundo ANTES de vencer → ejecuta (no bloquea de más)", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.stubEnv("FX_RATE_CACHE_TTL_MS", "0");
+      vi.setSystemTime(new Date("2026-08-04T10:36:03.863Z"));
+      stubFeed();
+      const quote = await runCorridorFx({ amountUsd: 100 });
+
+      stubDiditDecision({ status: "Approved", session_id: "v1", vendor_data: "12345678" });
+      vi.setSystemTime(new Date("2026-08-04T10:46:02.863Z")); // 1 s antes del vencimiento
+
+      const out = await runCashoutPayout({ ...validInput, quoteId: quote.quoteId, amountUsd: 100 });
+      expect(out.executed).toBe(true);
+      expect(executeSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // ⚠️ LÍMITE CONOCIDO, PINNEADO PARA QUE NADIE LEA LA VENTANA COMO "USO ÚNICO". Medido en
+  // producción: 1 cotización de 10.000 USD ⇒ 3 desembolsos de 10.000, cambiando sólo la
+  // `idempotencyKey`. El vencimiento ACOTA esa reutilización (de "para siempre" a "lo que dure la
+  // cotización"), NO la elimina: el techo `FX_MAX_SEND_USD` sigue siendo POR LLAMADA. Marcar una
+  // referencia como consumida exige almacenamiento compartido y este repo no tiene ninguno — la
+  // deuda y sus tres caminos están escritos en el encabezado de `quote-ref.ts`.
+  // Si algún día se implementa el uso único, ESTE TEST SE PONE ROJO. Es el recordatorio.
+  it("límite conocido: dentro de la ventana, la misma cotización desembolsa N veces (falta uso único)", async () => {
+    vi.stubEnv("FX_RATE_CACHE_TTL_MS", "0");
+    stubFeed();
+    const quote = await runCorridorFx({ amountUsd: 100 });
+    stubDiditDecision({ status: "Approved", session_id: "v1", vendor_data: "12345678" });
+
+    const primero = await runCashoutPayout({
+      ...validInput,
+      quoteId: quote.quoteId,
+      amountUsd: 100,
+      idempotencyKey: "idem-1",
+    });
+    const segundo = await runCashoutPayout({
+      ...validInput,
+      quoteId: quote.quoteId,
+      amountUsd: 100,
+      idempotencyKey: "idem-2", // lo ÚNICO que cambia
+    });
+
+    expect(primero.executed).toBe(true);
+    expect(segundo.executed).toBe(true);
+    expect(executeSpy).toHaveBeenCalledTimes(2);
   });
 
   // 🔴 EL TERCER ESTADO. "No pude resolver tu cotización" NO es "los montos no coinciden": el motivo

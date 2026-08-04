@@ -20,7 +20,8 @@ const validInput = {
   // Referencia AUTENTICADA de remit-corridor-fx (lleva el monto cotizado firmado adentro). Con un
   // `quoteId` crudo el core bloquea en `quote_unresolvable` y ningún test HTTP llega a su rama.
   // Solo crece el ARRANGE — los asserts quedan intactos.
-  quoteId: issueQuoteRef("fxmid-test", 100),
+  // …y VIGENTE: desde el vencimiento firmado, una referencia expirada bloquea en `quote_expired`.
+  quoteId: issueQuoteRef("fxmid-test", 100, new Date(Date.now() + 10 * 60_000).toISOString()),
   amountUsd: 100,
   kycVerificationId: "v1",
   kycPayoutAllowed: true,

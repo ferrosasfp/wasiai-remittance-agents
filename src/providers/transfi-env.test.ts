@@ -11,8 +11,17 @@ import { runCashoutPayout } from "../agents/cashout-payout";
 import { issueQuoteRef } from "./quote-ref";
 import type { FxQuoteInput, PayoutInput } from "./types";
 
-/** Referencia AUTENTICADA de cotización por 100 USD — el core la exige desde el binding quote↔monto. */
-const QUOTE_REF_100 = issueQuoteRef("fxmid-test", 100);
+/**
+ * Referencia AUTENTICADA de cotización por 100 USD — el core la exige desde el binding quote↔monto.
+ * Vigente por la misma ventana que promete `fx.ts` (10 min): desde que el vencimiento va firmado
+ * adentro, una referencia expirada bloquearía en `quote_expired` antes de llegar a lo que estos
+ * tests ejercitan (el ambiente de TransFi).
+ */
+const QUOTE_REF_100 = issueQuoteRef(
+  "fxmid-test",
+  100,
+  new Date(Date.now() + 10 * 60_000).toISOString(),
+);
 
 // ⚠️ CERO red real en este archivo: `fetch` SIEMPRE mockeado. Ninguna aserción puede tocar
 // api.transfi.com (que es precisamente el bug que este módulo cierra).
