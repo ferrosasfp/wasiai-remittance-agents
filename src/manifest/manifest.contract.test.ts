@@ -15,6 +15,7 @@ const PAYOUT_ENV = "REMIT_CASHOUT_PAYOUT_PAYTO";
 const MANIFEST_KEYS = [
   "capabilities",
   "description",
+  "inputSchema",
   "manifestVersion",
   "name",
   "payment",
@@ -37,7 +38,7 @@ afterEach(() => {
 });
 
 // T18 — AC-1..AC-3
-describe("ancla del wire — 7 claves de primer nivel, ni una más", () => {
+describe("ancla del wire — 8 claves de primer nivel, ni una más", () => {
   beforeEach(() => {
     vi.stubEnv(KYC_ENV, SOL_OK); // los 3 slots son Solana: el KYC también cobra en solana-devnet
     vi.stubEnv(FX_ENV, SOL_OK);
@@ -45,7 +46,7 @@ describe("ancla del wire — 7 claves de primer nivel, ni una más", () => {
   });
 
   for (const pathSlug of PATH_SLUGS) {
-    it(`${pathSlug}: Object.keys son exactamente las 7 claves del contrato`, () => {
+    it(`${pathSlug}: Object.keys son exactamente las 8 claves del contrato`, () => {
       expect(Object.keys(manifestOf(pathSlug)).sort()).toEqual(MANIFEST_KEYS);
     });
 
@@ -60,6 +61,31 @@ describe("ancla del wire — 7 claves de primer nivel, ni una más", () => {
       expect(typeof m.priceUsdc).toBe("number");
       expect(Number.isFinite(m.priceUsdc)).toBe(true);
       expect(typeof m.payment).toBe("object");
+      // La ficha SIEMPRE lleva inputSchema. Que su contenido describa al validador real es lo que
+      // verifica `input-schema-drift.test.ts`; acá sólo se ancla que la clave existe y es del shape
+      // que el registro del gateway acepta (type/required/properties).
+      expect(m.inputSchema.type).toBe("object");
+      expect(Array.isArray(m.inputSchema.required)).toBe(true);
+      expect(typeof m.inputSchema.properties).toBe("object");
+      expect(Object.keys(m.inputSchema.properties).length).toBeGreaterThan(0);
+    });
+
+    // Un `required` que nombra un campo que `properties` no describe es una ficha que pide algo sin
+    // decir de qué tipo es. Vale para el objeto raíz y para los anidados (el `beneficiary` del payout).
+    it(`${pathSlug}: todo campo de required está descripto en properties (raíz y anidados)`, () => {
+      const check = (
+        schema: { required?: readonly string[]; properties?: Record<string, unknown> },
+        path: string,
+      ) => {
+        const props = schema.properties ?? {};
+        for (const key of schema.required ?? []) {
+          expect(Object.keys(props), `${path}.required → ${key}`).toContain(key);
+        }
+        for (const [key, value] of Object.entries(props)) {
+          check(value as { required?: readonly string[] }, `${path}.${key}`);
+        }
+      };
+      check(manifestOf(pathSlug).inputSchema, "inputSchema");
     });
 
     it(`${pathSlug}: payment tiene exactamente 4 claves y se copia tal cual al registro`, () => {

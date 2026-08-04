@@ -168,6 +168,7 @@ const SYNTHETIC_EVM_ENTRY: ManifestEntry = {
   name: "synthetic-evm",
   description: "Entrada de TEST: no está en el registro y no se publica en ningún manifiesto.",
   capabilities: [],
+  inputSchema: { type: "object", required: [], properties: {} },
   chain: "avalanche-fuji",
   family: "evm",
   asset: "USDC",

@@ -49,6 +49,7 @@ describe("GET /api/agents/remit-cashout-payout/manifest — publicable", () => {
       "cashout",
       "value-delivery",
       "fiat-disbursement",
+      "disbursement-simulated",
     ]);
     expect(body.priceUsdc).toBe(0.03);
   });

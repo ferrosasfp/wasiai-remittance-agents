@@ -62,7 +62,22 @@ describe("registry — invariantes de la tabla (T16)", () => {
       "cashout",
       "value-delivery",
       "fiat-disbursement",
+      "disbursement-simulated",
     ]);
+  });
+
+  // La ficha del payout es la única que hace una afirmación sobre PLATA REAL, y el deploy de etapa 1
+  // sólo puede simular. Republicar `value-delivery` + `fiat-disbursement` sin marca habría hecho que
+  // el catálogo dejara de estar desactualizado para pasar a mentir. Este test fija las dos mitades de
+  // la marca: la capability y la frase de la descripción. Las dos se borran juntas en la etapa 2.
+  it("la ficha del payout declara la etapa: capability marcada + la descripcion dice SIMULADO", () => {
+    const payout = findEntry("remit-cashout-payout");
+    expect(payout?.capabilities).toContain("disbursement-simulated");
+    expect(payout?.description).toContain("ETAPA 1");
+    expect(payout?.description).toContain("SIMULADO");
+    // Y ningún otro agente se cuelga de la marca: es una afirmación sobre el que desembolsa.
+    expect(findEntry("remit-kyc-validator")?.capabilities).not.toContain("disbursement-simulated");
+    expect(findEntry("remit-corridor-fx")?.capabilities).not.toContain("disbursement-simulated");
   });
 
   // El pedido del mentor de la incubadora: el pipeline de Chaski cobra en Solana y "no debe

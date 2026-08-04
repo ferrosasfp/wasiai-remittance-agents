@@ -39,6 +39,9 @@ export function buildManifest(pathSlug: string): ManifestResult {
       description: entry.description,
       capabilities: entry.capabilities,
       priceUsdc: entry.priceUsdc,
+      // Se copia tal cual: la ficha que se publica y la que sirve el agente son el MISMO objeto.
+      // Que ese objeto describa al validador real lo hace cumplir `input-schema-drift.test.ts`.
+      inputSchema: entry.inputSchema,
       payment: {
         method: "x402",
         chain: entry.chain,
