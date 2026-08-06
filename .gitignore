@@ -28,3 +28,12 @@ project-context.md
 # (src/providers/transfi-env.ts, src/providers/payout.ts). Si sale del repo,
 # esas referencias quedan colgando.
 !doc/transfi-offramp-api-spec.md
+
+# --- endurecimiento .env (2026-08-06) ---
+# Se ignora TODO lo que empieza con .env y se rescatan los ejemplos por
+# excepcion. El patron anterior enumeraba sufijos peligrosos, y el 2026-08-05
+# un `.env.local.bak-<fecha>` con 29 secretos quedo suelto en un repo publico
+# porque no TERMINABA en `.local`. Enumerar lo peligroso nunca esta completo.
+.env*
+!.env.example
+!.env*.example
