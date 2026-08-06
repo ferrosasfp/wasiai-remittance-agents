@@ -975,9 +975,12 @@ describe("runCashoutPayout — KYC simulado (B1-sim)", () => {
   // El reverso, y la única cobertura real de B1 que queda en este archivo: con el ambiente declarado
   // `live` la etiqueta vuelve a ser `didit`, que es la que la allowlist acepta contra plata real.
   it("B1: KYC REAL (live) sí abre — la rama de siempre sigue viva", async () => {
-    // `live` exige además NODE_ENV=production en este repo (mismo criterio que el guard de Vercel en
-    // chaski: un build de dev no crea verificaciones reales). Se declara, no se saltea.
+    // `live` exige DOS señales de entorno en este repo, y las dos se DECLARAN, no se saltean:
+    // NODE_ENV=production (un build de dev no crea verificaciones reales) y VERCEL_ENV=production.
+    // La segunda hace falta porque Vercel fija NODE_ENV=production también en los previews, así que
+    // sola no distingue un preview del deploy de prod (ver `didit-env.ts`, assertLiveIsAllowedHere).
     vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv("VERCEL_ENV", "production");
     vi.stubEnv("DIDIT_ENV", "live"); // pisa el blindaje SOLO acá
     vi.stubEnv("DIDIT_BASE_URL", ""); // sin override: live resuelve el host canónico
     vi.stubEnv("PAYOUT_ALLOW_MOCK", "true"); // en prod el fail-safe del payout exige el opt-in

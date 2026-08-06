@@ -18,6 +18,9 @@ const MANAGED_ENVS = [
   "DIDIT_API_KEY",
   "DIDIT_ADAPTER_READY",
   "NODE_ENV",
+  // `VERCEL_ENV` es MANEJADA acá aunque el runner no la setee: si un día corriera bajo `vercel build`
+  // (que sí la exporta), los casos de "señal ausente" medirían otra cosa y el test mentiría en verde.
+  "VERCEL_ENV",
 ] as const;
 
 let envSnapshot: Record<string, string | undefined> = {};
@@ -75,16 +78,20 @@ describe("resolveDiditEnvironment / resolveDiditBaseUrl — fail-closed", () => 
 
   it("case/espacios se normalizan (' LIVE ' → live)", () => {
     setEnv("DIDIT_ENV", " LIVE ");
+    // Las DOS señales van explícitas porque `live` ya no se resuelve sin el scope de Vercel: lo que
+    // este caso mide es la NORMALIZACIÓN del valor, no el guard de entorno (tiene su propio describe).
     setEnv("NODE_ENV", "production");
+    setEnv("VERCEL_ENV", "production");
     expect(resolveDiditEnvironment()).toBe("live");
   });
 });
 
 // ── 2. live exige NODE_ENV=production (espejo de transfi_env_production_outside_node_prod) ──────
 describe("resolveDiditBaseUrl — live", () => {
-  it("live + NODE_ENV=production → host canónico de Didit", () => {
+  it("live + NODE_ENV=production + VERCEL_ENV=production → host canónico de Didit", () => {
     setEnv("DIDIT_ENV", "live");
     setEnv("NODE_ENV", "production");
+    setEnv("VERCEL_ENV", "production");
     expect(resolveDiditBaseUrl()).toBe(DIDIT_LIVE_BASE_URL);
   });
 
@@ -102,6 +109,7 @@ describe("resolveDiditBaseUrl — live", () => {
   it("live + host NO-Didit → throw (un mock que responda Approved bypassea el gate de compliance)", () => {
     setEnv("DIDIT_ENV", "live");
     setEnv("NODE_ENV", "production");
+    setEnv("VERCEL_ENV", "production");
     setEnv("DIDIT_BASE_URL", "https://mock.example.com");
     expect(() => resolveDiditBaseUrl()).toThrow(/^didit_base_url_non_didit_host_in_live/);
   });
@@ -109,8 +117,70 @@ describe("resolveDiditBaseUrl — live", () => {
   it("live + subdominio de didit.me → permitido (override legítimo)", () => {
     setEnv("DIDIT_ENV", "live");
     setEnv("NODE_ENV", "production");
+    setEnv("VERCEL_ENV", "production");
     setEnv("DIDIT_BASE_URL", "https://apx.didit.me/");
     expect(resolveDiditBaseUrl()).toBe("https://apx.didit.me"); // trailing slash normalizado
+  });
+});
+
+// ── 2b. `NODE_ENV` NO alcanza en Vercel: hace falta el SCOPE ────────────────────────────────────
+// Este repo se despliega en Vercel (`project-context.md:30`, `README.md:134`) y Vercel FIJA
+// `NODE_ENV=production` en TODOS sus deploys, preview incluido (lo dice este mismo repo en
+// `README.md:435` y en `.env.example:214`). O sea que `NODE_ENV !== "production"` no distingue un
+// preview de producción: un preview que hereda las envs de prod (el default de Vercel) pasaba el
+// guard y creaba verificaciones REALES con documentos de personas.
+//
+// La señal que sí distingue es `VERCEL_ENV`, y tiene TRES estados. El tercero —AUSENTE— es "no se
+// puede establecer el entorno", y también cierra: mismo criterio que `DIDIT_ENV` sin setear, que
+// LANZA en vez de asumir (didit-env.ts:67-76, su test en la línea 43 de este archivo).
+describe("resolveDiditEnvironment — live exige el SCOPE de Vercel, no sólo NODE_ENV", () => {
+  it("NODE_ENV=production + VERCEL_ENV=production → resuelve live (el deploy de prod)", () => {
+    setEnv("DIDIT_ENV", "live");
+    setEnv("NODE_ENV", "production");
+    setEnv("VERCEL_ENV", "production");
+    expect(resolveDiditEnvironment()).toBe("live");
+    expect(resolveDiditBaseUrl()).toBe(DIDIT_LIVE_BASE_URL);
+  });
+
+  // 🔴 EL CASO QUE `NODE_ENV` NO PODÍA VER. Un preview de Vercel tiene NODE_ENV=production igual que
+  // el deploy de producción; lo único que los diferencia es VERCEL_ENV.
+  it("NODE_ENV=production + VERCEL_ENV=preview → THROW (un preview NO habla con el Didit real)", () => {
+    setEnv("DIDIT_ENV", "live");
+    setEnv("NODE_ENV", "production");
+    setEnv("VERCEL_ENV", "preview");
+    expect(() => resolveDiditEnvironment()).toThrow(/^didit_env_live_outside_vercel_production/);
+    expect(() => resolveDiditBaseUrl()).toThrow(/^didit_env_live_outside_vercel_production/);
+  });
+
+  it("NODE_ENV=production + VERCEL_ENV=development → THROW", () => {
+    setEnv("DIDIT_ENV", "live");
+    setEnv("NODE_ENV", "production");
+    setEnv("VERCEL_ENV", "development");
+    expect(() => resolveDiditBaseUrl()).toThrow(/^didit_env_live_outside_vercel_production/);
+  });
+
+  // La ausencia: un `next start` en un contenedor, un script, un cron. `NODE_ENV=production` ahí es
+  // trivial de conseguir (basta con exportarla) y no dice nada sobre en qué deploy corrés.
+  it("NODE_ENV=production + VERCEL_ENV AUSENTE → THROW (fuera de Vercel no se puede establecer el entorno)", () => {
+    setEnv("DIDIT_ENV", "live");
+    setEnv("NODE_ENV", "production");
+    expect(() => resolveDiditBaseUrl()).toThrow(/^didit_env_live_without_vercel_scope/);
+  });
+
+  it('NODE_ENV=production + VERCEL_ENV="" → THROW igual que ausente', () => {
+    setEnv("DIDIT_ENV", "live");
+    setEnv("NODE_ENV", "production");
+    setEnv("VERCEL_ENV", "");
+    expect(() => resolveDiditBaseUrl()).toThrow(/^didit_env_live_without_vercel_scope/);
+  });
+
+  // El guard viejo NO se saca: sigue siendo la primera línea. Con VERCEL_ENV=production seteada a
+  // mano en una máquina de dev, `NODE_ENV` todavía corta.
+  it("VERCEL_ENV=production pero NODE_ENV=development → THROW (el guard de NODE_ENV sigue vivo)", () => {
+    setEnv("DIDIT_ENV", "live");
+    setEnv("NODE_ENV", "development");
+    setEnv("VERCEL_ENV", "production");
+    expect(() => resolveDiditBaseUrl()).toThrow(/^didit_env_live_outside_node_prod/);
   });
 });
 
